@@ -1,10 +1,10 @@
 ---
 id: TASK-5
 title: Controlar un run ACP desde START hasta STOP
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T14:46:00Z'
+updated_date: '2026-11-17T15:54:00Z'
 labels:
   - gc-mvp
   - gc-05

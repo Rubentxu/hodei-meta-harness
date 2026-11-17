@@ -563,6 +563,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hodei-mh-run"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hodei-mh-tracker"
 version = "0.1.0"
 dependencies = [
