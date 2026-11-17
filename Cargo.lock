@@ -560,6 +560,7 @@ dependencies = [
  "futures-util",
  "hodei-mh-coordinator",
  "hodei-mh-goal",
+ "hodei-mh-interact",
  "hodei-mh-opensandbox",
  "hodei-mh-promote",
  "hodei-mh-rollover",
@@ -590,6 +591,15 @@ version = "0.1.0"
 dependencies = [
  "hodei-mh-tracker",
  "hodei-mh-verify",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "hodei-mh-interact"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
  "thiserror",

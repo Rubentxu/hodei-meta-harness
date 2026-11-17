@@ -15,6 +15,7 @@ use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod custom_goal_probe;
 mod goal_probe;
+mod interact_probe;
 mod oneshot_debug;
 mod probe_util;
 mod promote_probe;
@@ -47,6 +48,12 @@ async fn main() {
                     .unwrap_or_else(|_| ".".to_string()),
             )
             .await;
+            std::process::exit(code);
+        }
+        Some("interact-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = interact_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("oneshot-probe") => {
