@@ -1,0 +1,15 @@
+[package]
+name = "hodei-mh-promote"
+description = "Promotion and closure for hodei-meta-harness: CAS git promotion with a write-ahead outbox and official-CLI ticket updates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "promote"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
