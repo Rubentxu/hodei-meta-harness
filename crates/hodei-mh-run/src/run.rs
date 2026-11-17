@@ -31,14 +31,17 @@ pub struct TaggedEvent {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct ForeignEventDetail {
+    pub kind: String,
+    pub observed: EventIdentity,
+    pub expected: EventIdentity,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum RunError {
-    #[error("event {kind:?} belongs to another run/session/epoch ({observed:?} vs {expected:?})")]
-    ForeignEvent {
-        kind: String,
-        observed: EventIdentity,
-        expected: EventIdentity,
-    },
+    #[error("event belongs to another run/session/epoch")]
+    ForeignEvent(Box<ForeignEventDetail>),
     #[error("run is not running (phase {0:?})")]
     NotRunning(Phase),
 }
@@ -88,11 +91,11 @@ impl RunState {
     pub fn receive(&mut self, event: TaggedEvent) -> Result<(), RunError> {
         let expected = self.identity();
         if event.identity != expected {
-            return Err(RunError::ForeignEvent {
+            return Err(RunError::ForeignEvent(Box::new(ForeignEventDetail {
                 kind: event.kind,
                 observed: event.identity,
                 expected,
-            });
+            })));
         }
         if self.phase != Phase::Running {
             // Late arrivals after stop started are invalidated, not applied.
@@ -199,7 +202,7 @@ mod tests {
                 epoch,
             };
             let err = run.receive(event("session/update", foreign)).unwrap_err();
-            assert!(matches!(err, RunError::ForeignEvent { .. }));
+            assert!(matches!(err, RunError::ForeignEvent(_)));
         }
         assert_eq!(run.pending.len(), 1); // foreign events never queued
     }

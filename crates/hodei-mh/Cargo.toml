@@ -13,6 +13,8 @@ path = "src/main.rs"
 hodei-mh-opensandbox = { path = "../opensandbox" }
 hodei-mh-workspace = { path = "../hodei-mh-workspace", package = "hodei-mh-workspace" }
 hodei-mh-tracker = { path = "../hodei-mh-tracker", package = "hodei-mh-tracker" }
+hodei-mh-coordinator = { path = "../hodei-mh-coordinator", package = "hodei-mh-coordinator" }
+hodei-mh-run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
