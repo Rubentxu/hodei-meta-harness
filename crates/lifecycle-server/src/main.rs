@@ -56,6 +56,29 @@ async fn main() {
     };
     let service = std::sync::Arc::new(LifecycleService::new(adapter, config));
 
+    // TTL reaper: the sweep interval bounds how long an expired sandbox can
+    // outlive its contract (spec TASK-13: TTL is real, not decorative).
+    let sweep_secs: u64 = std::env::var("EXPIRY_SWEEP_SECONDS")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5);
+    let reaper = service.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let removed = reaper.expire_due_sandboxes().await;
+            if !removed.is_empty() {
+                tracing::info!(
+                    "expiry sweep released {} sandbox(es): {:?}",
+                    removed.len(),
+                    removed
+                );
+            }
+        }
+    });
+
     let app = http::router(service);
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)

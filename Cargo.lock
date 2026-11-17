@@ -564,6 +564,7 @@ dependencies = [
  "hodei-mh-interact",
  "hodei-mh-opensandbox",
  "hodei-mh-promote",
+ "hodei-mh-release",
  "hodei-mh-rollover",
  "hodei-mh-run",
  "hodei-mh-tracker",
@@ -655,6 +656,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "hodei-mh-release"
+version = "0.1.0"
+dependencies = [
+ "hodei-mh-verify",
+ "serde",
 ]
 
 [[package]]

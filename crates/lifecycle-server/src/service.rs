@@ -221,6 +221,24 @@ impl LifecycleService {
         Ok(())
     }
 
+    /// TTL sweep: release every sandbox whose recorded expiry is due.
+    /// Returns the ids this sweep removed (racing removes are fine: an
+    /// already-gone sandbox is not an error for the reaper).
+    pub async fn expire_due_sandboxes(&self) -> Vec<String> {
+        let entries: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = self
+            .list_sandboxes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sandbox| (sandbox.id, sandbox.expires_at))
+            .collect();
+        let due = compose::expired_sandboxes(&entries, Utc::now());
+        for id in &due {
+            let _ = self.delete_sandbox(id).await;
+        }
+        due
+    }
+
     /// Resolve the host endpoint for a sandbox port. Only the two ports the
     /// server publishes (execd 44772, main 8080) are addressable; any other
     /// port is a contract error, not a silent fallback.
@@ -304,9 +322,7 @@ pub fn sandbox_from_inspect(
         .and_then(|raw| docker::parse_label_time(raw));
     let metadata_keys: Vec<String> = labels
         .get(compose::LABEL_METADATA_KEYS)
-        .and_then(|raw| {
-            serde_json::from_value::<Vec<String>>(serde_json::Value::String(raw.clone())).ok()
-        })
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
         .unwrap_or_default();
     let metadata: BTreeMap<String, String> = metadata_keys
         .iter()
@@ -347,6 +363,32 @@ mod tests {
     fn missing_labels_yield_none_not_panic() {
         let inspect = bollard::models::ContainerInspectResponse::default();
         assert!(sandbox_from_inspect("x", &inspect).is_none());
+    }
+
+    /// Regression: the metadata-keys label is a JSON STRING in a label; it
+    /// must be parsed with from_str. from_value over Value::String always
+    /// fails and silently dropped every sandbox's metadata (TASK-13 probe).
+    #[test]
+    fn metadata_is_restored_from_labels_on_inspect() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(crate::compose::LABEL_ID.to_string(), "sbx-meta".to_string());
+        labels.insert(
+            crate::compose::LABEL_METADATA_KEYS.to_string(),
+            r#"["team","purpose"]"#.to_string(),
+        );
+        labels.insert("team".to_string(), "hodei-mh".to_string());
+        labels.insert("purpose".to_string(), "probe".to_string());
+        let inspect = bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                labels: Some(labels),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sandbox = sandbox_from_inspect("sbx-meta", &inspect).expect("sandbox restored");
+        let metadata = sandbox.metadata.expect("metadata restored");
+        assert_eq!(metadata.get("team").map(String::as_str), Some("hodei-mh"));
+        assert_eq!(metadata.get("purpose").map(String::as_str), Some("probe"));
     }
 
     #[test]

@@ -308,6 +308,20 @@ pub fn container_name(sandbox_id: &str) -> String {
     format!("{CONTAINER_NAME_PREFIX}{sandbox_id}")
 }
 
+/// TTL decision (pure): ids whose recorded `expires_at` is due at `now`.
+/// Sandboxes without an expiry (manual cleanup) are NEVER selected — the
+/// reaper only enforces the contract the create request asked for.
+pub fn expired_sandboxes(
+    entries: &[(String, Option<chrono::DateTime<chrono::Utc>>)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(_, expires_at)| expires_at.is_some_and(|exp| exp <= now))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +401,28 @@ mod tests {
         let labels = build_labels("sbx2", &r, created, Some(exp), None);
         assert!(!labels.contains_key(LABEL_MANUAL_CLEANUP));
         assert_eq!(labels[LABEL_EXPIRES_AT], "2026-11-17T10:30:00.000000Z");
+    }
+
+    #[test]
+    fn expiry_selects_only_due_sandboxes_and_never_manual_cleanup_ones() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap();
+        let entries = vec![
+            (
+                "due-past".to_string(),
+                Some(now - chrono::Duration::seconds(1)),
+            ),
+            ("due-exactly".to_string(), Some(now)),
+            (
+                "future".to_string(),
+                Some(now + chrono::Duration::seconds(60)),
+            ),
+            ("manual".to_string(), None),
+        ];
+        let targets = expired_sandboxes(&entries, now);
+        assert_eq!(
+            targets,
+            vec!["due-past".to_string(), "due-exactly".to_string()]
+        );
     }
 
     #[test]
