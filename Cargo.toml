@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/opensandbox", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/lifecycle-server"]
+members = ["crates/opensandbox", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/lifecycle-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,7 +8,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }

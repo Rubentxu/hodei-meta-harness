@@ -1,0 +1,16 @@
+[package]
+name = "hodei-mh-tracker"
+description = "WorkTracker SPI for hodei-meta-harness: provider-agnostic work eligibility with a Backlog.md adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tracker"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
