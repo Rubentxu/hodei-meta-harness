@@ -513,6 +513,7 @@ dependencies = [
  "hodei-mh-coordinator",
  "hodei-mh-goal",
  "hodei-mh-opensandbox",
+ "hodei-mh-rollover",
  "hodei-mh-run",
  "hodei-mh-tracker",
  "hodei-mh-workspace",
@@ -573,6 +574,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "hodei-mh-rollover"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

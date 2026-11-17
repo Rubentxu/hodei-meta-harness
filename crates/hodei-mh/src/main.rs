@@ -14,6 +14,7 @@ use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod goal_probe;
 mod probe_util;
+mod rollover_probe;
 mod run_probe;
 mod tracker_probe;
 mod workspace_probe;
@@ -37,6 +38,12 @@ async fn main() {
                     .unwrap_or_else(|_| ".".to_string()),
             )
             .await;
+            std::process::exit(code);
+        }
+        Some("rollover-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = rollover_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("run-probe") => {
