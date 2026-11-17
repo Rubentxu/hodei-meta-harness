@@ -20,6 +20,8 @@ mod goal_probe;
 mod interact_probe;
 mod oneshot_debug;
 mod probe_util;
+mod profile_probe;
+mod profile_run;
 mod promote_probe;
 mod release_probe;
 mod rollover_probe;
@@ -83,6 +85,18 @@ async fn main() {
         }
         Some("tui") => {
             let code = supervisor_cli::run_tui(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("doctor") => {
+            let code = profile_run::run_doctor_cli(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("profile-run") => {
+            let code = profile_run::run_profile(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("profile-probe") => {
+            let code = profile_probe::run(&args[1..]).await;
             std::process::exit(code);
         }
         Some("supervisor-probe") => {

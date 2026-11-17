@@ -678,6 +678,7 @@ dependencies = [
  "hodei-mh-goal",
  "hodei-mh-interact",
  "hodei-mh-opensandbox",
+ "hodei-mh-profiles",
  "hodei-mh-promote",
  "hodei-mh-release",
  "hodei-mh-rollover",
@@ -763,6 +764,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "hodei-mh-profiles"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

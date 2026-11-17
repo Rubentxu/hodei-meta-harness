@@ -23,6 +23,7 @@ budget = { path = "../hodei-mh-budget", package = "hodei-mh-budget" }
 promote = { path = "../hodei-mh-promote", package = "hodei-mh-promote" }
 release = { path = "../hodei-mh-release", package = "hodei-mh-release" }
 supervisor = { path = "../hodei-mh-supervisor", package = "hodei-mh-supervisor" }
+profiles = { path = "../hodei-mh-profiles", package = "hodei-mh-profiles" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
