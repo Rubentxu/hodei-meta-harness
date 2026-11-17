@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/opensandbox", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/lifecycle-server"]
+members = ["crates/opensandbox", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/hodei-mh-coordinator", "crates/lifecycle-server"]
 
 [workspace.package]
 version = "0.1.0"
