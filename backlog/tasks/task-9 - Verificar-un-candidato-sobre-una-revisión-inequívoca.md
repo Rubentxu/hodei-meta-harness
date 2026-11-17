@@ -4,10 +4,11 @@ title: Verificar un candidato sobre una revisión inequívoca
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-09
+  - hodei-mh
 dependencies:
   - TASK-2
   - TASK-3

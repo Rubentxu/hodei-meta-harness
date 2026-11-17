@@ -4,10 +4,11 @@ title: Aplicar presupuestos agregados y proteger el host Bazzite
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:21:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-12
+  - hodei-mh
 dependencies:
   - TASK-1
   - TASK-4

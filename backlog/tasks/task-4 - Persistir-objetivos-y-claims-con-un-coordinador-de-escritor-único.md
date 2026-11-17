@@ -4,10 +4,11 @@ title: Persistir objetivos y claims con un coordinador de escritor único
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-04
+  - hodei-mh
 dependencies: []
 ordinal: 4000
 ---

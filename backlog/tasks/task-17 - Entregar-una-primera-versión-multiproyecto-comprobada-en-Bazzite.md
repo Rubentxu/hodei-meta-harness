@@ -4,10 +4,11 @@ title: Entregar una primera versión multiproyecto comprobada en Bazzite
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:21:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-17
+  - hodei-mh
 dependencies:
   - TASK-11
   - TASK-13

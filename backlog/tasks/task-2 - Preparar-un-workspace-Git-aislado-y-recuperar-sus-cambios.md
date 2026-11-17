@@ -4,10 +4,11 @@ title: Preparar un workspace Git aislado y recuperar sus cambios
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-02
+  - hodei-mh
 dependencies: []
 ordinal: 2000
 ---

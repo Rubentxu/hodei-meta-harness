@@ -4,10 +4,11 @@ title: Promover resultados Git y cerrar el ticket sin doble verdad
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:21:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-10
+  - hodei-mh
 dependencies:
   - TASK-4
   - TASK-9

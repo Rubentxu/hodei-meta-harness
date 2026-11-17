@@ -4,10 +4,11 @@ title: Seleccionar y encadenar tickets con un objetivo recurrente
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-06
+  - hodei-mh
 dependencies:
   - TASK-3
   - TASK-5

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/opensandbox", "crates/hodei-mh", "crates/lifecycle-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+agent-client-protocol = "5.3"
+bollard = { version = "0.21", default-features = false, features = ["pipe"] }
+axum = "0.8"
+tar = "0.4"
+uuid = { version = "1.29", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
