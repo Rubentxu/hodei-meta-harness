@@ -1,0 +1,11 @@
+[package]
+name = "hodei-mh-opensandbox"
+description = "Client for OpenSandbox contracts: lifecycle REST API and execd WebSocket pipe transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "opensandbox"
+
+[dependencies]

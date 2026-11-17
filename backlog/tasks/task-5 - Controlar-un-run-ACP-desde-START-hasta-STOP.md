@@ -4,10 +4,11 @@ title: Controlar un run ACP desde START hasta STOP
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:46:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-05
+  - hodei-mh
 dependencies:
   - TASK-1
   - TASK-4
@@ -24,10 +25,10 @@ Clave de incorporación: GC-05.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Start crea un grant explícito asociado al proyecto y a los efectos autorizados; instalar o editar WORKFLOW no activa ni amplía permisos.
-- [ ] #2 GoalCycle abre y controla una sesión real exclusivamente; eventos llevan identidad de run/session/epoch.
-- [ ] #3 Stop invalida respuestas y efectos pendientes; cancela procesos controlados y muestra acciones ya iniciadas que no pueden deshacerse.
-- [ ] #4 Si el agente carece de goal nativo el mismo trabajo finito se ejecuta por session/prompt sin simular capacidades.
+- [ ] #1 Start crea un grant explícito asociado al proyecto y a los efectos autorizados; instalar o editar WORKFLOW no activa ni amplía permisos
+- [ ] #2 hodei-mh abre y controla una sesión real exclusivamente; eventos llevan identidad de run/session/epoch
+- [ ] #3 Stop invalida respuestas y efectos pendientes; cancela procesos controlados y muestra acciones ya iniciadas que no pueden deshacerse
+- [ ] #4 Si el agente carece de goal nativo el mismo trabajo finito se ejecuta por session/prompt sin simular capacidades
 <!-- AC:END -->
 
 ## Definition of Done

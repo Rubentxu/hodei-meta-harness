@@ -4,10 +4,11 @@ title: Resolver permisos y formularios según capacidades y autorización
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-08
+  - hodei-mh
 dependencies:
   - TASK-1
   - TASK-5

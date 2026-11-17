@@ -1,0 +1,366 @@
+//! Lifecycle orchestration: thin async sequencing of Docker adapter calls
+//! with all decisions taken by the pure `compose` layer.
+
+use std::collections::BTreeMap;
+
+use chrono::Utc;
+
+use crate::compose::{
+    self, DockerHardening, build_env, build_host_spec, build_labels, resolve_resource_limits,
+    validate_create_request,
+};
+use crate::docker::{self, DockerAdapter, DockerError, ExecdArtifacts};
+use crate::model::{
+    CreateSandboxRequest, CreateSandboxResponse, Endpoint, Sandbox, SandboxStatus, error_codes,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error("{code}: {message}")]
+    Contract { code: &'static str, message: String },
+    #[error(transparent)]
+    Docker(#[from] DockerError),
+}
+
+impl ServiceError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ServiceError::Contract { code, .. } => code,
+            ServiceError::Docker(DockerError::Contract { code, .. }) => code,
+            ServiceError::Docker(DockerError::Operation { .. }) => {
+                error_codes::CONTAINER_START_FAILED
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    pub hardening: DockerHardening,
+    pub server_env: BTreeMap<String, String>,
+    pub execd_run_as_init: bool,
+    pub max_timeout_seconds: i64,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            hardening: DockerHardening::default(),
+            server_env: BTreeMap::new(),
+            execd_run_as_init: true,
+            max_timeout_seconds: 86_400,
+        }
+    }
+}
+
+pub struct LifecycleService {
+    adapter: DockerAdapter,
+    config: ServiceConfig,
+}
+
+impl LifecycleService {
+    pub fn new(adapter: DockerAdapter, config: ServiceConfig) -> Self {
+        Self { adapter, config }
+    }
+
+    pub async fn create_sandbox(
+        &self,
+        req: CreateSandboxRequest,
+    ) -> Result<CreateSandboxResponse, ServiceError> {
+        validate_create_request(&req, self.config.max_timeout_seconds).map_err(|e| {
+            ServiceError::Contract {
+                code: e.code,
+                message: e.message,
+            }
+        })?;
+        let (memory, nano_cpus) =
+            resolve_resource_limits(&req).map_err(|e| ServiceError::Contract {
+                code: e.code,
+                message: e.message,
+            })?;
+
+        let image = req
+            .image
+            .as_ref()
+            .expect("validated: image present")
+            .clone();
+        let entrypoint = req.entrypoint.clone().unwrap_or_default();
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let created_at = Utc::now();
+        let expires_at = req
+            .timeout
+            .map(|t| created_at + chrono::Duration::seconds(t));
+        let platform = req.platform.clone();
+        let docker_platform = platform.as_ref().map(|p| format!("{}/{}", p.os, p.arch));
+
+        let credentials = image
+            .auth
+            .as_ref()
+            .map(|a| bollard::auth::DockerCredentials {
+                username: Some(a.username.clone()),
+                password: Some(a.password.clone()),
+                ..Default::default()
+            });
+        self.adapter
+            .ensure_image_available(&image.uri, credentials, docker_platform.as_deref())
+            .await?;
+
+        let labels = build_labels(&sandbox_id, &req, created_at, expires_at, platform.as_ref());
+        let env = build_env(
+            &self.config.server_env,
+            req.env.as_ref(),
+            &sandbox_id,
+            self.config.execd_run_as_init,
+        );
+        let host = build_host_spec(&self.config.hardening, memory, nano_cpus);
+
+        let labels_map: std::collections::HashMap<String, String> =
+            labels.clone().into_iter().collect();
+        let container_id = self
+            .adapter
+            .create_sandbox_container(
+                &sandbox_id,
+                &image.uri,
+                docker_platform.as_deref(),
+                &entrypoint,
+                &env,
+                &labels_map,
+                &host,
+            )
+            .await?;
+
+        let prepared = self
+            .inject_execd_runtime(&container_id, docker_platform.as_deref())
+            .await;
+        if let Err(e) = prepared {
+            let _ = self.adapter.remove_container(&container_id).await;
+            return Err(e);
+        }
+        if let Err(e) = self.adapter.start_container(&container_id).await {
+            let _ = self.adapter.remove_container(&container_id).await;
+            return Err(e.into());
+        }
+
+        Ok(CreateSandboxResponse {
+            id: sandbox_id,
+            status: SandboxStatus {
+                state: "Running".to_string(),
+                reason: Some("CONTAINER_RUNNING".to_string()),
+                message: Some("Sandbox container started successfully.".to_string()),
+            },
+            metadata: req.metadata,
+            expires_at,
+            created_at,
+            entrypoint: Some(entrypoint),
+        })
+    }
+
+    /// Inject execd + bootstrap.sh into the created (stopped) container.
+    async fn inject_execd_runtime(
+        &self,
+        container_id: &str,
+        platform: Option<&str>,
+    ) -> Result<ExecdArtifacts, ServiceError> {
+        let artifacts = self
+            .adapter
+            .execd_artifacts(platform.unwrap_or("default"))
+            .await?;
+        let name = container_id.to_string();
+        self.adapter
+            .ensure_directory(&name, compose::OPENSANDBOX_DIR)
+            .await?;
+        // Uploads expect the archive placed under the parent of the final path.
+        self.adapter
+            .upload_archive(
+                &name,
+                compose::OPENSANDBOX_DIR,
+                (*artifacts.execd_archive).clone(),
+            )
+            .await?;
+        self.adapter
+            .upload_archive(
+                &name,
+                compose::OPENSANDBOX_DIR,
+                (*artifacts.bootstrap_archive).clone(),
+            )
+            .await?;
+        Ok(artifacts)
+    }
+
+    pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Sandbox, ServiceError> {
+        let inspect = self
+            .adapter
+            .inspect(&compose::container_name(sandbox_id))
+            .await?;
+        sandbox_from_inspect(sandbox_id, &inspect).ok_or_else(|| ServiceError::Contract {
+            code: error_codes::SANDBOX_NOT_FOUND,
+            message: format!("sandbox {sandbox_id} not found"),
+        })
+    }
+
+    pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, ServiceError> {
+        let summaries = self.adapter.list_sandbox_containers().await?;
+        let mut items = Vec::new();
+        for summary in summaries {
+            let Some(id) = summary.labels.get(compose::LABEL_ID) else {
+                continue;
+            };
+            let inspect = self.adapter.inspect(&summary.id).await?;
+            if let Some(sandbox) = sandbox_from_inspect(id, &inspect) {
+                items.push(sandbox);
+            }
+        }
+        Ok(items)
+    }
+
+    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), ServiceError> {
+        let name = compose::container_name(sandbox_id);
+        // 404 when absent, mirroring the reference contract.
+        self.adapter.inspect(&name).await?;
+        self.adapter.remove_container(&name).await?;
+        Ok(())
+    }
+
+    /// Resolve the host endpoint for a sandbox port. Only the two ports the
+    /// server publishes (execd 44772, main 8080) are addressable; any other
+    /// port is a contract error, not a silent fallback.
+    pub async fn resolve_endpoint(
+        &self,
+        sandbox_id: &str,
+        port: i32,
+        host_header: Option<&str>,
+    ) -> Result<Endpoint, ServiceError> {
+        let container_port = match port {
+            44772 => compose::EXECD_CONTAINER_PORT,
+            8080 => compose::HTTP_CONTAINER_PORT,
+            _ => {
+                return Err(ServiceError::Contract {
+                    code: error_codes::INVALID_PARAMETER,
+                    message: format!(
+                        "port {port} is not published by the sandbox; only 44772 (execd) and 8080 (main) are addressable"
+                    ),
+                });
+            }
+        };
+        let inspect = self
+            .adapter
+            .inspect(&compose::container_name(sandbox_id))
+            .await?;
+        let host_port =
+            find_host_port(&inspect, container_port).ok_or_else(|| ServiceError::Contract {
+                code: error_codes::SANDBOX_NOT_FOUND,
+                message: format!(
+                    "no published host port for {container_port} on sandbox {sandbox_id}"
+                ),
+            })?;
+        let host = host_header
+            .and_then(|h| h.split(':').next())
+            .filter(|h| !h.is_empty())
+            .unwrap_or("localhost");
+        Ok(Endpoint {
+            endpoint: format!("{host}:{host_port}"),
+            headers: None,
+        })
+    }
+}
+
+fn find_host_port(
+    inspect: &bollard::models::ContainerInspectResponse,
+    container_port: &str,
+) -> Option<String> {
+    let ports = inspect.network_settings.as_ref()?.ports.as_ref()?;
+    let bindings = ports.get(container_port)?;
+    bindings.as_ref()?.iter().find_map(|b| b.host_port.clone())
+}
+
+/// Map a container inspect into the contract Sandbox using the labels the
+/// server wrote at creation (restore-from-labels, no separate store).
+pub fn sandbox_from_inspect(
+    sandbox_id: &str,
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> Option<Sandbox> {
+    let config = inspect.config.as_ref()?;
+    let labels = config.labels.as_ref()?;
+    let label_id = labels.get(compose::LABEL_ID)?;
+    if label_id != sandbox_id {
+        return None;
+    }
+    let docker_state = inspect
+        .state
+        .as_ref()
+        .and_then(|s| s.status.as_ref())
+        .and_then(|status| {
+            serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+        })
+        .unwrap_or_default();
+    let created_at = labels
+        .get(compose::LABEL_CREATED_AT)
+        .and_then(|raw| docker::parse_label_time(raw))
+        .unwrap_or_else(Utc::now);
+    let expires_at = labels
+        .get(compose::LABEL_EXPIRES_AT)
+        .and_then(|raw| docker::parse_label_time(raw));
+    let metadata_keys: Vec<String> = labels
+        .get(compose::LABEL_METADATA_KEYS)
+        .and_then(|raw| {
+            serde_json::from_value::<Vec<String>>(serde_json::Value::String(raw.clone())).ok()
+        })
+        .unwrap_or_default();
+    let metadata: BTreeMap<String, String> = metadata_keys
+        .iter()
+        .filter_map(|k| labels.get(k).map(|v| (k.clone(), v.clone())))
+        .collect();
+    let metadata = (!metadata.is_empty()).then_some(metadata);
+    let entrypoint = config.cmd.clone().filter(|c| !c.is_empty());
+    Some(Sandbox {
+        id: sandbox_id.to_string(),
+        status: SandboxStatus {
+            state: docker::map_state(&docker_state).to_string(),
+            reason: None,
+            message: None,
+        },
+        metadata,
+        expires_at,
+        created_at,
+        entrypoint,
+    })
+}
+
+/// Parse helpers kept total: resource limit strings come from untrusted input.
+pub fn resource_limits_checked(
+    req: &CreateSandboxRequest,
+) -> Result<(Option<i64>, Option<i64>), ServiceError> {
+    resolve_resource_limits(req).map_err(|e| ServiceError::Contract {
+        code: e.code,
+        message: e.message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::validation_error;
+
+    #[test]
+    fn missing_labels_yield_none_not_panic() {
+        let inspect = bollard::models::ContainerInspectResponse::default();
+        assert!(sandbox_from_inspect("x", &inspect).is_none());
+    }
+
+    #[test]
+    fn service_error_codes_map_from_both_variants() {
+        let contract = ServiceError::Contract {
+            code: error_codes::SANDBOX_NOT_FOUND,
+            message: "m".into(),
+        };
+        assert_eq!(contract.code(), error_codes::SANDBOX_NOT_FOUND);
+        let validation = validation_error(error_codes::INVALID_PARAMETER, "bad");
+        let from_validation = ServiceError::Contract {
+            code: validation.code,
+            message: validation.message,
+        };
+        assert_eq!(from_validation.code(), error_codes::INVALID_PARAMETER);
+    }
+}

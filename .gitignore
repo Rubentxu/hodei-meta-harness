@@ -1,2 +1,8 @@
 # Intake package already imported; keep out of version control
 GoalCycle_Backlog_MVP.zip
+
+# Rust
+/target
+
+# Local Python infra (dev control plane, not product)
+/.venv

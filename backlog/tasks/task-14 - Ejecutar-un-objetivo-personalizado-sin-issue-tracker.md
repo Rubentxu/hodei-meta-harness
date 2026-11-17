@@ -4,10 +4,11 @@ title: Ejecutar un objetivo personalizado sin issue tracker
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:21:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-14
+  - hodei-mh
 dependencies:
   - TASK-5
   - TASK-9

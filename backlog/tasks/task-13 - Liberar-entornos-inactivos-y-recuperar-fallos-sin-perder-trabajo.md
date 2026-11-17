@@ -4,10 +4,11 @@ title: Liberar entornos inactivos y recuperar fallos sin perder trabajo
 status: To Do
 assignee: []
 created_date: '2026-11-17T14:21:00Z'
+updated_date: '2026-11-17T14:46:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-13
+  - hodei-mh
 dependencies:
   - TASK-7
   - TASK-10
@@ -25,10 +26,10 @@ Clave de incorporación: GC-13.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Desconexión/timeout tras create reconcilia el efecto por metadata/estado antes de intentar otro; huérfanos solo se limpian si pertenecen a GoalCycle.
-- [ ] #2 Idle libera el entorno gestionado después de confirmar candidato/checkpoint y sigue observando el tracker sin inferencia.
-- [ ] #3 Pérdida del sandbox se recupera desde candidato durable y sesión nueva; datos nunca exportados se marcan como posible pérdida.
-- [ ] #4 Dos intentos improductivos o unos 20–30 minutos observados activan investigación y cambio de estrategia; antes de una hora se decide otro slice o yield sin cierre ficticio.
+- [ ] #1 Desconexión/timeout tras create reconcilia el efecto por metadata/estado antes de intentar otro; huérfanos solo se limpian si pertenecen a hodei-mh
+- [ ] #2 Idle libera el entorno gestionado después de confirmar candidato/checkpoint y sigue observando el tracker sin inferencia
+- [ ] #3 Pérdida del sandbox se recupera desde candidato durable y sesión nueva; datos nunca exportados se marcan como posible pérdida
+- [ ] #4 Dos intentos improductivos o unos 20–30 minutos observados activan investigación y cambio de estrategia; antes de una hora se decide otro slice o yield sin cierre ficticio
 <!-- AC:END -->
 
 ## Definition of Done

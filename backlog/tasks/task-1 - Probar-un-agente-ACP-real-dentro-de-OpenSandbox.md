@@ -1,14 +1,16 @@
 ---
 id: TASK-1
 title: Probar un agente ACP real dentro de OpenSandbox
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
+updated_date: '2026-11-17T14:41:00Z'
 labels:
-  - goalcycle
   - gc-mvp
   - gc-01
-dependencies: []
+  - hodei-mh
+dependencies:
+  - TASK-18
 ordinal: 1000
 ---
 
@@ -32,3 +34,9 @@ Clave de incorporación: GC-01.
 <!-- DOD:BEGIN -->
 - [ ] #1 Registrar comandos versiones exactas y resultado real de cada caso en esta tarea.
 <!-- DOD:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Pipeline: lifecycle REST (contrato /v1 OpenAPI, server Python FastAPI solo dev) → execd WS pipe (pty=0, frames binarios 0x00 stdin/0x01 stdout/0x02 stderr/0x03 replay-offset-BE; JSON control stdin|signal|resize|ping; subprotocolo opensandbox-pty; señales SIGINT/SIGTERM/SIGKILL/SIGQUIT/SIGHUP al process group) → ACP v1 NDJSON (crate oficial agent-client-protocol 5.3.0). Agente: claude-code-acp 0.16.2 dentro de sandbox code-interpreter v1.1.0; probar Bun primero, Node fallback documentado. TDD: módulo frames puro → transporte pipe con mock → framing ACP → E2E real con evidencia. Decision: decision-1.
+<!-- SECTION:PLAN:END -->
