@@ -589,6 +589,7 @@ name = "hodei-mh-goal"
 version = "0.1.0"
 dependencies = [
  "hodei-mh-tracker",
+ "hodei-mh-verify",
  "serde",
  "serde_json",
  "thiserror",
