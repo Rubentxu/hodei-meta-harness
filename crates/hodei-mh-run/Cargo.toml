@@ -1,0 +1,14 @@
+[package]
+name = "hodei-mh-run"
+description = "Run lifecycle for hodei-meta-harness: explicit grants, identity-tagged events, stop semantics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "run"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

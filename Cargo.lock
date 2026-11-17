@@ -510,7 +510,9 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
+ "hodei-mh-coordinator",
  "hodei-mh-opensandbox",
+ "hodei-mh-run",
  "hodei-mh-tracker",
  "hodei-mh-workspace",
  "reqwest",
@@ -560,6 +562,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "hodei-mh-run"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

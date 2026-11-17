@@ -13,45 +13,11 @@ use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod probe_util;
+mod run_probe;
 mod tracker_probe;
 mod workspace_probe;
 
-use probe_util::{run_command_session, run_command_session_with_output, ws_url_for};
-
-const MOCK_AGENT_JS: &str = r#"
-let buffer = '';
-process.stdin.setEncoding('utf8');
-console.error('mock-acp-agent: stderr transport marker');
-function reply(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
-}
-function notify(method, params) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
-}
-process.stdin.on('data', (chunk) => {
-  buffer += chunk;
-  let idx;
-  while ((idx = buffer.indexOf('\n')) >= 0) {
-    const line = buffer.slice(0, idx).trim();
-    buffer = buffer.slice(idx + 1);
-    if (!line) continue;
-    const msg = JSON.parse(line);
-    if (msg.method === 'initialize') {
-      reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
-    } else if (msg.method === 'session/new') {
-      reply(msg.id, { sessionId: 'mock-session-1' });
-    } else if (msg.method === 'session/prompt') {
-      require('fs').writeFileSync('/workspace/hodei-probe.txt', 'written-by-mock-agent\n');
-      notify('session/update', { sessionId: 'mock-session-1', update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: 'wrote /workspace/hodei-probe.txt' } } });
-      reply(msg.id, { stopReason: 'end_turn' });
-    } else if (msg.method === 'session/cancel') {
-      process.exit(0);
-    }
-  }
-});
-"#;
+use probe_util::{MOCK_AGENT_JS, run_command_session, run_command_session_with_output, ws_url_for};
 
 const PROBE_FILE: &str = "/workspace/hodei-probe.txt";
 
@@ -61,6 +27,12 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("acp-probe") => {
             let code = acp_probe(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("run-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = run_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("tracker-probe") => {

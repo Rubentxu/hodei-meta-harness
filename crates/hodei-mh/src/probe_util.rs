@@ -1,5 +1,40 @@
 //! Shared helpers for probe subcommands.
 
+pub(crate) const MOCK_AGENT_JS: &str = r#"
+let buffer = '';
+process.stdin.setEncoding('utf8');
+console.error('mock-acp-agent: stderr transport marker');
+function reply(id, result) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
+}
+function notify(method, params) {
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+}
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  let idx;
+  while ((idx = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if (msg.method === 'initialize') {
+      reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
+    } else if (msg.method === 'session/new') {
+      reply(msg.id, { sessionId: 'mock-session-1' });
+    } else if (msg.method === 'session/prompt') {
+      require('fs').writeFileSync('/workspace/hodei-probe.txt', 'written-by-mock-agent\n');
+      notify('session/update', { sessionId: 'mock-session-1', update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'wrote /workspace/hodei-probe.txt' } } });
+      reply(msg.id, { stopReason: 'end_turn' });
+    } else if (msg.method === 'session/cancel') {
+      process.exit(0);
+    }
+  }
+});
+"#;
+
 use std::time::{Duration, Instant};
 
 use opensandbox::execd::api::{self, CreateSessionRequest};
