@@ -1,0 +1,12 @@
+[package]
+name = "hodei-mh-workspace"
+description = "Git workspace lifecycle for hodei-meta-harness: base revision planning, candidate export and host-side validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "workspace"
+
+[dependencies]
+thiserror = { workspace = true }
