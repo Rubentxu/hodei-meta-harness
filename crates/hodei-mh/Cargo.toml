@@ -21,6 +21,7 @@ verify = { path = "../hodei-mh-verify", package = "hodei-mh-verify" }
 interact = { path = "../hodei-mh-interact", package = "hodei-mh-interact" }
 budget = { path = "../hodei-mh-budget", package = "hodei-mh-budget" }
 promote = { path = "../hodei-mh-promote", package = "hodei-mh-promote" }
+release = { path = "../hodei-mh-release", package = "hodei-mh-release" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }

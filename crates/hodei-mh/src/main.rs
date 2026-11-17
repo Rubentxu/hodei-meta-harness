@@ -21,6 +21,7 @@ mod interact_probe;
 mod oneshot_debug;
 mod probe_util;
 mod promote_probe;
+mod release_probe;
 mod rollover_probe;
 mod run_probe;
 mod tracker_probe;
@@ -43,6 +44,12 @@ async fn main() {
             let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
             let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
             let code = budget_probe::run(&server, &image).await;
+            std::process::exit(code);
+        }
+        Some("release-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = release_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("autonomous-loop") => {

@@ -1,0 +1,13 @@
+[package]
+name = "hodei-mh-release"
+description = "Environment lifecycle for hodei-meta-harness: create reconciliation, idle release with durable work and loss recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "release"
+
+[dependencies]
+serde = { workspace = true }
+verify = { path = "../hodei-mh-verify", package = "hodei-mh-verify" }
