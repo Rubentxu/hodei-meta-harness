@@ -22,6 +22,9 @@ interact = { path = "../hodei-mh-interact", package = "hodei-mh-interact" }
 budget = { path = "../hodei-mh-budget", package = "hodei-mh-budget" }
 promote = { path = "../hodei-mh-promote", package = "hodei-mh-promote" }
 release = { path = "../hodei-mh-release", package = "hodei-mh-release" }
+supervisor = { path = "../hodei-mh-supervisor", package = "hodei-mh-supervisor" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
