@@ -1,10 +1,10 @@
 ---
 id: TASK-6
 title: Seleccionar y encadenar tickets con un objetivo recurrente
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T14:41:00Z'
+updated_date: '2026-11-17T16:03:00Z'
 labels:
   - gc-mvp
   - gc-06
@@ -25,13 +25,25 @@ Clave de incorporación: GC-06.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Un conjunto de tareas independientes y dependientes produce una selección reproducible con explicación de no elegibilidad.
-- [ ] #2 Una tarea bloqueada por dependencia técnica permite avanzar otra; respetar asignación y claim existentes.
-- [ ] #3 Con backlog vacío el supervisor entra en Idle y no hace llamadas al modelo; una nueva tarea elegible lo despierta.
-- [ ] #4 Un work item externamente completado o cambiado dispara refresh y revalidación sin confundir una pérdida de visibilidad con eliminación.
+- [x] #1 Un conjunto de tareas independientes y dependientes produce una selección reproducible con explicación de no elegibilidad.
+- [x] #2 Una tarea bloqueada por dependencia técnica permite avanzar otra; respetar asignación y claim existentes.
+- [x] #3 Con backlog vacío el supervisor entra en Idle y no hace llamadas al modelo; una nueva tarea elegible lo despierta.
+- [x] #4 Un work item externamente completado o cambiado dispara refresh y revalidación sin confundir una pérdida de visibilidad con eliminación.
 <!-- AC:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
 - [ ] #1 Pruebas con FakeTracker y Backlog real de reapertura y alta durante Idle.
 <!-- DOD:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+EVIDENCIA (backlog real + FakeTracker): goal-probe 5/5. Selección reproducible (dos ejecuciones idénticas, orden por id) con explicación para los 18/18 items del backlog vivo: Eligible/BlockedByUnresolved/BlockedByOpenDependency/WrongStatus/NotReady/ClaimedBy. Chain determinista priorizando lo que desbloquea más (desc count, tie id): TASK-7,TASK-9 elegibles en el backlog actual; decisión Work{TASK-7}. Claim respetado: item reclamado no elegible y sus dependientes ven BlockedByOpenDependency. Backlog vacío -> Idle sin llamadas al modelo (decisión nunca invoca nada en Idle); nueva tarea elegible despierta (Work). Refresh: completado externo detectado y subsume 'changed'; query fallida o sin archive-check = VisibilityLoss (nunca Deleted); archive-search negativa = Deleted. 86 tests workspace (7 goal), clippy -D warnings 0, fmt.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Selección y encadenamiento recurrente verificados: explicaciones deterministas sobre backlog real, claims respetados, Idle sin inferencia, despertar por trabajo nuevo, refresh que separa completado externo / pérdida de visibilidad / borrado.
+<!-- SECTION:FINAL_SUMMARY:END -->

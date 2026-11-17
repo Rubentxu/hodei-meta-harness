@@ -4,11 +4,12 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Observed work states. Unknown provider states are preserved verbatim and
 /// are never eligible — an unrecognized state must not silently mean ready.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkStatus {
     Open,
     InProgress,
@@ -39,7 +40,7 @@ impl WorkStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
     pub title: String,
