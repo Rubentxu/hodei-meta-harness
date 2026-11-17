@@ -2,6 +2,7 @@
 //! it proves a real ACP v1 agent session inside an OpenSandbox environment,
 //! driven end to end through the hodei-mh lifecycle server and execd pipe.
 
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -14,6 +15,7 @@ use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod custom_goal_probe;
 mod goal_probe;
+mod oneshot_debug;
 mod probe_util;
 mod promote_probe;
 mod rollover_probe;
@@ -22,7 +24,7 @@ mod tracker_probe;
 mod verify_probe;
 mod workspace_probe;
 
-use probe_util::{MOCK_AGENT_JS, run_command_session, run_command_session_with_output, ws_url_for};
+use probe_util::{MOCK_AGENT_JS, run_command_session_with_output, ws_url_for};
 
 const PROBE_FILE: &str = "/workspace/hodei-probe.txt";
 
@@ -45,6 +47,10 @@ async fn main() {
                     .unwrap_or_else(|_| ".".to_string()),
             )
             .await;
+            std::process::exit(code);
+        }
+        Some("oneshot-probe") => {
+            let code = oneshot_debug::run(&args[1..]).await;
             std::process::exit(code);
         }
         Some("rollover-probe") => {
@@ -231,24 +237,88 @@ async fn acp_probe(args: &[String]) -> i32 {
     // 3. Install the agent inside the sandbox (mock script or npm adapter).
     match mode.as_str() {
         "mock" => {
+            // Attach-first oneshot: unheld sessions get purged before their
+            // process starts, so staging must hold the pipe immediately.
             let encoded = base64::engine::general_purpose::STANDARD.encode(MOCK_AGENT_JS);
             let install = format!(
-                "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js"
+                "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js && test -s /workspace/mock-acp-agent.js"
             );
-            let ok = run_command_session(&execd_base, &install).await;
+            let outcome =
+                opensandbox::execd::oneshot::run(&execd_base, &install, Duration::from_secs(20))
+                    .await;
             checks.push(ProbeCheck {
                 name: "agent-install",
-                passed: ok,
-                detail: "mock agent staged at /workspace/mock-acp-agent.js".into(),
+                passed: outcome.succeeded(),
+                detail: format!(
+                    "mock agent staged at /workspace/mock-acp-agent.js (exit={:?} out={:?})",
+                    outcome.exit_code,
+                    outcome.output.trim()
+                ),
             });
         }
         "claude" => {
-            let install = "npm install -g @zed-industries/claude-code-acp@0.16.2 2>&1 | tail -1 && command -v claude-code-acp";
-            let ok = run_command_session(&execd_base, install).await;
+            // The sandbox has no direct internet: install host-side, pack,
+            // upload, extract. The adapter is pure JS (node) so it is
+            // portable; nothing is persisted beyond the sandbox.
+            let install_dir = std::env::temp_dir().join("hodei-ccacp");
+            let host_install = Command::new("npm")
+                .args([
+                    "install",
+                    "--prefix",
+                    install_dir.to_string_lossy().as_ref(),
+                    "--no-audit",
+                    "--no-fund",
+                    "@zed-industries/claude-code-acp@0.16.2",
+                ])
+                .output();
+            let installed = match host_install {
+                Ok(out) if out.status.success() => true,
+                other => {
+                    checks.push(ProbeCheck {
+                        name: "agent-install",
+                        passed: false,
+                        detail: format!("host npm install failed: {other:?}"),
+                    });
+                    cleanup();
+                    report(&checks, sandbox_id, started.elapsed(), 1);
+                    unreachable!()
+                }
+            };
+            let packed = Command::new("tar")
+                .args([
+                    "czf",
+                    "/tmp/hodei-ccacp.tgz",
+                    "-C",
+                    install_dir.to_string_lossy().as_ref(),
+                    "node_modules",
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
+            let uploaded = api::upload_file(&execd_base, None, bundle, "/tmp/ccacp.tgz").await;
+            let probe_fs = opensandbox::execd::oneshot::run(
+                &execd_base,
+                "ls -la /tmp/ccacp.tgz",
+                Duration::from_secs(15),
+            )
+            .await;
+            let staged_outcome = opensandbox::execd::oneshot::run(
+                &execd_base,
+                "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp 2>&1 | tail -2 && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
+                Duration::from_secs(120),
+            )
+            .await;
+            let staged = staged_outcome.succeeded();
+            let staged_output = staged_outcome.output;
             checks.push(ProbeCheck {
                 name: "agent-install",
-                passed: ok,
-                detail: "claude-code-acp installed via npm".into(),
+                passed: installed && packed && uploaded.is_ok() && staged,
+                detail: format!(
+                    "host install={installed} pack={packed} upload={} extract={staged} out={staged_output:?} fs={:?}",
+                    uploaded.is_ok(),
+                    probe_fs
+                ),
             });
         }
         other => {
@@ -268,7 +338,18 @@ async fn acp_probe(args: &[String]) -> i32 {
         "mock" => "node /workspace/mock-acp-agent.js".to_string(),
         _ => {
             let token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
-            format!("ANTHROPIC_AUTH_TOKEN={token} claude-code-acp")
+            // Propagate an optional gateway base URL; never persist either.
+            let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default();
+            let base_prefix = if base.is_empty() {
+                String::new()
+            } else {
+                format!("ANTHROPIC_BASE_URL={base} ")
+            };
+            // The sandbox has no direct internet: the host bridge proxy
+            // (docker gateway IP) provides the HTTPS egress the agent needs.
+            format!(
+                "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY=http://172.17.0.1:8888 {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp"
+            )
         }
     };
     let session = api::create_session(
@@ -318,9 +399,11 @@ async fn acp_probe(args: &[String]) -> i32 {
         tokio::time::sleep(Duration::from_millis(300)).await;
         content = run_command_session_with_output(&execd_base, &format!("cat {PROBE_FILE}")).await;
     }
+    // Both modes must leave the SAME artifact: the agent (mock or real)
+    // writing the requested content inside the sandbox.
     checks.push(ProbeCheck {
         name: "file-modified-in-sandbox",
-        passed: content.contains("written-by-mock-agent") || content.contains("hodei"),
+        passed: content.contains("written-by-mock-agent"),
         detail: format!("cat -> {content:?}"),
     });
 
@@ -355,11 +438,14 @@ struct AgentProbeResult {
 /// Drive the ACP v1 conversation over the pipe: initialize, session/new,
 /// session/prompt, collect structured events, verify stderr separation,
 /// then cancel and observe process release.
-async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> AgentProbeResult {
+async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentProbeResult {
     let mut checks = Vec::new();
     let mut assembler = AcpAssembler::new();
     let mut stdout_bytes = 0usize;
     let mut stderr_bytes = 0usize;
+    let mut stderr_sample: Vec<u8> = Vec::new();
+    let mut acp_methods: Vec<String> = Vec::new();
+    let mut agent_text = String::new();
     let mut updates = 0usize;
     let mut next_id: u64 = 1;
     let mut pending_prompt_id: Option<u64> = None;
@@ -368,9 +454,11 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
     // Handshake.
     let init_id = next_id;
     next_id += 1;
+    // No fs capabilities advertised: the agent uses its OWN tools inside
+    // the sandbox instead of delegating writes to this client.
     let init_params = json!({
         "protocolVersion": 1,
-        "clientCapabilities": {"fs": {"readTextFile": true, "writeTextFile": true}}
+        "clientCapabilities": {}
     });
     if pipe_session
         .send_stdin(acp::encode_request(init_id, "initialize", init_params).as_bytes())
@@ -385,7 +473,7 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
         return AgentProbeResult { checks };
     }
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(if mode == "claude" { 240 } else { 60 });
     let mut new_session_sent = false;
     let mut prompt_sent = false;
     let mut cancel_sent = false;
@@ -413,10 +501,39 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
             }
             ServerEvent::Stdout(bytes) => {
                 stdout_bytes += bytes.len();
+
                 for message in assembler.push(&bytes).unwrap_or_default() {
                     // Structured ACP events (notifications) count separately.
                     if message.get("method").and_then(|m| m.as_str()) == Some("session/update") {
                         updates += 1;
+                        // Capture the agent's visible text (diagnostics):
+                        let chunk = message["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .unwrap_or_default();
+                        if !chunk.is_empty() && agent_text.len() < 4000 {
+                            agent_text.push_str(chunk);
+                        }
+                    }
+                    if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
+                        acp_methods.push(method.to_string());
+                        // The real agent asks the client for tool permission:
+                        // select the allow_once option it offered and keep
+                        // driving (ACP outcome = selected + optionId).
+                        if method == "session/request_permission" {
+                            let allow_option = message["params"]["options"]
+                                .as_array()
+                                .and_then(|opts| {
+                                    opts.iter()
+                                        .find(|o| o["kind"].as_str() == Some("allow_once"))
+                                        .and_then(|o| o["optionId"].as_str().map(str::to_string))
+                                })
+                                .unwrap_or_default();
+                            let response = acp::encode_response(
+                                message.get("id").cloned().unwrap_or(json!(0)),
+                                json!({"outcome": {"outcome": "selected", "optionId": allow_option}}),
+                            );
+                            let _ = pipe_session.send_stdin(response.as_bytes()).await;
+                        }
                     }
                     let id = message.get("id").and_then(|v| v.as_u64());
                     if id == Some(init_id) && message.get("result").is_some() {
@@ -433,7 +550,7 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
                                 acp::encode_request(
                                     sid,
                                     "session/new",
-                                    json!({"cwd": "/workspace"}),
+                                    json!({"cwd": "/workspace", "mcpServers": []}),
                                 )
                                 .as_bytes(),
                             )
@@ -471,6 +588,11 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
             }
             ServerEvent::Stderr(bytes) => {
                 stderr_bytes += bytes.len();
+                stderr_sample.extend(bytes);
+                if stderr_sample.len() > 4096 {
+                    let keep = stderr_sample.split_off(stderr_sample.len() - 2048);
+                    stderr_sample = keep;
+                }
             }
             ServerEvent::Exit { exit_code } => {
                 saw_exit = Some(exit_code);
@@ -496,8 +618,9 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
                     .and_then(|r| r.get("stopReason"))
                     .is_some(),
                 detail: format!(
-                    "stopReason={:?}",
-                    prompt_answer.as_ref().and_then(|r| r.get("stopReason"))
+                    "stopReason={:?} agent_text_tail={:?}",
+                    prompt_answer.as_ref().and_then(|r| r.get("stopReason")),
+                    agent_text.chars().rev().take(400).collect::<String>()
                 ),
             });
             checks.push(ProbeCheck {
@@ -555,7 +678,11 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, _mode: &str) -> Agent
     checks.push(ProbeCheck {
         name: "cancellation-releases-process",
         passed: saw_exit.is_some(),
-        detail: format!("exit_code observed: {saw_exit:?}"),
+        detail: format!(
+            "exit_code observed: {saw_exit:?}; methods_count={}; stderr_tail={:?}",
+            acp_methods.len(),
+            String::from_utf8_lossy(&stderr_sample)
+        ),
     });
     AgentProbeResult { checks }
 }

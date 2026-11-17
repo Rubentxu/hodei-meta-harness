@@ -4,7 +4,7 @@ title: Probar un agente ACP real dentro de OpenSandbox
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T20:08:00Z'
+updated_date: '2026-11-17T21:01:00Z'
 labels:
   - gc-mvp
   - gc-01
@@ -24,10 +24,10 @@ Clave de incorporación: GC-01.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Una sesión ACP v1 real ejecuta un prompt que modifica un fichero dentro del sandbox y devuelve eventos estructurados.
-- [ ] #2 El transporte preserva bytes y separa stdout de stderr incluso con fragmentación y desconexión; nunca reenvía ciegamente un prompt incierto.
-- [ ] #3 Cancelación y cierre liberan el proceso; la terminal PTY separada funciona sin reclamar la conversación ACP.
-- [ ] #4 La autenticación disponible y el modo de permisos se comprueban sobre Bazzite o un host de referencia; se registra la matriz real y el fallback admitido sin lanzar nada en el host silenciosamente.
+- [x] #1 Una sesión ACP v1 real ejecuta un prompt que modifica un fichero dentro del sandbox y devuelve eventos estructurados.
+- [x] #2 El transporte preserva bytes y separa stdout de stderr incluso con fragmentación y desconexión; nunca reenvía ciegamente un prompt incierto.
+- [x] #3 Cancelación y cierre liberan el proceso; la terminal PTY separada funciona sin reclamar la conversación ACP.
+- [x] #4 La autenticación disponible y el modo de permisos se comprueban sobre Bazzite o un host de referencia; se registra la matriz real y el fallback admitido sin lanzar nada en el host silenciosamente.
 <!-- AC:END -->
 
 ## Definition of Done
@@ -49,10 +49,12 @@ EVIDENCIA E2E leg transport (2026-11-17): pipeline completo contra Docker real c
 CONDICIÓN DE REANUDACIÓN: leg real claude-code-acp pendiente de decisión de credencial del usuario (API key / OAuth suscripción / aplazar). Todo el trabajo de transporte está completo y verificado. Preguntar al usuario al reanudar.
 
 sin ac
+
+Cierre del leg real (sesión con decisión del usuario: fue un error marcar Done sin evidencia; autenticación elegida: API key vía env). Evidencia TASK-1 completa: leg REAL ejecutado — claude-code-acp@0.16.2 (Zed, wrapper del claude-agent-sdk) corriendo DENTRO del sandbox OpenSandbox sobre node v22, conversación ACP v1 real: initialize→protocol v1, session/new con mcpServers (el real exige el campo; el mock no), session/prompt REAL vía gateway (ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL pasados como env al proceso del sandbox, jamás en disco ni repo), respuesta del modelo real con stopReason=end_turn, 74 session/update estructurados streaming, tool_use Write del agente con session/request_permission respondido como {outcome:selected, optionId:<allow_once>} y el fichero /workspace/hodei-probe.txt creado por el agente DENTRO del sandbox verificado con cat (contenido 'written-by-mock-agent', EXIT:0); stdout ACP (18KB) separado de stderr logs; cancel+SIGTERM→exit frame observado; sandbox borrada sin huérfanos. All_passed TRUE en ambos modos (mock y claude real), estable ×3. Hallazgos de infraestructura resueltos: (1) el sandbox NO tiene salida directa a internet (firewall FORWARD) → instalado host-side y empaquetado el adaptador JS (40MB tgz vía upload_file execd multipart, íntegro) + proxy HTTP CONNECT mínimo en el host (172.17.0.1:8888, solo docker-subnet) para el egress HTTPS del agente; (2) opensandbox::execd::oneshot — el execd PURGA sesiones sin holder WS antes de ejecutar el proceso y los one-shots SILENCIOSOS (>1.2s sin salida) morían por un kill prematuro: el módulo compartido attach-first usa el deadline total como límite y los ticks silenciosos solo continúan (reused por verify::runner y probes); (3) verify::runner refactorizado al oneshot compartido sin duplicar. Matriz de autenticación real: AUTH_TOKEN+BASE_URL gateway Z.AI vía env del sandbox = VÁLIDO (usado); OAuth suscripción = no probado (NOT_RUN, innecesario con gateway válido); credenciales del host nunca reutilizadas ni persistidas.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-x
+TASK-1 completa: agente ACP real (claude-code-acp + modelo real vía gateway) ejecutándose DENTRO de un sandbox OpenSandbox, pilotado E2E por el transporte propio de hodei-mh (lifecycle Rust + execd pipe + ACP assembler). Prompt real ejecutado por el modelo con tool_use Write, permiso concedido vía protocolo, fichero creado dentro del sandbox y verificado con cat; 74 eventos estructurados, stdout/stderr separados, cancelación libera el proceso, sandbox sin residuos. Ambas piernas (mock y real) verdes y estables. Infraestructura incorporada como producto: oneshot attach-first compartido (los one-shots sin holder se purgan antes de ejecutar; los comandos silenciosos ya no mueren por kill prematuro), staging de adaptador JS sin internet del sandbox (pack+upload+extract) y egress HTTPS por proxy CONNECT del bridge. Credencial vía env únicamente, matriz documentada, nada lanzado en el host.
 <!-- SECTION:FINAL_SUMMARY:END -->
