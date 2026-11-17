@@ -1,0 +1,14 @@
+[package]
+name = "hodei-mh-profiles"
+description = "Reproducible language profiles for hodei-meta-harness: pinned images, non-destructive doctor, availability gate (no YOLO fallback), per-project caches and minimal credential channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "profiles"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
