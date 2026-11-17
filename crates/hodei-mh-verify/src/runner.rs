@@ -4,14 +4,12 @@
 //! every result to the candidate digest and environment fingerprint.
 //! A timeout or lost session yields an ABSENT record: never a PASS.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use opensandbox::execd::api::{self, CreateSessionRequest};
-use opensandbox::execd::frames::ServerEvent;
-use opensandbox::execd::pipe::{self, AttachOptions};
+use opensandbox::execd::api;
 
 use crate::digest::CandidateDigest;
 use crate::evidence::{BoundResult, EvidenceSet};
@@ -183,85 +181,22 @@ impl CleanRunner {
     }
 }
 
-/// Run one command to its terminal state or to the timeout, whichever comes
-/// first. The pipe attaches IMMEDIATELY after creation: the execd drops
-/// unheld sessions before their process can even start, so being the
-/// holder is part of running a command, not an optional extra. A timeout
-/// or a lost session produces `ExecutionRecord::absent` — exit code None,
-/// never eligible for PASS (AC-1).
+/// Run one command to its terminal state or to the timeout (shared,
+/// attach-first oneshot), mapped into an ExecutionRecord: timeout and
+/// signal deaths produce absence — never a PASS (AC-1).
 async fn run_with_timeout(execd_base: &str, command: &str, timeout: Duration) -> ExecutionRecord {
-    let Ok(session) = api::create_session(
-        execd_base,
-        None,
-        CreateSessionRequest {
-            cwd: None,
-            command: Some(command),
-        },
-    )
-    .await
-    else {
-        return ExecutionRecord::absent(command, "could not create session");
-    };
-
-    let ws_url = ws_url_for(execd_base, &session.session_id);
-    let attached = pipe::attach(&ws_url, AttachOptions::default()).await;
-    let mut output: Vec<u8> = Vec::new();
-    let mut terminal_code: Option<i32> = None;
-
-    if let Ok(mut pipe_session) = attached {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(1200), pipe_session.next_event()).await
-            {
-                Ok(Some(ServerEvent::Stdout(bytes)))
-                | Ok(Some(ServerEvent::Replay { data: bytes, .. })) => output.extend(bytes),
-                Ok(Some(ServerEvent::Stderr(bytes))) => output.extend(bytes),
-                Ok(Some(ServerEvent::Exit { exit_code })) => {
-                    terminal_code = exit_code;
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-        if terminal_code.is_none() {
-            // Still running at the deadline: kill and record absence. The
-            // signal death is reported as a negative code — a signal is not
-            // a terminal exit status, so it can never become a verdict.
-            let _ = pipe_session.send_signal("SIGKILL").await;
-            let grace = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < grace && terminal_code.is_none() {
-                match tokio::time::timeout(Duration::from_millis(800), pipe_session.next_event())
-                    .await
-                {
-                    Ok(Some(ServerEvent::Exit { exit_code })) => terminal_code = exit_code,
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-        let _ = pipe_session.close().await;
-    }
-    let _ = api::delete_session(execd_base, None, &session.session_id).await;
-
-    let text = String::from_utf8_lossy(&output).to_string();
-    match terminal_code {
-        // A negative code means the process died by signal: no terminal
-        // exit status exists, so the result is absence, never a verdict.
-        Some(code) if code >= 0 => ExecutionRecord::terminal(command, code, text),
-        Some(_) => ExecutionRecord::absent(
+    let outcome = opensandbox::execd::oneshot::run(execd_base, command, timeout).await;
+    match outcome.exit_code {
+        Some(code) => ExecutionRecord::terminal(command, code, outcome.output),
+        None => ExecutionRecord::absent(
             command,
-            "process died by signal; no terminal exit status was produced",
+            if outcome.output.is_empty() {
+                "no terminal result observed"
+            } else {
+                "process died by signal; no terminal exit status was produced"
+            },
         ),
-        None => ExecutionRecord::absent(command, "no terminal exit surfaced"),
     }
-}
-
-fn ws_url_for(execd_base: &str, session_id: &str) -> String {
-    let ws_base = execd_base
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1);
-    format!("{ws_base}/pty/{session_id}/ws?pty=0")
 }
 
 #[cfg(test)]

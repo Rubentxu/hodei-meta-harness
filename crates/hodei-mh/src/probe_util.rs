@@ -56,14 +56,6 @@ pub fn ws_url_for(execd_base: &str, session_id: &str) -> String {
     format!("{authority}/pty/{session_id}/ws?pty=0")
 }
 
-/// Run a one-shot shell command in the sandbox via a dedicated PTY session,
-/// returning whether it exited successfully.
-pub async fn run_command_session(execd_base: &str, command: &str) -> bool {
-    run_command_session_with_output(execd_base, command)
-        .await
-        .ends_with("EXIT:0")
-}
-
 /// Same, returning captured output plus a trailing `EXIT:<code>` marker.
 /// One-shot commands may finish before the pipe attaches, so completion is
 /// tracked through the status endpoint and output is read via replay.
