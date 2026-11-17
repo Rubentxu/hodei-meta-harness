@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use hodei_mh_goal::refresh::{self, Disappearance};
-use hodei_mh_goal::selection::{chain_order, explain_selection, next_decision};
+use goal::refresh::{self, Disappearance};
+use goal::selection::{chain_order, explain_selection, next_decision};
 use hodei_mh_tracker::backlog::BacklogTracker;
 use hodei_mh_tracker::core::TrackerRead;
 use hodei_mh_tracker::fake::{FakeTracker, contracts};
@@ -66,10 +66,7 @@ pub async fn run(working_dir: String) -> i32 {
     let decision = next_decision(&explained_once, &claims);
     checks.push(Check {
         name: "next-decision-from-live-backlog",
-        passed: matches!(
-            decision,
-            hodei_mh_goal::selection::SupervisorDecision::Work { .. }
-        ),
+        passed: matches!(decision, goal::selection::SupervisorDecision::Work { .. }),
         detail: format!("{decision:?}"),
     });
 
@@ -79,7 +76,7 @@ pub async fn run(working_dir: String) -> i32 {
     let empty_snapshot = empty.snapshot().await.unwrap_or_default();
     let empty_explained = explain_selection(&empty_snapshot, &BTreeMap::new());
     let idle = next_decision(&empty_explained, &BTreeMap::new());
-    let idle_ok = idle == hodei_mh_goal::selection::SupervisorDecision::Idle;
+    let idle_ok = idle == goal::selection::SupervisorDecision::Idle;
     checks.push(Check {
         name: "empty-backlog-idle",
         passed: idle_ok,
@@ -99,7 +96,7 @@ pub async fn run(working_dir: String) -> i32 {
         name: "new-eligible-wakes-supervisor",
         passed: matches!(
             next_decision(&woke_explained, &BTreeMap::new()),
-            hodei_mh_goal::selection::SupervisorDecision::Work { .. }
+            goal::selection::SupervisorDecision::Work { .. }
         ),
         detail: "NEW-1 in snapshot -> Work decision".into(),
     });

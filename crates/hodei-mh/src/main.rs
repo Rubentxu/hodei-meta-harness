@@ -12,6 +12,7 @@ use opensandbox::execd::api::{self, CreateSessionRequest};
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
+mod custom_goal_probe;
 mod goal_probe;
 mod probe_util;
 mod promote_probe;
@@ -31,6 +32,10 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("acp-probe") => {
             let code = acp_probe(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("custom-goal-probe") => {
+            let code = custom_goal_probe::run();
             std::process::exit(code);
         }
         Some("goal-probe") => {
