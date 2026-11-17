@@ -24,7 +24,10 @@ mod promote_probe;
 mod release_probe;
 mod rollover_probe;
 mod run_probe;
+mod supervisor_cli;
+mod supervisor_probe;
 mod tracker_probe;
+mod tui;
 mod verify_probe;
 mod workspace_probe;
 
@@ -56,6 +59,34 @@ async fn main() {
             let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
             let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
             let code = autonomous_probe::run(&server, &image).await;
+            std::process::exit(code);
+        }
+        Some("supervisor") => {
+            let code = supervisor_cli::run_supervisor(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("sup-status") => {
+            let code = supervisor_cli::run_status(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("sup-action") => {
+            let code = supervisor_cli::run_action(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("sup-events") => {
+            let code = supervisor_cli::run_events(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("attach-terminal") => {
+            let code = supervisor_cli::run_attach_terminal(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("tui") => {
+            let code = supervisor_cli::run_tui(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("supervisor-probe") => {
+            let code = supervisor_probe::run().await;
             std::process::exit(code);
         }
         Some("custom-goal-probe") => {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/opensandbox", "crates/hodei-mh-interact", "crates/hodei-mh-budget", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/hodei-mh-coordinator", "crates/hodei-mh-run", "crates/hodei-mh-goal", "crates/hodei-mh-rollover", "crates/hodei-mh-verify", "crates/hodei-mh-promote", "crates/hodei-mh-release", "crates/lifecycle-server"]
+members = ["crates/opensandbox", "crates/hodei-mh-interact", "crates/hodei-mh-budget", "crates/hodei-mh", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/hodei-mh-coordinator", "crates/hodei-mh-run", "crates/hodei-mh-goal", "crates/hodei-mh-rollover", "crates/hodei-mh-verify", "crates/hodei-mh-promote", "crates/hodei-mh-release", "crates/hodei-mh-supervisor", "crates/lifecycle-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,3 +26,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 async-trait = "0.1"
+ratatui = "0.29"
+crossterm = "0.28"

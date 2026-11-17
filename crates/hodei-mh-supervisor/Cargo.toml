@@ -1,0 +1,17 @@
+[package]
+name = "hodei-mh-supervisor"
+description = "Supervisor control/observation surface for hodei-meta-harness: protocol, pure engine, Unix-socket server and clients (CLI/TUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "supervisor"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
