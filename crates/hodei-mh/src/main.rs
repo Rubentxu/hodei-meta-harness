@@ -13,6 +13,7 @@ use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod probe_util;
+mod tracker_probe;
 mod workspace_probe;
 
 use probe_util::{run_command_session, run_command_session_with_output, ws_url_for};
@@ -60,6 +61,15 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("acp-probe") => {
             let code = acp_probe(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("tracker-probe") => {
+            let code = tracker_probe::run(
+                std::env::current_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string()),
+            )
+            .await;
             std::process::exit(code);
         }
         Some("workspace-probe") => {
