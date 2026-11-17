@@ -19,6 +19,7 @@ goal = { path = "../hodei-mh-goal", package = "hodei-mh-goal" }
 rollover = { path = "../hodei-mh-rollover", package = "hodei-mh-rollover" }
 verify = { path = "../hodei-mh-verify", package = "hodei-mh-verify" }
 interact = { path = "../hodei-mh-interact", package = "hodei-mh-interact" }
+budget = { path = "../hodei-mh-budget", package = "hodei-mh-budget" }
 promote = { path = "../hodei-mh-promote", package = "hodei-mh-promote" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
