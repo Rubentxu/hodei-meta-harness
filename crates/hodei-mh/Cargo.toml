@@ -15,6 +15,7 @@ hodei-mh-workspace = { path = "../hodei-mh-workspace", package = "hodei-mh-works
 hodei-mh-tracker = { path = "../hodei-mh-tracker", package = "hodei-mh-tracker" }
 hodei-mh-coordinator = { path = "../hodei-mh-coordinator", package = "hodei-mh-coordinator" }
 hodei-mh-run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
+hodei-mh-goal = { path = "../hodei-mh-goal", package = "hodei-mh-goal" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
