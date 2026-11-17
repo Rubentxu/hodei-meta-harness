@@ -17,6 +17,7 @@ mod probe_util;
 mod rollover_probe;
 mod run_probe;
 mod tracker_probe;
+mod verify_probe;
 mod workspace_probe;
 
 use probe_util::{MOCK_AGENT_JS, run_command_session, run_command_session_with_output, ws_url_for};
@@ -44,6 +45,12 @@ async fn main() {
             let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
             let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
             let code = rollover_probe::run(&server, &image).await;
+            std::process::exit(code);
+        }
+        Some("verify-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = verify_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("run-probe") => {
