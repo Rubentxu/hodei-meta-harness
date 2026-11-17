@@ -94,6 +94,60 @@ pub async fn delete_session(
     Ok(())
 }
 
+/// `POST /files/upload` — multipart upload of a file into the sandbox.
+/// Contract: one metadata part (JSON `{"path":..., "mode":...}`) followed by
+/// the binary `file` part, in that order.
+pub async fn upload_file(
+    base_url: &str,
+    access_token: Option<&str>,
+    content: Vec<u8>,
+    remote_path: &str,
+) -> Result<(), ExecdApiError> {
+    let url = format!("{base_url}/files/upload");
+    let metadata = serde_json::json!({
+        "path": remote_path,
+    })
+    .to_string();
+    let metadata_part = reqwest::multipart::Part::text(metadata)
+        .file_name("metadata.json")
+        .mime_str("application/json")?;
+    let file_part = reqwest::multipart::Part::bytes(content).file_name("payload");
+    let form = reqwest::multipart::Form::new()
+        .part("metadata", metadata_part)
+        .part("file", file_part);
+    let mut builder = http_client()?.post(url).multipart(form);
+    if let Some(token) = access_token {
+        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    }
+    let response = builder.send().await?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ExecdApiError::Status { status, body });
+    }
+    Ok(())
+}
+
+/// `GET /files/download?path=...` — stream a sandbox file back to the host.
+pub async fn download_file(
+    base_url: &str,
+    access_token: Option<&str>,
+    remote_path: &str,
+) -> Result<Vec<u8>, ExecdApiError> {
+    let url = format!("{base_url}/files/download");
+    let mut builder = http_client()?.get(url).query(&[("path", remote_path)]);
+    if let Some(token) = access_token {
+        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    }
+    let response = builder.send().await?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ExecdApiError::Status { status, body });
+    }
+    Ok(response.bytes().await?.to_vec())
+}
+
 fn http_client() -> Result<reqwest::Client, ExecdApiError> {
     Ok(reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
