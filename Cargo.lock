@@ -558,6 +558,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
+ "hodei-mh-budget",
  "hodei-mh-coordinator",
  "hodei-mh-goal",
  "hodei-mh-interact",
@@ -571,6 +572,15 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "hodei-mh-budget"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

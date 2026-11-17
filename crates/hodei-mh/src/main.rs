@@ -14,6 +14,7 @@ use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
 mod autonomous_probe;
+mod budget_probe;
 mod custom_goal_probe;
 mod goal_probe;
 mod interact_probe;
@@ -36,6 +37,12 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("acp-probe") => {
             let code = acp_probe(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("budget-probe") => {
+            let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
+            let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
+            let code = budget_probe::run(&server, &image).await;
             std::process::exit(code);
         }
         Some("autonomous-loop") => {
