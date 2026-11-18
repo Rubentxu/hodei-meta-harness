@@ -106,6 +106,17 @@ NO credential of its own — the barrier is the execd's own per-sandbox
 credential, which the control plane hands over in the endpoint contract and
 which the execd demands in the `X-EXECD-ACCESS-TOKEN` header.
 
+One supervisor per project, enforced by the socket itself: starting a
+second supervisor on a LIVE socket is refused (`a supervisor is already
+listening on ...`), so the state can never split in two. A socket left by a
+crashed supervisor is stale and IS taken over. The CLI and the TUI are
+clients of the same socket (`sup-status`,
+`sup-action start|pause|resume|stop|renew`, `tui`).
+
+The supervisor serves ONE project: a `Start` naming a different project is
+refused with `project mismatch`, and the snapshot states the grant's effect
+scope explicitly (the supervisor authorizes no effect by itself).
+
 ## The trust boundary
 
 Every sandbox runs in a network of its own, and the boundary is verified
@@ -162,17 +173,6 @@ is read by the execd, so the server owns it:
 the container to its network, the applied resource limits and the real state
 of the container. A sandbox whose isolation could not be established is a
 failure, not a sandbox that reports itself as running.
-
-One supervisor per project, enforced by the socket itself: starting a
-second supervisor on a LIVE socket is refused (`a supervisor is already
-listening on ...`), so the state can never split in two. A socket left by a
-crashed supervisor is stale and IS taken over. The CLI and the TUI are
-clients of the same socket (`sup-status`,
-`sup-action start|pause|resume|stop|renew`, `tui`).
-
-The supervisor serves ONE project: a `Start` naming a different project is
-refused with `project mismatch`, and the snapshot states the grant's effect
-scope explicitly (the supervisor authorizes no effect by itself).
 
 ## Doctor (strictly non-destructive)
 
