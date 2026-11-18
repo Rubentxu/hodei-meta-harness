@@ -11,8 +11,9 @@ without evidence.
 
 ## Prerequisites (clean host)
 
-1. Docker (the chosen backend): `docker --version` (any recent version with
-   `docker inspect`).
+1. Docker with support for an internal bridge using IPv4 gateway mode
+   `isolated`. The lifecycle server validates each network and refuses to
+   create the sandbox if the backend cannot enforce it.
 2. A Rust toolchain to build the harness itself: cargo ≥ 1.96 (the shipped
    `rust` profile runs cargo 1.100.0 inside its own image).
 
@@ -21,19 +22,24 @@ without evidence.
    system library from the host. The binaries land in
    `$BIN` = `target/x86_64-unknown-linux-gnu/release` (the triple is
    explicit because the static flags must not reach the proc-macros).
-3. Restricted egress proxy for sandboxes (the authorized network path):
-   `python3 scripts/egress-proxy.py` — binds `172.17.0.1:8888`, accepts
-   CONNECT only from the docker subnet. The probe lane starts it when
-   none is running and stops it at the end.
+3. A restricted egress proxy running in a Docker container, configured via
+   `HODEI_MH_EGRESS_PROXY_CONTAINER`. The lifecycle server creates a separate
+   internal bridge for each sandbox, requiring IPv4 gateway mode `isolated`
+   and IPv6 disabled, and attaches the configured proxy using the Docker DNS
+   alias `hodei-proxy`. A backend that cannot provide this mode is unsupported.
+   The operator must configure the proxy to permit clients from Docker's
+   sandbox address pools: the shipped proxy accepts `172.16.0.0/12`, which
+   covers every pool Docker allocates from (`172.17`–`172.31`), and refuses
+   a broader prefix. The probe lane uses the configured proxy and does
+   not create or remove it.
 
-   **Direct internet from a sandbox is NOT blocked by the harness.** The
-   lifecycle server runs sandboxes on Docker's default `bridge` network
-   without an egress firewall, so a sandbox can reach the internet on its
-   own. `profile-run` MEASURES this from inside the sandbox and records the
-   result (`sandbox_egress.direct_internet_reachable`). Restricting it is a
-   host-level concern (a forwarding firewall rule or a dedicated internal
-   network); until that is configured, treat the proxy as the *preferred*
-   path, not an enforced boundary.
+   Configure `HODEI_MH_PROXY_URL` to the proxy address reachable from the
+   sandbox (for example `http://hodei-proxy:8888`) and
+   `HODEI_MH_PROXY_CHECK_URL` to its host-side address. Before a profile build,
+   the client checks proxy reachability and checks that direct internet access
+   is blocked. These observations do not authenticate the proxy or prove
+   isolation from every possible destination: operators must provision and
+   trust the proxy and its network connections.
 4. Credentials, if the workload needs them, in the environment of the
    process that needs them (`ANTHROPIC_AUTH_TOKEN`, ...). They are never
    written to disk, logs, state or snapshots.
@@ -83,9 +89,25 @@ dependencies are used at runtime.
 ## Start the control plane
 
 ```bash
+# Set a secret shared by the lifecycle server and its authorized clients.
+export HODEI_MH_CONTROL_TOKEN="$(openssl rand -hex 32)"
+# Name or ID of the operator-provisioned restricted proxy container.
+export HODEI_MH_EGRESS_PROXY_CONTAINER="your-proxy-container"
+export HODEI_MH_PROXY_URL="http://hodei-proxy:8888"
+export HODEI_MH_PROXY_CHECK_URL="http://127.0.0.1:8888"
 PORT=8081 $BIN/hodei-mh-lifecycle-server &
 $BIN/hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock --project hodei-mh &
 ```
+
+The lifecycle HTTP listener accepts loopback hosts only; do not expose its
+bearer credential over an unprotected network. Sandbox ports are not published:
+a per-sandbox loopback relay carries the traffic to the execd. The relay has
+NO credential of its own — the barrier is the execd's own per-sandbox
+credential, which the control plane hands over in the endpoint contract and
+which the execd demands in the `X-EXECD-ACCESS-TOKEN` header. The relay is
+bounded: 32 open connections per sandbox, 900 seconds of silence close a
+connection, and no connection lives longer than 2 hours, so a client that
+keeps a connection busy cannot starve the one that owns the sandbox.
 
 One supervisor per project, enforced by the socket itself: starting a
 second supervisor on a LIVE socket is refused (`a supervisor is already
@@ -97,6 +119,106 @@ clients of the same socket (`sup-status`,
 The supervisor serves ONE project: a `Start` naming a different project is
 refused with `project mismatch`, and the snapshot states the grant's effect
 scope explicitly (the supervisor authorizes no effect by itself).
+
+## The trust boundary
+
+Every sandbox runs in a network of its own, and the boundary is verified
+before the sandbox is reported as usable. The properties below are not
+aspirational: each one is checked by the control plane (which fails closed)
+or measured from inside the sandbox by `hodei-mh trust-probe`.
+
+**The network of a sandbox.** One internal bridge per sandbox, created and
+verified by the server:
+
+- `internal=true`: the bridge has no route to the outside.
+- `enable_ipv6=false`: no second way out.
+- `com.docker.network.bridge.gateway_mode_ipv4=isolated`: the bridge gateway
+  does not forward for the sandbox, and the sandbox has no default route at
+  all (measured from inside: `/proc/net/route` carries no default).
+- The subnet is allocated by Docker from the `172.17.0.0/16`–`172.31.0.0/16`
+  pools, so a sandbox never shares a subnet with the host's default bridge.
+  The server reads the allocated subnet back and REFUSES one that falls
+  outside the range the operator declared (`SANDBOX_ADDRESS_POOL`, by default
+  `172.16.0.0/12`, the same range the proxy accepts clients from): an
+  allocation the operator did not ask for is a boundary nobody chose.
+- The container is attached to that network ALONE, and the server reads the
+  attachment back: a container attached somewhere else fails the creation.
+- `NET_ADMIN` and `NET_RAW` are dropped, so the sandbox cannot add a route
+  of its own.
+
+**The egress path.** The operator's proxy is attached to the sandbox's
+bridge by its immutable container id, under the DNS alias `hodei-proxy`.
+The sandbox reaches the internet ONLY through that proxy, and the proxy
+speaks HTTPS `CONNECT` to an exact allow-list of destinations, validating
+every DNS answer and refusing any answer that is not a global address. The
+proxy's client ACL must cover the pools Docker allocates from
+(`172.16.0.0/12`); a prefix broader than a /12 is refused, because a proxy
+that accepts the whole address space is an open relay for the host. The
+proxy also accounts for the tunnels it has open: a sandbox that opens
+tunnels without limit would take the egress of every other sandbox with it.
+
+**The execution plane.** The execd listens on `0.0.0.0:44772` of the
+sandbox's own network, so it is reachable from INSIDE the sandbox — the
+network is not the barrier. The barrier is the credential: the server mints
+one per sandbox, injects it into the container's environment, and hands it
+over in the endpoint contract of that sandbox only. The execd refuses a
+request with a missing, wrong or foreign credential, and it refuses one
+from inside the sandbox as well (measured: `401`).
+
+**The environment belongs to the operator.** The environment of the sandbox
+is read by the execd, so the server owns it:
+
+- The operator's variables win over the request's, always.
+- A request may NOT write into the `EXECD_` or `OPENSANDBOX_` namespaces:
+  the execd takes its configuration from there.
+- The IMAGE may not write into them either: the daemon merges the
+  environment of the image with the one of the container, so an image that
+  declares `EXECD_*` or `OPENSANDBOX_*` would reach the execution plane by
+  a door the composition does not cover. The server inspects the image and
+  refuses it.
+- The credential and the identity of the sandbox belong to the server. The
+  credential is read back from the container by EXACT name, and an
+  environment entry that merely starts with the same name is not the
+  credential — a request cannot choose the credential the server hands out.
+  The value read back is compared with the one the server minted, and a
+  sandbox whose credential is not that one is refused.
+
+**What the server verifies before answering a create.** The attachment of
+the container to its network, the applied resource limits and the real state
+of the container. A sandbox whose isolation could not be established is a
+failure, not a sandbox that reports itself as running.
+
+**What the server does when a sandbox is released.** The container and its
+bridge go away, and the release is written to the log with what it removed.
+A network whose removal is refused (Docker still holds the proxy's endpoint)
+is retried, and every attempt makes sure the proxy is really detached. A
+bridge that survives anyway is not lost: the sweep removes the networks of
+sandboxes that no longer exist, two minutes after they were created.
+
+**What happens to the bridge of a creation that is still working.** The sweep
+never touches it: the creations in flight are recorded, and the age of a
+network says nothing about how long the creation takes. The two-minute margin
+is only the last line for the bridges that no creation owns, because the
+process that created them is gone.
+
+**What happens to the bridge of a creation that never finishes.** The bridge
+is created BEFORE the container, so a creation that fails — or that is
+abandoned because its client gave up — would leave a bridge on the host that
+no sandbox owns. The creation holds that bridge until it finishes: whatever
+the reason it did not finish, the bridge goes away with it.
+
+**How the boundary is measured.** `hodei-mh trust-probe` does not assert the
+properties above: it measures them, from the host and from inside a real
+sandbox. The checks that run inside cover the routing table, the IPv6
+addresses, the name resolution, the reachability of the host, of the internet
+(TCP and UDP), of an IPv6 destination and of the authorized proxy, the refusal
+of the execd without its credential, and the ownership of the credential and
+of the identity of the environment. A check that could not be measured is
+reported as `NOT_MEASURED` and the probe FAILS: an absence of evidence is
+never evidence. The report carries no credential, and the environments the
+probe creates are deleted before it finishes — even the one whose identifier
+it never received, which is found again by the marker it left in the
+metadata.
 
 ## Doctor (strictly non-destructive)
 
@@ -147,9 +269,7 @@ Behavior:
 - Creates a sandbox with the PINNED image and the REQUESTED limits, then
   reports the OBSERVED limits from inside (cgroups).
 - Waits (BOUNDED, 60 s) for the sandbox's `execd` to start answering
-  before running anything: a fresh sandbox publishes its port before the
-  server inside can answer, and the first attempts are REFUSED. Without
-  that wait a booting sandbox is recorded as a failed command. The wait
+  through its loopback control relay before running the workload. The wait
   uses a harmless probe, so the real command runs EXACTLY ONCE — a
   command that ran and failed is never repeated. A sandbox that never
   becomes usable is a failure (exit 1), not an endless wait.

@@ -8,6 +8,9 @@
 //! the bundle).
 
 use std::path::{Path, PathBuf};
+
+use opensandbox::control::ControlPlane;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -163,13 +166,9 @@ fn spawn_budget_server(bin: &Path, server_url: &str) -> Command {
 
 /// Whether the lifecycle server answers its readiness probe.
 async fn wait_lifecycle_ready(server_url: &str) -> bool {
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server_url);
     for _ in 0..30 {
-        if let Ok(response) = client
-            .get(format!("{server_url}/ready"))
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
+        if let Ok(response) = client.ready().timeout(Duration::from_secs(2)).send().await
             && response.status().is_success()
         {
             return true;
@@ -184,9 +183,9 @@ async fn wait_lifecycle_ready(server_url: &str) -> bool {
 /// not be READ: an unknown count is not an empty host, and treating it
 /// as one would make the probe expect slots the server cannot admit.
 async fn count_sandboxes(server_url: &str) -> Option<usize> {
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server_url);
     let response = client
-        .get(format!("{server_url}/v1/sandboxes"))
+        .get(ControlPlane::sandboxes_path())
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -208,9 +207,9 @@ async fn wait_supervisor(bin: &Path, socket: &str) -> bool {
     false
 }
 
-async fn create_sandbox(server: &str, tag: &str) -> String {
-    let created: Value = match reqwest::Client::new()
-        .post(format!("{server}/v1/sandboxes"))
+async fn create_sandbox(client: &ControlPlane, tag: &str) -> String {
+    let created: Value = match client
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": RUST_IMAGE},
             "entrypoint": ["sleep", "infinity"],
@@ -227,17 +226,17 @@ async fn create_sandbox(server: &str, tag: &str) -> String {
     created["id"].as_str().unwrap_or_default().to_string()
 }
 
-async fn execd_for(server: &str, sid: &str) -> String {
-    let execd = match reqwest::Client::new()
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+async fn execd_for(client: &ControlPlane, sid: &str) -> ExecdEndpoint {
+    let execd = match client
+        .get(&ControlPlane::endpoint_path(sid, 44772))
         .send()
         .await
     {
         Ok(r) => {
             let v: Value = r.json().await.unwrap_or_default();
-            format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
+            ExecdEndpoint::from_contract(&v).unwrap_or_default()
         }
-        Err(_) => String::new(),
+        Err(_) => ExecdEndpoint::default(),
     };
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
@@ -245,17 +244,13 @@ async fn execd_for(server: &str, sid: &str) -> String {
     execd
 }
 
-async fn delete_sandbox(server: &str, sid: &str) -> bool {
-    delete_sandbox_detailed(server, sid).await.0
+async fn delete_sandbox(client: &ControlPlane, sid: &str) -> bool {
+    delete_sandbox_detailed(client, sid).await.0
 }
 
 /// (deleted, status code, body) — the probe reports what REALLY happened.
-async fn delete_sandbox_detailed(server: &str, sid: &str) -> (bool, u16, String) {
-    match reqwest::Client::new()
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
-        .send()
-        .await
-    {
+async fn delete_sandbox_detailed(client: &ControlPlane, sid: &str) -> (bool, u16, String) {
+    match client.delete(&ControlPlane::sandbox_path(sid)).send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
@@ -265,16 +260,21 @@ async fn delete_sandbox_detailed(server: &str, sid: &str) -> (bool, u16, String)
     }
 }
 
-async fn sandbox_exists(server: &str, sid: &str) -> bool {
-    reqwest::Client::new()
-        .get(format!("{server}/v1/sandboxes/{sid}"))
+async fn sandbox_exists(client: &ControlPlane, sid: &str) -> bool {
+    client
+        .get(&ControlPlane::sandbox_path(sid))
         .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
 }
 
-async fn stage_and_build(execd: &str, project: &Path, marker: &str) -> bool {
+async fn stage_and_build(
+    execd: &ExecdEndpoint,
+    project: &Path,
+    marker: &str,
+    proxy_url: &str,
+) -> bool {
     let tgz =
         std::env::temp_dir().join(format!("hodei-mproj-{}-{}.tgz", std::process::id(), marker));
     let packed = Command::new("tar")
@@ -296,7 +296,7 @@ async fn stage_and_build(execd: &str, project: &Path, marker: &str) -> bool {
     let _ = std::fs::remove_file(&tgz);
     let mut uploaded = false;
     for _ in 0..3 {
-        if opensandbox::execd::api::upload_file(execd, None, bytes.clone(), "/tmp/project.tgz")
+        if opensandbox::execd::api::upload_file(execd, bytes.clone(), "/tmp/project.tgz")
             .await
             .is_ok()
         {
@@ -317,9 +317,10 @@ async fn stage_and_build(execd: &str, project: &Path, marker: &str) -> bool {
     if !staged.succeeded() {
         return false;
     }
+    let quoted_proxy = format!("'{}'", proxy_url.replace('\'', "'\\''"));
     let build = crate::probe_util::run_in_sandbox(
         execd,
-        "HTTPS_PROXY=http://172.17.0.1:8888 HTTP_PROXY=http://172.17.0.1:8888 CARGO_TARGET_DIR=/workspace/.cache/target cargo run --quiet --manifest-path /workspace/project/Cargo.toml",
+        &format!("HTTPS_PROXY={quoted_proxy} HTTP_PROXY={quoted_proxy} CARGO_TARGET_DIR=/workspace/.cache/target cargo run --quiet --manifest-path /workspace/project/Cargo.toml"),
         Duration::from_secs(240),
     )
     .await;
@@ -426,6 +427,8 @@ pub async fn run(args: &[String]) -> i32 {
     let mut steps: Vec<Step> = Vec::new();
     let bin = std::env::current_exe().expect("current binary");
     let server = flag(args, "--server", "http://127.0.0.1:8081");
+    let proxy_url = flag(args, "--proxy-url", crate::profile_run::DEFAULT_PROXY_URL);
+    let control = ControlPlane::new(&server);
     let base = std::env::temp_dir().join(format!("hodei-mproj-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::create_dir_all(&base);
@@ -524,10 +527,11 @@ pub async fn run(args: &[String]) -> i32 {
     let preexisting = count_sandboxes(&budget_server).await;
     let mut refused_by_budget: Option<String> = None;
     let mut created_ids: Vec<String> = Vec::new();
+    let budget_control = ControlPlane::new(&budget_server);
     if budget_ready {
         for _ in 0..(BUDGET_SLOTS + 2) {
-            let response = reqwest::Client::new()
-                .post(format!("{budget_server}/v1/sandboxes"))
+            let response = budget_control
+                .post(ControlPlane::sandboxes_path())
                 .json(&json!({
                     "image": {"uri": "rust:1-bookworm"},
                     "entrypoint": ["sleep", "infinity"],
@@ -571,8 +575,8 @@ pub async fn run(args: &[String]) -> i32 {
     // and it needs the count of the environments already alive.
     let budget_enforced = refused && free_slots.is_none_or(|slots| created_ids.len() == slots);
     for id in &created_ids {
-        let _ = reqwest::Client::new()
-            .delete(format!("{budget_server}/v1/sandboxes/{id}"))
+        let _ = budget_control
+            .delete(&ControlPlane::sandbox_path(id))
             .send()
             .await;
     }
@@ -629,14 +633,14 @@ pub async fn run(args: &[String]) -> i32 {
         if !matches!(admissions[index], Admission::Admitted) {
             continue; // gamma/delta wait: no sandbox, no build (below).
         }
-        let sid = create_sandbox(&server, &format!("mproj-{name}")).await;
+        let sid = create_sandbox(&control, &format!("mproj-{name}")).await;
         if sid.is_empty() {
             builds_ok = false;
             break;
         }
         sandbox_ids.push((name.to_string(), sid.clone()));
-        let execd = execd_for(&server, &sid).await;
-        let built = stage_and_build(&execd, dir, marker).await;
+        let execd = execd_for(&control, &sid).await;
+        let built = stage_and_build(&execd, dir, marker, &proxy_url).await;
         builds_ok = builds_ok && built;
         build_detail.push_str(&format!("{name}={built} "));
     }
@@ -683,8 +687,8 @@ pub async fn run(args: &[String]) -> i32 {
     let release = release_on_idle(&IdleGate::CandidateConfirmed { digest });
     let alpha_release_allowed = matches!(release, release::idle::ReleaseDecision::Release { .. });
     let (alpha_deleted, alpha_delete_status, alpha_delete_body) =
-        delete_sandbox_detailed(&server, &alpha_sid).await;
-    let alpha_gone = !sandbox_exists(&server, &alpha_sid).await;
+        delete_sandbox_detailed(&control, &alpha_sid).await;
+    let alpha_gone = !sandbox_exists(&control, &alpha_sid).await;
     let alpha_released = alpha_release_allowed && alpha_deleted && alpha_gone;
     // A NEW task appears in alpha's tracker; claim it and re-admit.
     let new_task = Command::new("backlog")
@@ -717,13 +721,13 @@ pub async fn run(args: &[String]) -> i32 {
     git(alpha_dir, &["add", "."]);
     let _ = workspace_git::commit_index(alpha_dir, "new task work");
     let _ = wrote_new_task;
-    let alpha_new_sid = create_sandbox(&server, "mproj-alpha-newtask").await;
+    let alpha_new_sid = create_sandbox(&control, "mproj-alpha-newtask").await;
     let alpha_new_ok = if alpha_new_sid.is_empty() {
         false
     } else {
         sandbox_ids.push(("alpha-restart".into(), alpha_new_sid.clone()));
-        let execd = execd_for(&server, &alpha_new_sid).await;
-        stage_and_build(&execd, alpha_dir, new_task_marker).await
+        let execd = execd_for(&control, &alpha_new_sid).await;
+        stage_and_build(&execd, alpha_dir, new_task_marker, &proxy_url).await
     };
     let stop_cycle_ok = start_code == 0
         && start_out.contains("applied")
@@ -751,7 +755,7 @@ pub async fn run(args: &[String]) -> i32 {
         .cloned()
         .unwrap_or_default();
     let (beta_released, beta_delete_status, beta_delete_body) =
-        delete_sandbox_detailed(&server, &beta_sid).await;
+        delete_sandbox_detailed(&control, &beta_sid).await;
     let _ = ledger.release(&SandboxId("beta-1".into()));
     let gamma_admitted = matches!(
         ledger.admit(&capacity, SandboxId("gamma-2".into()), per_sandbox.clone()),
@@ -761,11 +765,12 @@ pub async fn run(args: &[String]) -> i32 {
     // Gamma runs, then its sandbox is LOST; recovery resumes from the
     // durable project and completes the build in a fresh sandbox.
     let gamma_dir = &projects[2].1;
-    let gamma_first = create_sandbox(&server, "mproj-gamma").await;
+    let gamma_first = create_sandbox(&control, "mproj-gamma").await;
     let gamma_lost = if gamma_first.is_empty() {
         false
     } else {
-        delete_sandbox(&server, &gamma_first).await && !sandbox_exists(&server, &gamma_first).await
+        delete_sandbox(&control, &gamma_first).await
+            && !sandbox_exists(&control, &gamma_first).await
     };
     let gamma_plan = recover_from_loss(&SandboxLoss {
         last_export: Some(CandidateDigest::from_bytes(
@@ -774,13 +779,13 @@ pub async fn run(args: &[String]) -> i32 {
         unexported: vec![],
     });
     let gamma_resumed = matches!(gamma_plan, RecoveryPlan::ResumeFromCandidate { .. });
-    let gamma_sid = create_sandbox(&server, "mproj-gamma-resume").await;
+    let gamma_sid = create_sandbox(&control, "mproj-gamma-resume").await;
     let gamma_built = if gamma_sid.is_empty() {
         false
     } else {
         sandbox_ids.push(("gamma".into(), gamma_sid.clone()));
-        let execd = execd_for(&server, &gamma_sid).await;
-        stage_and_build(&execd, gamma_dir, "build-ok-gamma").await
+        let execd = execd_for(&control, &gamma_sid).await;
+        stage_and_build(&execd, gamma_dir, "build-ok-gamma", &proxy_url).await
     };
     steps.push(Step {
         name: "release-admits-next-and-loss-recovers-from-durable",
@@ -797,7 +802,7 @@ pub async fn run(args: &[String]) -> i32 {
         Admission::Admitted
     );
     let delta_dir = &projects[3].1;
-    let delta_sid = create_sandbox(&server, "mproj-delta").await;
+    let delta_sid = create_sandbox(&control, "mproj-delta").await;
     if !delta_sid.is_empty() {
         // The probe owns this sandbox: it must be in the cleanup list,
         // or every run leaves an orphan behind and the NEXT run's
@@ -807,8 +812,8 @@ pub async fn run(args: &[String]) -> i32 {
     let delta_built = if delta_sid.is_empty() {
         false
     } else {
-        let execd = execd_for(&server, &delta_sid).await;
-        stage_and_build(&execd, delta_dir, "build-ok-delta").await
+        let execd = execd_for(&control, &delta_sid).await;
+        stage_and_build(&execd, delta_dir, "build-ok-delta", &proxy_url).await
     };
     steps.push(Step {
         name: "last-waitlisted-project-admitted-and-built",
@@ -865,7 +870,7 @@ pub async fn run(args: &[String]) -> i32 {
 
     // Cleanup sandboxes.
     for (_, sid) in &sandbox_ids {
-        let _ = delete_sandbox(&server, sid).await;
+        let _ = delete_sandbox(&control, sid).await;
     }
     for (_, child, _) in supervisor_handles.iter_mut() {
         if let Some(mut child) = child.take() {

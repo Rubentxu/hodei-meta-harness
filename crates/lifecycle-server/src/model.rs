@@ -141,6 +141,11 @@ pub mod error_codes {
     pub const INTERNAL: &str = "SANDBOX::INTERNAL";
     /// The global environment budget is exhausted: nothing was created.
     pub const BUDGET_EXHAUSTED: &str = "SANDBOX::BUDGET_EXHAUSTED";
+    /// The request carries no valid credential: nothing was created,
+    /// enumerated, executed nor destroyed.
+    pub const UNAUTHORIZED: &str = "SANDBOX::UNAUTHORIZED";
+    /// The network policy could not be enforced: nothing was created.
+    pub const NETWORK_POLICY_VIOLATION: &str = "SANDBOX::NETWORK_POLICY_VIOLATION";
 }
 
 #[cfg(test)]

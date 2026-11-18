@@ -6,3 +6,6 @@ GoalCycle_Backlog_MVP.zip
 
 # Local Python infra (dev control plane, not product)
 /.venv
+
+# Python bytecode of the proxy tests
+__pycache__/

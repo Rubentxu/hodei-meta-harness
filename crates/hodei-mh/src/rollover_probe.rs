@@ -8,13 +8,15 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use opensandbox::acp::{self, AcpAssembler};
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions};
 use rollover::checkpoint::{Checkpoint, RecoveryAction, RolloverLedger};
 use rollover::handoff::{contains_canary_risk, render_handoff};
 
-use crate::probe_util::{MOCK_AGENT_JS, ws_url_for};
+use crate::probe_util::MOCK_AGENT_JS;
 
 const GOAL_ID: &str = "goal-rollover-7";
 const WORK_REF: &str = "TASK-7";
@@ -28,10 +30,9 @@ struct Check {
 
 /// One fresh ACP conversation against the mock agent: initialize, new
 /// session, one prompt turn. Returns the exit code observed.
-async fn run_conversation(execd_base: &str, prompt: &str) -> (String, Option<i32>) {
+async fn run_conversation(execd: &ExecdEndpoint, prompt: &str) -> (String, Option<i32>) {
     let Ok(agent) = api::create_session(
-        execd_base,
-        None,
+        execd,
         CreateSessionRequest {
             cwd: Some("/workspace"),
             command: Some("node /workspace/mock-acp-agent.js"),
@@ -41,9 +42,9 @@ async fn run_conversation(execd_base: &str, prompt: &str) -> (String, Option<i32
     else {
         return (String::new(), None);
     };
-    let ws_url = ws_url_for(execd_base, &agent.session_id);
+    let ws_url = execd.ws_url(&agent.session_id);
     let Ok(mut session) = pipe::attach(&ws_url, AttachOptions::default()).await else {
-        let _ = api::delete_session(execd_base, None, &agent.session_id).await;
+        let _ = api::delete_session(execd, &agent.session_id).await;
         return (String::new(), None);
     };
     let mut assembler = AcpAssembler::new();
@@ -124,13 +125,13 @@ async fn run_conversation(execd_base: &str, prompt: &str) -> (String, Option<i32
             break;
         }
     }
-    let _ = api::delete_session(execd_base, None, &agent.session_id).await;
+    let _ = api::delete_session(execd, &agent.session_id).await;
     (agent.session_id, exit)
 }
 
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let mut checks: Vec<Check> = Vec::new();
     let finish = |checks: &[Check], elapsed: Duration| -> i32 {
         let summary = json!({
@@ -154,7 +155,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
     // Sandbox + agent staging.
     let created = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -181,25 +182,24 @@ pub async fn run(server: &str, image: &str) -> i32 {
         return finish(&checks, started.elapsed());
     }
     let endpoint = client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await;
-    let ep = match endpoint {
+    let execd = match endpoint {
         Ok(resp) => resp
             .json::<Value>()
             .await
             .ok()
-            .and_then(|v| v["endpoint"].as_str().map(str::to_string))
+            .and_then(|v| ExecdEndpoint::from_contract(&v))
             .unwrap_or_default(),
-        Err(_) => String::new(),
+        Err(_) => ExecdEndpoint::default(),
     };
-    let execd_base = format!("http://{ep}");
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd_base).await;
+    crate::probe_util::wait_for_execd(&execd).await;
     let encoded = base64::engine::general_purpose::STANDARD.encode(MOCK_AGENT_JS);
     let _ = crate::probe_util::run_command_session_with_output(
-        &execd_base,
+        &execd,
         &format!(
             "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js"
         ),
@@ -241,7 +241,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             // Fresh session: a brand-new PTY process every epoch — never
             // session/load, never resume.
             let (new_session, exit) = run_conversation(
-                &execd_base,
+                &execd,
                 "Create /workspace/hodei-rollover.txt with 'ok' then stop",
             )
             .await;
@@ -331,7 +331,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
     // Cleanup.
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())

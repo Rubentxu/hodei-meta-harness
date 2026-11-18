@@ -22,12 +22,10 @@ pub async fn run(args: &[String]) -> i32 {
         eprintln!("usage: oneshot-probe --endpoint host:port --exec \"cmd\" [--timeout SECS]");
         return 2;
     }
-    let outcome = oneshot::run(
-        &format!("http://{endpoint}"),
-        &exec,
-        Duration::from_secs(timeout),
-    )
-    .await;
+    // The credential travels in the environment of this process, never
+    // in the command line: a flag would show it in the process list.
+    let execd = opensandbox::execd::endpoint::ExecdEndpoint::from_env(format!("http://{endpoint}"));
+    let outcome = oneshot::run(&execd, &exec, Duration::from_secs(timeout)).await;
     println!(
         "{}",
         serde_json::json!({
