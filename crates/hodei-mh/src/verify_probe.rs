@@ -478,10 +478,10 @@ pub async fn run(server: &str, image: &str) -> i32 {
         passed: invalidated
             && new_tree
                 .as_ref()
-                .map(|tree| set.tree == *tree)
+                .map(|tree| set.binding.tree != *tree)
                 .unwrap_or(false),
         detail: format!(
-            "commit ok={changed}; invalidated=3; now satisfied={}",
+            "commit ok={changed}; invalidated=3; the binding still names the content that ran; now satisfied={}",
             set.all_checks_satisfied(&["pass-check"])
         ),
     });

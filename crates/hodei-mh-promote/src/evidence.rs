@@ -121,8 +121,6 @@ mod tests {
     ) -> serde_json::Value {
         json!({
             "work_ref": work_ref,
-            "revision": revision,
-            "tree": TREE,
             "binding": {
                 "revision": revision,
                 "tree": TREE,

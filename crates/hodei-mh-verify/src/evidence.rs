@@ -75,13 +75,13 @@ pub enum EvidenceStatus {
 }
 
 /// The evidence for one candidate of one work item.
+///
+/// The binding is the only answer to "what does this evidence speak
+/// for?": the revision, the content, the transport, the policy and the
+/// environment live there, and nowhere else.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceSet {
     pub work_ref: String,
-    /// Revision (git sha) the candidate was materialized from.
-    pub revision: String,
-    /// The content the candidate carried, as git names it.
-    pub tree: GitTree,
     /// What this evidence is bound to: the candidate and the observed
     /// policy and environment.
     pub binding: EvidenceBinding,
@@ -114,8 +114,6 @@ impl EvidenceSet {
             .collect();
         Self {
             work_ref: work_ref.into(),
-            revision: binding.revision.as_str().to_string(),
-            tree: binding.tree.clone(),
             binding,
             entries,
         }
@@ -123,7 +121,10 @@ impl EvidenceSet {
 
     /// AC-2: the candidate moved. Every entry bound to a previous content
     /// is invalidated (its execution no longer refers to the current
-    /// state). Returns how many entries were invalidated.
+    /// state). The binding does not move with the candidate: it still
+    /// names the content the checks ran against, and that is exactly
+    /// what the invalidated entries say.
+    /// Returns how many entries were invalidated.
     pub fn candidate_changed(&mut self, new_tree: &GitTree) -> usize {
         let mut invalidated = 0;
         for entry in &mut self.entries {
@@ -134,9 +135,6 @@ impl EvidenceSet {
                 };
                 invalidated += 1;
             }
-        }
-        if self.tree != *new_tree {
-            self.tree = new_tree.clone();
         }
         invalidated
     }
@@ -335,7 +333,8 @@ mod tests {
 
         let invalidated = set.candidate_changed(&new);
         assert_eq!(invalidated, 2);
-        assert_eq!(set.tree, new);
+        // The binding still names the content the checks ran against.
+        assert_eq!(set.binding.tree, old);
         // The stored verdict was Pass, but the evidence no longer refers to
         // the current candidate: it acts as NotRun.
         assert_eq!(set.effective_verdict("AC-1"), Verdict::NotRun);

@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-11-18T11:49:00Z'
-updated_date: '2026-11-18T14:03:00Z'
+updated_date: '2026-11-18T14:07:00Z'
 labels:
   - audit-v0.2
   - security
@@ -80,6 +80,10 @@ VERIFICACION (medida, no declarada)
 - Carril caro (`scripts/probes.sh --rounds 1`, que ahora incluye el `verify-probe`): 5/5 sondas PASS contra Docker y el lifecycle server reales (release, supervisor, profile, multiproject, verify) y 0 residuos (0 sandboxes, 0 contenedores).
 - `verify-probe` (15/15 checks): un candidato que declara otro commit se rechaza en 1.4 s SIN ejecutar el check que habria tardado 60 s; la evidencia con un check fallido NO promueve; un bundle valido de otro SHA no promueve ("the evidence belongs to another commit"); la evidencia de otra politica no promueve ("the evidence is stale: the check pass-check is no longer required"); y el bundle verificado SI se promueve por el CAS.
 - `autonomous-loop` (11/11 steps, 349 s, 0 residuos): las 5 tareas dependientes se verifican, se promueven por la puerta de evidencia y se cierran por la CLI oficial, en orden y una sola vez; el ticket de fraude (el agente declara completo sin producir nada) sigue abierto y sin promover.
+
+ESTADO DEL CARRIL DE CI (medido, no supuesto)
+
+El job `integration` de CI esta ROJO en `main` desde su primera ejecucion (merge del PR #32, run 44308881486): release-probe, profile-probe y multiproject-probe fallan porque el runner NO tiene el CLI oficial de Backlog.md ni el proxy de egreso restringido que los perfiles exigen. Causa VERIFICADA en local (sin el CLI en el PATH, la release-probe falla con `[fixture error: spawn No such file or directory (os error 2)]`). Registrada como TASK-37 con sus criterios. El `verify-probe` que esta tarea anade al carril NO necesita ninguno de los dos prerrequisitos (git, shell y la imagen que descarga el host), asi que su resultado en CI no depende de ellos.
 
 LIMITES
 
