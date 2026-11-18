@@ -9,3 +9,6 @@ GoalCycle_Backlog_MVP.zip
 
 # Python bytecode of the proxy tests
 __pycache__/
+
+# Reports of the supervised task loop (the receipts of the run, not the product)
+build/
