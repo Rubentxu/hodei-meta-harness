@@ -10,6 +10,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use hodei_mh_workspace::git as workspace_git;
 use release::idle::{IdleGate, ReleaseDecision, release_on_idle};
 use release::reconcile::{
     CreateOutcome, EnvironmentMeta, ReconcileDecision, RequestTag, TagLookup, orphans_to_release,
@@ -220,18 +221,7 @@ fn make_tracker_fixture(base: &std::path::Path) -> Result<std::path::PathBuf, St
                 }
             })
     };
-    std::process::Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(&root)
-        .output()
-        .map(|o| {
-            if !o.status.success() {
-                return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())
-        .and_then(|r| r)?;
+    workspace_git::init_fixture_repo(&root).map_err(|e| e.to_string())?;
     run(&[
         "init",
         "fixture",

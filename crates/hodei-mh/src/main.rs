@@ -40,6 +40,32 @@ use probe_util::{MOCK_AGENT_JS, run_command_session_with_output, ws_url_for};
 
 const PROBE_FILE: &str = "/workspace/hodei-probe.txt";
 
+/// What a consumer reads when the binary is called without a command:
+/// the real commands of the product, not one of the probes.
+const USAGE: &str = "\
+hodei-meta-harness — sandbox-first meta-harness driven by persistent goals
+
+usage: hodei-mh <command> [options]
+
+product:
+  doctor --profile <name>              read-only checks and the release gate
+  profile-run --profile <name>         run a project inside a pinned sandbox
+  supervisor --socket <path> --project <name>
+                                       the single controller of a project
+  sup-status | sup-action | sup-events | attach-terminal | tui
+                                       observe and drive the supervisor
+  package                              build the installable bundle
+
+probes (evidence about this host):
+  release-probe | profile-probe | supervisor-probe | multiproject-probe
+
+options:
+  --version                            print the version and exit
+  --help                               print this help and exit
+
+documentation: docs/profiles.md
+";
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,10 +200,16 @@ async fn main() {
             let code = workspace_probe::run(&server, &image).await;
             std::process::exit(code);
         }
+        Some("--version") | Some("-V") => {
+            println!("hodei-mh {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            print!("{USAGE}");
+            std::process::exit(0);
+        }
         _ => {
-            eprintln!(
-                "usage: hodei-mh acp-probe --server URL [--mode mock|claude] [--image IMAGE]"
-            );
+            eprint!("{USAGE}");
             std::process::exit(2);
         }
     }

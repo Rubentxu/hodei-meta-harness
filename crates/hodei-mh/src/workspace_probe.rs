@@ -246,7 +246,7 @@ fn build_base_fixture() -> Result<BaseFixture, String> {
             Err(String::from_utf8_lossy(&status.stderr).to_string())
         }
     };
-    run_git(&["init", "-q", "-b", "main"])?;
+    git::init_fixture_repo(&repo).map_err(|e| e.to_string())?;
     std::fs::write(repo.join("README.md"), "base revision fixture\n").map_err(|e| e.to_string())?;
     run_git(&["add", "-A"])?;
     // The fixture commits with git's PLUMBING: automation must not
