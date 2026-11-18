@@ -54,7 +54,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // writer). A second claim attempt for the same ticket is denied.
     let db = std::env::temp_dir().join(format!("hodei-run-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db);
-    let actor = match CoordinatorActor::start(&db) {
+    let actor = match CoordinatorActor::start("run-probe", &db) {
         Ok(actor) => actor,
         Err(err) => {
             checks.push(Check {
