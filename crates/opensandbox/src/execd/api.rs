@@ -84,6 +84,8 @@ pub async fn session_accepted(
     }
 }
 
+/// The state of a session: whether it still runs and how much output it
+/// produced.
 #[derive(Debug, Deserialize)]
 pub struct SessionStatusResponse {
     pub session_id: String,
@@ -91,24 +93,59 @@ pub struct SessionStatusResponse {
     pub output_offset: i64,
 }
 
-/// `GET /pty/{id}/status` — is the session process still running?
+/// `GET /pty/{id}` — the session state and its output offset.
+///
+/// The reference daemon answers the session state at `/pty/{id}`; some
+/// builds answer the same shape at `/pty/{id}/status`. Both are tried,
+/// in that order: a 404 on one of them says nothing about the session,
+/// and the output offset is what tells a truncated output from a
+/// complete one.
 pub async fn session_status(
     base_url: &str,
     access_token: Option<&str>,
     session_id: &str,
 ) -> Result<SessionStatusResponse, ExecdApiError> {
-    let url = format!("{base_url}/pty/{session_id}/status");
-    let mut builder = http_client(DEFAULT_TIMEOUT)?.get(url);
-    if let Some(token) = access_token {
-        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    let mut last: Option<ExecdApiError> = None;
+    for path in [
+        format!("/pty/{session_id}"),
+        format!("/pty/{session_id}/status"),
+    ] {
+        let url = format!("{base_url}{path}");
+        let mut builder = http_client(DEFAULT_TIMEOUT)?.get(url);
+        if let Some(token) = access_token {
+            builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+        }
+        let response = builder.send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        if (200..300).contains(&status) {
+            return Ok(serde_json::from_str(&body)?);
+        }
+        let error = ExecdApiError::Status { status, body };
+        if status != 404 {
+            return Err(error);
+        }
+        last = Some(error);
     }
-    let response = builder.send().await?;
-    let status = response.status().as_u16();
-    let body = response.text().await?;
-    if !(200..300).contains(&status) {
-        return Err(ExecdApiError::Status { status, body });
-    }
-    Ok(serde_json::from_str(&body)?)
+    Err(last.unwrap_or(ExecdApiError::Status {
+        status: 404,
+        body: format!("no session state for {session_id}"),
+    }))
+}
+
+/// How many output bytes the execd says the session produced.
+///
+/// `None` when the execd does not answer: the caller then knows nothing
+/// about the completeness of the output, and must not claim it.
+pub async fn session_output_offset(
+    base_url: &str,
+    access_token: Option<&str>,
+    session_id: &str,
+) -> Option<i64> {
+    session_status(base_url, access_token, session_id)
+        .await
+        .ok()
+        .map(|status| status.output_offset)
 }
 
 /// `DELETE /pty/{id}` — terminate the session and its process group.

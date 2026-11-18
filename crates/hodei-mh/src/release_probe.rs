@@ -557,16 +557,37 @@ pub async fn run(server: &str, image: &str) -> i32 {
                         EXECD_READY_TIMEOUT,
                     )
                     .await;
-                    let matches = restored.succeeded()
+                    let mut matches = restored.succeeded()
                         && restored.output.contains(CANDIDATE_CONTENT)
                         && CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes()) == digest;
+                    let mut restore_facts = oneshot_facts("restore", &restored);
+                    if !matches && restored.succeeded() && restored.output.is_empty() {
+                        // The read returned NOTHING: the transport lost
+                        // the output. Reading the file again is
+                        // idempotent — the work is not repeated, only
+                        // measured again — and the detail says that the
+                        // first read came back empty.
+                        let reread = opensandbox::execd::oneshot::run_when_ready(
+                            &fresh_execd,
+                            "cat /workspace/candidate.txt",
+                            Duration::from_secs(30),
+                            EXECD_READY_TIMEOUT,
+                        )
+                        .await;
+                        matches = reread.succeeded()
+                            && reread.output.contains(CANDIDATE_CONTENT)
+                            && CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes()) == digest;
+                        restore_facts = format!(
+                            "{restore_facts} (the first read returned no output) re-read[{}]",
+                            oneshot_facts("re-read", &reread)
+                        );
+                    }
                     (
                         lost,
                         matches,
                         format!(
-                            "sandbox={resume_id} lost={lost} fresh={fresh} seed[{}] restore[{}]",
+                            "sandbox={resume_id} lost={lost} fresh={fresh} seed[{}] restore[{restore_facts}]",
                             oneshot_facts("seed write", &seeded),
-                            oneshot_facts("restore", &restored)
                         ),
                     )
                 }
