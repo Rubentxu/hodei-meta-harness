@@ -112,10 +112,13 @@ the cheap gate never hides their cost.
 
 The **integration** lane has prerequisites, and it states them instead of
 degrading: the official Backlog.md CLI (the probes drive the real tracker),
-Docker, and a restricted egress proxy (the profiles' gate refuses to build
-without one, and it does not fall back). `scripts/probes.sh --preflight`
-checks them and fails with the reason; the lane starts the versioned proxy
-(`scripts/egress-proxy.py`) when none is running, and stops it at the end.
+Docker, a restricted egress proxy (the profiles' gate refuses to build
+without one, and it does not fall back), and the images of the profiles (the
+doctor is read-only and refuses an image that is not already in the local
+daemon). `scripts/probes.sh --preflight` leaves the host prepared and fails
+with the reason when something is missing; the lane starts the versioned
+proxy (`scripts/egress-proxy.py`) when none is running, and stops it at the
+end.
 
 Two rules about those probes:
 
