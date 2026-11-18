@@ -40,10 +40,13 @@ fn oneshot_facts(label: &str, outcome: &opensandbox::execd::oneshot::OneshotOutc
         .rev()
         .collect();
     format!(
-        "{label}: exit={:?} end={:?} ran={} output={:?}",
+        "{label}: exit={:?} end={:?} ran={} expected={:?} missing={} replayed={} output={:?}",
         outcome.exit_code,
         outcome.end,
         !outcome.not_accepted(),
+        outcome.expected_bytes,
+        outcome.missing_bytes,
+        outcome.replayed,
         tail
     )
 }

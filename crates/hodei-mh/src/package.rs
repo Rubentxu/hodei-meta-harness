@@ -62,31 +62,39 @@ fn stage(src: &Path, dest: &Path) -> bool {
     }
 }
 
-/// Where the release binaries live. An INSTALLED binary must not look
-/// for them on the machine that compiled it: the path is resolved from
-/// the running executable, with the repository as an explicit fallback.
+/// Where the release binaries live.
+///
+/// The RUNNING profile is not necessarily the one that ships: a
+/// checkout runs `target/<triple>/debug`, and a debug build is not a
+/// release artifact. The release profile of the SAME target directory
+/// is the one, and an INSTALLATION ships the pair next to the running
+/// binary.
 fn resolve_release_dir(repo: &Path) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(parent) = exe.parent()
     {
-        // The binaries NEXT TO the running one are the pair it was
-        // built with — in the repo (target/<triple>/release) and in
-        // an installation (<prefix>/bin) alike. This is the rule
-        // that ships the SAME build that is running.
-        if parent.join("hodei-mh-lifecycle-server").exists() {
+        // A cargo checkout: target/<triple>/<profile>. The PROFILE
+        // decides, and only "release" ships.
+        let profile = parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if profile == "debug" || profile == "release" {
+            if let Some(target_dir) = parent.parent() {
+                let release = target_dir.join("release");
+                if release.join("hodei-mh").exists() {
+                    return release;
+                }
+            }
+        } else if parent.join("hodei-mh-lifecycle-server").exists() {
+            // An INSTALLATION: the pair lives next to the running binary.
             return parent.to_path_buf();
         }
         // Installed layout: <prefix>/bin/hodei-mh -> <prefix>/lib/hodei-mh
-        for candidate in [
-            parent.join("../lib/hodei-mh"),
-            parent.join("../target/x86_64-unknown-linux-gnu/release"),
-            parent.join("../target/release"),
-            parent.join("target/release"),
-        ] {
-            let resolved = candidate.canonicalize().unwrap_or(candidate.clone());
-            if resolved.join("hodei-mh").exists() {
-                return resolved;
-            }
+        let candidate = parent.join("../lib/hodei-mh");
+        let resolved = candidate.canonicalize().unwrap_or(candidate.clone());
+        if resolved.join("hodei-mh").exists() {
+            return resolved;
         }
     }
     // Fallback for a checkout: the default build is explicitly
@@ -100,7 +108,30 @@ fn resolve_release_dir(repo: &Path) -> PathBuf {
             return candidate;
         }
     }
-    repo.join("target/release")
+    repo.join("target/x86_64-unknown-linux-gnu/release")
+}
+
+/// Whether a directory belongs to a cargo build tree.
+fn is_build_dir(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "target")
+}
+
+/// The platform the binaries were COMPILED for: the identity of the
+/// artifact, not the platform that happens to run `package`.
+fn target_platform() -> (&'static str, &'static str) {
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        std::env::consts::OS
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        std::env::consts::ARCH
+    };
+    (os, arch)
 }
 
 pub async fn run_package(args: &[String]) -> i32 {
@@ -114,6 +145,16 @@ pub async fn run_package(args: &[String]) -> i32 {
             .unwrap_or_else(|| PathBuf::from("."));
     let release = resolve_release_dir(&repo);
 
+    // A debug build is not a release artifact: the bundle ships the
+    // RELEASE profile, whatever profile the running binary is.
+    if release.components().any(|c| c.as_os_str() == "debug") {
+        eprintln!(
+            "refusing to package a debug build: {} — the release profile is the artifact that ships",
+            release.display()
+        );
+        return 1;
+    }
+
     // Build the release binaries if they are not there yet (bounded
     // retries: the cargo lock can be transiently held by another session).
     let bins = [
@@ -121,6 +162,13 @@ pub async fn run_package(args: &[String]) -> i32 {
         release.join("hodei-mh-lifecycle-server"),
     ];
     if bins.iter().any(|b| !b.exists()) {
+        if !is_build_dir(&release) {
+            eprintln!(
+                "release binaries missing at {} and it is not a build directory: there is nothing to build here",
+                release.display()
+            );
+            return 1;
+        }
         println!("release binaries missing: building (offline, -j2, up to 5 attempts)");
         for attempt in 0..5 {
             let status = std::process::Command::new("cargo")
@@ -134,6 +182,9 @@ pub async fn run_package(args: &[String]) -> i32 {
                     "--offline",
                     "-j2",
                 ])
+                // The build belongs to the WORKSPACE, wherever the
+                // command was invoked from.
+                .current_dir(&repo)
                 .status();
             if matches!(status, Ok(s) if s.success()) {
                 break;
@@ -144,6 +195,21 @@ pub async fn run_package(args: &[String]) -> i32 {
                 eprintln!("could not build release binaries; package aborted");
                 return 1;
             }
+        }
+    }
+
+    // The name of the artifact is its identity: it must agree with
+    // what the binaries really are, measured from their headers.
+    let (os, arch) = target_platform();
+    for bin in &bins {
+        if let Some(found) = elf::architecture_of(bin)
+            && found != arch
+        {
+            eprintln!(
+                "refusing to package {}: it is a {found} binary, but the artifact would be named {os}-{arch}",
+                bin.display()
+            );
+            return 1;
         }
     }
 
@@ -183,11 +249,7 @@ pub async fn run_package(args: &[String]) -> i32 {
     }
     let install_sh = out_dir.join("install.sh");
     let install_md = out_dir.join("INSTALL.md");
-    let install_md_text = format!(
-        "{INSTALL_MD}\nRelease: v{version} ({}-{})\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+    let install_md_text = format!("{INSTALL_MD}\nRelease: v{version} ({os}-{arch})\n");
     let wrote_installers = std::fs::write(&install_sh, INSTALL_SH).is_ok()
         && std::fs::write(&install_md, install_md_text).is_ok()
         && {
@@ -208,14 +270,13 @@ pub async fn run_package(args: &[String]) -> i32 {
     }
 
     // Tar it up. The name carries the version, the OS and the
-    // architecture: a bundle is a release artifact, and its name is
-    // part of its identity.
+    // architecture the binaries were COMPILED for: a bundle is a
+    // release artifact, and its name is part of its identity.
     let version = env!("CARGO_PKG_VERSION");
-    let tar_path = out_dir.parent().unwrap_or(Path::new("/tmp")).join(format!(
-        "hodei-mh-v{version}-{}-{}.tar.gz",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    ));
+    let tar_path = out_dir
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("hodei-mh-v{version}-{os}-{arch}.tar.gz"));
     let tar_ok = std::process::Command::new("tar")
         .args([
             "czf",

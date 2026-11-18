@@ -52,6 +52,13 @@ host's. `hodei-mh package` REFUSES to build a bundle from binaries that
 carry a dynamic loader — the distribution is standalone or it is not
 published.
 
+The bundle is assembled from the **release** profile, never from a debug
+build, and it is named after the platform the binaries were COMPILED for
+(`x86_64-unknown-linux-gnu`), not after the machine that happens to run
+the packaging command. `hodei-mh package` checks the architecture of the
+binaries it stages against that name and refuses a mismatch: a mislabeled
+artifact is worse than no artifact.
+
 Versions are pinned by the workspace (`Cargo.toml`): no floating
 dependencies are used at runtime.
 

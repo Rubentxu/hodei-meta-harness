@@ -39,9 +39,13 @@ cargo build --release -p hodei-mh -p hodei-mh-lifecycle-server
 # -> target/x86_64-unknown-linux-gnu/release
 ```
 
-The build is standalone by default (`.cargo/config.toml` links statically).
-`hodei-mh package` assembles the installable bundle and **refuses** to package
-binaries that carry a dynamic loader.
+The build is standalone by default (`.cargo/config.toml` links statically), and the
+workspace is **pinned to `x86_64-unknown-linux-gnu`**: the product runs on Linux
+sandboxes, so every cargo command targets that triple.
+
+`hodei-mh package` assembles the installable bundle from the **release** profile
+(a debug build is never packaged), names it after the platform the binaries were
+compiled for, and **refuses** to package binaries that carry a dynamic loader.
 
 ## What it guarantees
 

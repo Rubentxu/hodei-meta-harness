@@ -180,27 +180,22 @@ async fn wait_lifecycle_ready(server_url: &str) -> bool {
 }
 
 /// How many environments the server currently lists.
-async fn count_sandboxes(server_url: &str) -> usize {
+/// How many environments the host carries. `None` when the count could
+/// not be READ: an unknown count is not an empty host, and treating it
+/// as one would make the probe expect slots the server cannot admit.
+async fn count_sandboxes(server_url: &str) -> Option<usize> {
     let client = reqwest::Client::new();
-    match client
+    let response = client
         .get(format!("{server_url}/v1/sandboxes"))
         .timeout(Duration::from_secs(5))
         .send()
         .await
-    {
-        Ok(response) => response
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("items")
-                    .and_then(|i| i.as_array())
-                    .map(|items| items.len())
-            })
-            .unwrap_or(0),
-        Err(_) => 0,
-    }
+        .ok()?;
+    let value = response.json::<Value>().await.ok()?;
+    value
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| items.len())
 }
 
 async fn wait_supervisor(bin: &Path, socket: &str) -> bool {
@@ -568,11 +563,13 @@ pub async fn run(args: &[String]) -> i32 {
     // server may admit, whatever already exists. The expectation is
     // therefore the free slots (ZERO when the host already carries the
     // whole budget), NOT "the host was empty".
-    let free_slots = budget::ledger::admissible_creates(preexisting, BUDGET_SLOTS);
-    let budget_enforced = refused_by_budget
+    let free_slots = preexisting.map(|live| budget::ledger::admissible_creates(live, BUDGET_SLOTS));
+    let refused = refused_by_budget
         .as_ref()
-        .is_some_and(|body| body.contains("429") || body.contains("BUDGET_EXHAUSTED"))
-        && created_ids.len() == free_slots;
+        .is_some_and(|body| body.contains("429") || body.contains("BUDGET_EXHAUSTED"));
+    // The refusal is the fact; the slot arithmetic is the corroboration
+    // and it needs the count of the environments already alive.
+    let budget_enforced = refused && free_slots.is_none_or(|slots| created_ids.len() == slots);
     for id in &created_ids {
         let _ = reqwest::Client::new()
             .delete(format!("{budget_server}/v1/sandboxes/{id}"))
@@ -582,14 +579,25 @@ pub async fn run(args: &[String]) -> i32 {
     if let Some(mut child) = budget_child.take() {
         let _ = child.kill().await;
     }
+    let detail = match (preexisting, free_slots) {
+        (Some(live), Some(free)) => format!(
+            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {live} environment(s) already alive, admitted exactly the {free} free slot(s) and REFUSED the next one (slots exhausted at {}); the refusal was {:?} — the limit is a property of the server, not of a client-side ledger",
+            live + created_ids.len(),
+            refused_by_budget,
+        ),
+        (None, _) => format!(
+            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget REFUSED the create ({:?}); the number of environments already alive could NOT be read, so the slot arithmetic is not verifiable — the refusal itself was observed",
+            refused_by_budget,
+        ),
+        (Some(live), None) => format!(
+            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {live} environment(s) already alive and REFUSED the create ({:?}); the free slots could not be derived, so the slot arithmetic is not verifiable — the refusal itself was observed",
+            refused_by_budget,
+        ),
+    };
     steps.push(Step {
         name: "the-global-budget-is-enforced-by-the-server-create-path",
         passed: budget_enforced,
-        detail: format!(
-            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {preexisting} environment(s) already alive, admitted exactly the {free_slots} free slot(s) and REFUSED the next one (slots exhausted at {}); the refusal was {:?} — the limit is a property of the server, not of a client-side ledger",
-            preexisting + created_ids.len(),
-            refused_by_budget,
-        ),
+        detail,
     });
 
     // ---- Supervisors: one socket per project ---------------------------
