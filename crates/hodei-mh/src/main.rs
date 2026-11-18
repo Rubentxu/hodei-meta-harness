@@ -16,6 +16,7 @@ use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 mod autonomous_probe;
 mod budget_probe;
 mod custom_goal_probe;
+mod elf;
 mod goal_probe;
 mod interact_probe;
 mod multiproject_probe;

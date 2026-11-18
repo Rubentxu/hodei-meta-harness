@@ -51,6 +51,17 @@ pub enum Admission {
     Waitlisted { reason: WaitReason },
 }
 
+/// How many creations a budget of `slots` may admit when `live`
+/// environments already exist.
+///
+/// The budget is GLOBAL for the host: the environments that already
+/// exist count against it, whoever created them. The count is the free
+/// slots, and ZERO when the limit is already reached — a caller must
+/// never assume an empty host.
+pub fn admissible_creates(live: usize, slots: usize) -> usize {
+    slots.saturating_sub(live)
+}
+
 /// The aggregate budget state. Committed + provisioning both count.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetLedger {
@@ -159,6 +170,18 @@ mod tests {
             total: ResourceVector::new(8.0, 8.0, 100.0),
             reserve: ResourceVector::new(1.0, 1.0, 10.0),
         }
+    }
+
+    #[test]
+    fn the_free_slots_are_what_the_budget_admits() {
+        assert_eq!(admissible_creates(0, 2), 2);
+        assert_eq!(admissible_creates(1, 2), 1);
+        // The limit is reached: nothing else is admitted.
+        assert_eq!(admissible_creates(2, 2), 0);
+        // The host carries MORE than the budget: still nothing, and
+        // never a negative count.
+        assert_eq!(admissible_creates(3, 2), 0);
+        assert_eq!(admissible_creates(9, 2), 0);
     }
 
     #[test]

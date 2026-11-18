@@ -21,10 +21,23 @@ pub enum GitError {
 }
 
 fn run_raw(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result<String, GitError> {
+    run_raw_env(operation, args, cwd, &[])
+}
+
+/// `run_raw` with an explicit environment for the child process.
+fn run_raw_env(
+    operation: &'static str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(&str, &str)],
+) -> Result<String, GitError> {
     let mut command = Command::new("git");
     command.args(args);
     if let Some(dir) = cwd {
         command.current_dir(dir);
+    }
+    for (key, value) in envs {
+        command.env(key, value);
     }
     let output = command.output().map_err(GitError::Unavailable)?;
     if !output.status.success() {
@@ -48,6 +61,64 @@ fn run(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result<Str
 /// git commands whose stdout is legitimately empty (bundle create, clone).
 fn run_mutator(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result<(), GitError> {
     run_raw(operation, args, cwd).map(|_| ())
+}
+
+/// Build a commit from the staged index with git's PLUMBING commands
+/// (`write-tree` + `commit-tree` + `update-ref`) and return its id.
+///
+/// Automation must not depend on the host's `git commit` path: that
+/// command can be governed by a policy (identity, message rules), can
+/// require an editor and is refused outright in repositories that
+/// policy does not classify. The plumbing path is deterministic, needs
+/// no editor and never touches the working tree. The parent is the
+/// current HEAD, so the history is a real chain and `base..head` is a
+/// real revision range.
+///
+/// The author and the committer are this harness, explicitly: the
+/// commit does not borrow —nor pretend— the identity of whoever runs
+/// the automation.
+pub fn commit_index(repo: &Path, message: &str) -> Result<String, GitError> {
+    const IDENTITY: [(&str, &str); 4] = [
+        ("GIT_AUTHOR_NAME", "hodei-mh"),
+        ("GIT_AUTHOR_EMAIL", "hodei-mh@local"),
+        ("GIT_COMMITTER_NAME", "hodei-mh"),
+        ("GIT_COMMITTER_EMAIL", "hodei-mh@local"),
+    ];
+    let tree = run("write-tree", &["write-tree"], Some(repo))?
+        .trim()
+        .to_string();
+    // `--verify --quiet` prints nothing and fails when there is no HEAD
+    // yet: that is the root commit, not an error.
+    let parent = run_raw_env(
+        "rev-parse HEAD",
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        Some(repo),
+        &IDENTITY,
+    )
+    .ok()
+    .map(|head| head.trim().to_string())
+    .filter(|head| !head.is_empty());
+    let mut args: Vec<&str> = vec!["commit-tree", tree.as_str(), "-m", message];
+    if let Some(parent) = &parent {
+        args.push("-p");
+        args.push(parent.as_str());
+    }
+    let commit = run_raw_env("commit-tree", &args, Some(repo), &IDENTITY)?
+        .trim()
+        .to_string();
+    let branch = run(
+        "symbolic-ref",
+        &["symbolic-ref", "--quiet", "HEAD"],
+        Some(repo),
+    )?
+    .trim()
+    .to_string();
+    run_mutator(
+        "update-ref",
+        &["update-ref", branch.as_str(), commit.as_str()],
+        Some(repo),
+    )?;
+    Ok(commit)
 }
 
 /// `git bundle verify` — checks the bundle header (refs, prerequisites).
@@ -123,10 +194,14 @@ mod tests {
         );
     }
 
-    fn commit_file(dir: &Path, name: &str, content: &str, message: &str) {
+    /// Build a commit in the fixture repository with the crate's own
+    /// plumbing helper (`commit_index`): the fixture never asks the
+    /// host's git for a commit, so it does not depend on the host's
+    /// commit governance.
+    fn commit_file(dir: &Path, name: &str, content: &str, message: &str) -> String {
         std::fs::write(dir.join(name), content).unwrap();
         git(dir, &["add", "-A"]);
-        git(dir, &["commit", "-q", "-m", message]);
+        commit_index(dir, message).expect("the fixture commits")
     }
 
     #[test]

@@ -189,14 +189,41 @@ mod tests {
         dir
     }
 
+    /// Build a commit in the fixture repository with git's PLUMBING
+    /// commands (`write-tree` + `commit-tree` + `update-ref`).
+    ///
+    /// The fixture does not ask the host's git for a commit: it builds a
+    /// synthetic history in a scratch directory with no remote that is
+    /// never pushed. Plumbing keeps the fixture independent of the
+    /// host's commit governance, which governs the user's repositories.
+    /// The parent is explicit, so the history is a real chain and
+    /// "base..head" is a real revision range.
     fn commit_file(repo: &Path, name: &str, message: &str) -> String {
         std::fs::write(repo.join(name), format!("content of {name}\n")).unwrap();
         must(repo, "add", &["add", name]).unwrap();
-        must(repo, "commit", &["commit", "-q", "-m", message]).unwrap();
-        must(repo, "rev-parse", &["rev-parse", "HEAD"])
+        let tree = must(repo, "write-tree", &["write-tree"])
             .unwrap()
             .trim()
-            .to_string()
+            .to_string();
+        let (has_head, head, _err) =
+            run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]).unwrap();
+        let head = if has_head {
+            head.trim().to_string()
+        } else {
+            String::new()
+        };
+        let mut args: Vec<&str> = vec!["commit-tree", tree.as_str(), "-m", message];
+        if !head.is_empty() {
+            args.push("-p");
+            args.push(&head);
+        }
+        let commit = must(repo, "commit-tree", &args).unwrap().trim().to_string();
+        let branch = must(repo, "symbolic-ref", &["symbolic-ref", "--quiet", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        must(repo, "update-ref", &["update-ref", &branch, &commit]).unwrap();
+        commit
     }
 
     fn init_repo(repo: &Path) {

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use hodei_mh_workspace::git as workspace_git;
 use promote::git::{self, PromoteError};
 use promote::ledger::{LedgerPhase, PromotionLedger, PromotionPlan, RecoveryAction};
 use promote::ticket::TicketUpdate;
@@ -39,11 +40,14 @@ fn git_out(repo: &Path, args: &[&str]) -> Option<(bool, String, String)> {
 
 fn commit_file(repo: &Path, name: &str, message: &str) -> Option<String> {
     std::fs::write(repo.join(name), format!("content {name}\n")).ok()?;
-    let ok = git_out(repo, &["add", name])?.0 && git_out(repo, &["commit", "-q", "-m", message])?.0;
+    // The fixture commits with git's PLUMBING: automation must not
+    // depend on the host's `git commit` path, which can be governed by a
+    // policy that refuses repositories it does not classify.
+    let ok = git_out(repo, &["add", name])?.0;
     if !ok {
         return None;
     }
-    Some(git_out(repo, &["rev-parse", "HEAD"])?.1.trim().to_string())
+    workspace_git::commit_index(repo, message).ok()
 }
 
 /// Build the example project: a git repo with a real backlog inside.

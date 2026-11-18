@@ -13,6 +13,7 @@ name = "hodei-mh-lifecycle-server"
 path = "src/main.rs"
 
 [dependencies]
+budget = { path = "../hodei-mh-budget", package = "hodei-mh-budget" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

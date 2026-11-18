@@ -15,6 +15,12 @@ without evidence.
    `docker inspect`).
 2. A Rust toolchain to build the harness itself: cargo ≥ 1.96 (the shipped
    `rust` profile runs cargo 1.100.0 inside its own image).
+
+   The build is STANDALONE by default: `.cargo/config.toml` links the
+   binaries statically, so they need no glibc, no libgcc and no other
+   system library from the host. The binaries land in
+   `$BIN` = `target/x86_64-unknown-linux-gnu/release` (the triple is
+   explicit because the static flags must not reach the proc-macros).
 3. Restricted egress proxy for sandboxes (the authorized network path):
    `python3 /tmp/hodei-connect-proxy.py` — binds `172.17.0.1:8888`, accepts
    CONNECT only from the docker subnet.
@@ -37,7 +43,14 @@ without evidence.
 git clone https://github.com/Rubentxu/hodei-meta-harness
 cd hodei-meta-harness
 cargo build --release -p hodei-mh-lifecycle-server -p hodei-mh
+BIN=target/x86_64-unknown-linux-gnu/release
 ```
+
+The result is a statically linked binary: `ldd` reports "statically
+linked" and it runs on a distro whose glibc is older than the build
+host's. `hodei-mh package` REFUSES to build a bundle from binaries that
+carry a dynamic loader — the distribution is standalone or it is not
+published.
 
 Versions are pinned by the workspace (`Cargo.toml`): no floating
 dependencies are used at runtime.
@@ -45,8 +58,8 @@ dependencies are used at runtime.
 ## Start the control plane
 
 ```bash
-PORT=8081 ./target/release/hodei-mh-lifecycle-server &
-./target/release/hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock --project hodei-mh &
+PORT=8081 $BIN/hodei-mh-lifecycle-server &
+$BIN/hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock --project hodei-mh &
 ```
 
 One supervisor per project, enforced by the socket itself: starting a
@@ -63,8 +76,8 @@ scope explicitly (the supervisor authorizes no effect by itself).
 ## Doctor (strictly non-destructive)
 
 ```bash
-./target/release/hodei-mh doctor --profile rust
-./target/release/hodei-mh doctor --profile jvm
+$BIN/hodei-mh doctor --profile rust
+$BIN/hodei-mh doctor --profile jvm
 ```
 
 Checks (all read-only): profile pinned, local image digest vs pinned digest,
@@ -97,8 +110,8 @@ observed for the image that actually ran (`image_digest_observed`).
 ## Run a profile build
 
 ```bash
-./target/release/hodei-mh profile-run --profile rust --project /path/to/project --cpu 1 --memory 1Gi
-./target/release/hodei-mh profile-run --profile jvm  --project /path/to/project --cpu 1 --memory 1Gi
+$BIN/hodei-mh profile-run --profile rust --project /path/to/project --cpu 1 --memory 1Gi
+$BIN/hodei-mh profile-run --profile jvm  --project /path/to/project --cpu 1 --memory 1Gi
 ```
 
 Behavior:
@@ -141,7 +154,7 @@ Behavior:
 The lifecycle server can enforce a global budget of concurrent environments:
 
 ```bash
-MAX_CONCURRENT_ENVIRONMENTS=2 PORT=8081 ./target/release/hodei-mh-lifecycle-server
+MAX_CONCURRENT_ENVIRONMENTS=2 PORT=8081 $BIN/hodei-mh-lifecycle-server
 ```
 
 When the budget is exhausted the create is REFUSED with

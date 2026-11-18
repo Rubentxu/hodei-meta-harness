@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use hodei_mh_workspace::git as workspace_git;
 use verify::digest::{CandidateDigest, ContentFile, Progress, candidate_progress};
 use verify::evidence::EvidenceSet;
 use verify::policy::{explicit, infer_from_instructions};
@@ -72,7 +73,13 @@ fn make_example_repo() -> Option<ExampleRepo> {
     if !run_git(&root, &["init", "-q", "-b", "main"]) {
         return None;
     }
-    if !run_git(&root, &["add", "-A"]) || !run_git(&root, &["commit", "-q", "-m", "candidate"]) {
+    if !run_git(&root, &["add", "-A"]) {
+        return None;
+    }
+    // The fixture commits with git's PLUMBING: automation must not
+    // depend on the host's `git commit` path, which can be governed by a
+    // policy that refuses repositories it does not classify.
+    if workspace_git::commit_index(&root, "candidate").is_err() {
         return None;
     }
     let ok = Command::new("git")
@@ -273,7 +280,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         "#!/bin/sh\n# changed\nexec grep -q dev-override fixture.local\n",
     );
     let changed = run_git(&repo.root, &["add", "-A"])
-        && run_git(&repo.root, &["commit", "-q", "-m", "change candidate"]);
+        && workspace_git::commit_index(&repo.root, "change candidate").is_ok();
     let new_digest = CandidateDigest::from_files(&[
         ContentFile {
             path: ".gitignore".into(),
@@ -295,10 +302,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     // AC-3: an empty commit (same tree) does not credit progress.
-    let empty = run_git(
-        &repo.root,
-        &["commit", "-q", "--allow-empty", "-m", "empty"],
-    );
+    let empty = workspace_git::commit_index(&repo.root, "empty").is_ok();
     let after_empty = CandidateDigest::from_files(&[
         ContentFile {
             path: ".gitignore".into(),

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use budget::ledger::{Admission, BudgetLedger, SandboxId};
 use budget::vector::{HostCapacity, ResourceVector};
 use hodei_mh_coordinator::core::{ClaimResult, CoordinatorState};
+use hodei_mh_workspace::git as workspace_git;
 use release::idle::{IdleGate, release_on_idle};
 use release::recovery::{RecoveryPlan, SandboxLoss, recover_from_loss};
 use serde_json::{Value, json};
@@ -100,7 +101,13 @@ fn make_project(base: &Path, name: &str, marker: &str) -> Option<PathBuf> {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
     )
     .ok()?;
-    if !git(&root, &["add", "."]) || !git(&root, &["commit", "-q", "-m", "project base"]) {
+    if !git(&root, &["add", "."]) {
+        return None;
+    }
+    // The fixture commits with git's PLUMBING: automation must not
+    // depend on the host's `git commit` path, which can be governed by a
+    // policy that refuses repositories it does not classify.
+    if workspace_git::commit_index(&root, "project base").is_err() {
         return None;
     }
     for ticket in ["first build", "follow-up task"] {
@@ -556,10 +563,16 @@ pub async fn run(args: &[String]) -> i32 {
     }
     // The refusal happens exactly when the slots are exhausted, and no
     // environment is created for the refused request.
+    //
+    // The budget is GLOBAL for the host: the free slots are what the
+    // server may admit, whatever already exists. The expectation is
+    // therefore the free slots (ZERO when the host already carries the
+    // whole budget), NOT "the host was empty".
+    let free_slots = budget::ledger::admissible_creates(preexisting, BUDGET_SLOTS);
     let budget_enforced = refused_by_budget
         .as_ref()
         .is_some_and(|body| body.contains("429") || body.contains("BUDGET_EXHAUSTED"))
-        && preexisting + created_ids.len() == BUDGET_SLOTS;
+        && created_ids.len() == free_slots;
     for id in &created_ids {
         let _ = reqwest::Client::new()
             .delete(format!("{budget_server}/v1/sandboxes/{id}"))
@@ -573,8 +586,7 @@ pub async fn run(args: &[String]) -> i32 {
         name: "the-global-budget-is-enforced-by-the-server-create-path",
         passed: budget_enforced,
         detail: format!(
-            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {preexisting} environment(s) already alive, created {} more and REFUSED the next one (slots exhausted at {}); the refusal was {:?} — the limit is a property of the server, not of a client-side ledger",
-            created_ids.len(),
+            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {preexisting} environment(s) already alive, admitted exactly the {free_slots} free slot(s) and REFUSED the next one (slots exhausted at {}); the refusal was {:?} — the limit is a property of the server, not of a client-side ledger",
             preexisting + created_ids.len(),
             refused_by_budget,
         ),
@@ -695,7 +707,7 @@ pub async fn run(args: &[String]) -> i32 {
     )
     .is_ok();
     git(alpha_dir, &["add", "."]);
-    git(alpha_dir, &["commit", "-q", "-m", "new task work"]);
+    let _ = workspace_git::commit_index(alpha_dir, "new task work");
     let _ = wrote_new_task;
     let alpha_new_sid = create_sandbox(&server, "mproj-alpha-newtask").await;
     let alpha_new_ok = if alpha_new_sid.is_empty() {
@@ -778,6 +790,12 @@ pub async fn run(args: &[String]) -> i32 {
     );
     let delta_dir = &projects[3].1;
     let delta_sid = create_sandbox(&server, "mproj-delta").await;
+    if !delta_sid.is_empty() {
+        // The probe owns this sandbox: it must be in the cleanup list,
+        // or every run leaves an orphan behind and the NEXT run's
+        // budget measurement counts a host it does not control.
+        sandbox_ids.push(("delta".into(), delta_sid.clone()));
+    }
     let delta_built = if delta_sid.is_empty() {
         false
     } else {
