@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures-util = { workspace = true }
 subtle = "2.6.1"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` calls the router in process: the HTTP

@@ -20,6 +20,12 @@ pub struct CreateSandboxRequest {
     pub timeout: Option<i64>,
     pub resource_limits: Option<ResourceLimits>,
     pub platform: Option<PlatformSpec>,
+    /// The stable key of the creation intent.
+    ///
+    /// Two requests with the same key and the same body are ONE creation:
+    /// the second one is answered with the environment the first one
+    /// produced. The same key with another body is a conflict.
+    pub creation_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +147,12 @@ pub mod error_codes {
     pub const INTERNAL: &str = "SANDBOX::INTERNAL";
     /// The global environment budget is exhausted: nothing was created.
     pub const BUDGET_EXHAUSTED: &str = "SANDBOX::BUDGET_EXHAUSTED";
+    /// The creation key was already used with another body: nothing was
+    /// created, and the environment of the first request was not touched.
+    pub const CREATION_CONFLICT: &str = "SANDBOX::CREATION_CONFLICT";
+    /// The creation with this key is still in flight: nothing was
+    /// created, and the caller must wait for it.
+    pub const CREATION_IN_PROGRESS: &str = "SANDBOX::CREATION_IN_PROGRESS";
     /// The request carries no valid credential: nothing was created,
     /// enumerated, executed nor destroyed.
     pub const UNAUTHORIZED: &str = "SANDBOX::UNAUTHORIZED";

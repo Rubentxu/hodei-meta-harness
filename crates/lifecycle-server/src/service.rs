@@ -6,6 +6,7 @@ use std::net::IpAddr;
 
 use chrono::Utc;
 
+use crate::admission::{AdmissionAuthority, AdmissionBudget, AdmissionError, EnvironmentResources};
 use crate::auth::ControlToken;
 use crate::compose::{
     self, DockerHardening, build_env, build_host_spec, build_labels, resolve_resource_limits,
@@ -210,6 +211,16 @@ pub struct ServiceConfig {
     /// Global budget of concurrent environments. `None` means no limit.
     /// Enforced in the create path, so it bounds EVERY client.
     pub max_concurrent_environments: Option<usize>,
+    /// Global budget of memory the environments may take. `None` means no
+    /// limit.
+    pub max_total_memory_bytes: Option<i64>,
+    /// Global budget of CPU the environments may take. `None` means no
+    /// limit.
+    pub max_total_nano_cpus: Option<i64>,
+    /// How many times the release of an environment is attempted.
+    pub release_attempts: usize,
+    /// The wait between two attempts of the release of an environment.
+    pub release_delay: std::time::Duration,
     /// Who may ask, and what the sandbox may reach.
     pub trust: TrustConfig,
 }
@@ -222,13 +233,93 @@ impl Default for ServiceConfig {
             execd_run_as_init: true,
             max_timeout_seconds: 86_400,
             max_concurrent_environments: None,
+            max_total_memory_bytes: None,
+            max_total_nano_cpus: None,
+            release_attempts: DEFAULT_RELEASE_ATTEMPTS,
+            release_delay: DEFAULT_RELEASE_DELAY,
             trust: TrustConfig::default(),
         }
     }
 }
 
+/// How many times the release of an environment is attempted.
+///
+/// The attempt is BOUNDED: a daemon that refuses the removal is a real
+/// failure, and the operator has to see it.
+const DEFAULT_RELEASE_ATTEMPTS: usize = 3;
+
+/// The wait between two attempts of the release of an environment.
+const DEFAULT_RELEASE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a request waits for the creation another request owns.
+const CREATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The lifecycle service, shared by the HTTP surface.
 pub type SharedService = std::sync::Arc<LifecycleService>;
+
+/// The outcome of a creation, published to whoever waits for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreationOutcome {
+    /// The creation is still working.
+    InFlight,
+    /// The creation failed: the key is free again.
+    Failed,
+    /// The environment exists: this is its id.
+    Succeeded(String),
+}
+
+/// One creation intent, by creation key.
+struct CreationEntry {
+    /// The fingerprint of the body the key was used with.
+    fingerprint: String,
+    /// Publishes the outcome of the creation to whoever waits for it.
+    outcome: tokio::sync::watch::Sender<CreationOutcome>,
+}
+
+/// The claim of a creation key.
+enum CreationClaim {
+    /// The request owns the creation and has to perform it.
+    Owned(CreationTicket),
+    /// The creation already happened: this is the environment it produced.
+    Existing(String),
+    /// The key was already used with another body.
+    Conflict,
+    /// Another request owns the creation and it is still working.
+    InFlight(tokio::sync::watch::Receiver<CreationOutcome>),
+}
+
+/// What the claim of a creation key decided.
+enum CreationClaimResult {
+    /// The request creates the environment. The ticket is `None` when the
+    /// request carries no creation key.
+    Create(Option<CreationTicket>),
+    /// The creation already happened: this is the environment it produced.
+    Existing(String),
+}
+
+/// The ownership of a creation key.
+struct CreationTicket {
+    key: String,
+    outcome: tokio::sync::watch::Sender<CreationOutcome>,
+}
+
+/// Wait for the outcome of a creation another request owns.
+///
+/// The outcome is published by its owner: `None` means the owner is gone
+/// without publishing anything, and the creation did not happen.
+async fn await_creation_outcome(
+    outcome: &mut tokio::sync::watch::Receiver<CreationOutcome>,
+) -> Option<CreationOutcome> {
+    loop {
+        let current = outcome.borrow().clone();
+        if current != CreationOutcome::InFlight {
+            return Some(current);
+        }
+        if outcome.changed().await.is_err() {
+            return None;
+        }
+    }
+}
 
 pub struct LifecycleService {
     adapter: DockerAdapter,
@@ -246,16 +337,77 @@ pub struct LifecycleService {
     /// The creations that are in flight: their networks exist before
     /// their containers do, and the sweep must not take them away.
     in_flight: InFlight,
+    /// The admission authority: the single owner of the slots and of the
+    /// aggregate budget of environments.
+    admission: std::sync::Mutex<AdmissionAuthority>,
+    /// The creation intents, by creation key.
+    creations: std::sync::Mutex<std::collections::HashMap<String, CreationEntry>>,
+}
+
+/// The admission authority, locked.
+///
+/// The lock is held for a decision and never across an await: the
+/// admission of a creation must not wait for a slow operation, and the
+/// decision must not be taken twice.
+fn lock_admission(
+    admission: &std::sync::Mutex<AdmissionAuthority>,
+) -> std::sync::MutexGuard<'_, AdmissionAuthority> {
+    admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The creation intents, locked.
+fn lock_creations(
+    creations: &std::sync::Mutex<std::collections::HashMap<String, CreationEntry>>,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, CreationEntry>> {
+    creations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The reservation of the budget for a creation in flight.
+///
+/// The reservation is taken BEFORE any effect and released when the
+/// creation does not finish: a creation that fails, that is abandoned or
+/// that is cancelled does not keep the host's slot.
+struct BudgetReservation<'a> {
+    authority: &'a std::sync::Mutex<AdmissionAuthority>,
+    sandbox_id: String,
+    committed: bool,
+}
+
+impl BudgetReservation<'_> {
+    /// The environment exists: the reservation becomes a commitment.
+    fn commit(&mut self) {
+        self.committed = true;
+        lock_admission(self.authority).commit(&self.sandbox_id);
+    }
+}
+
+impl Drop for BudgetReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            lock_admission(self.authority).release(&self.sandbox_id);
+        }
+    }
 }
 
 impl LifecycleService {
     pub fn new(adapter: DockerAdapter, config: ServiceConfig) -> Self {
+        let budget = AdmissionBudget {
+            slots: config.max_concurrent_environments,
+            memory_bytes: config.max_total_memory_bytes,
+            nano_cpus: config.max_total_nano_cpus,
+        };
         Self {
             adapter,
             config,
             relays: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            admission: std::sync::Mutex::new(AdmissionAuthority::new(budget)),
+            creations: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -264,7 +416,169 @@ impl LifecycleService {
         &self.config.trust.control_token
     }
 
+    /// Create an environment.
+    ///
+    /// The creation key decides whether this request is a NEW creation or
+    /// a repeat of one that was already served: the same key with the same
+    /// body is ONE environment, and the same key with another body is a
+    /// conflict. Without a key the request creates, as it always did.
     pub async fn create_sandbox(
+        &self,
+        req: CreateSandboxRequest,
+    ) -> Result<CreateSandboxResponse, ServiceError> {
+        match self.claim_creation(&req).await? {
+            CreationClaimResult::Existing(sandbox_id) => self.describe_creation(&sandbox_id).await,
+            CreationClaimResult::Create(ticket) => {
+                let created = self.create_environment(req).await;
+                match (created, ticket) {
+                    (Ok(created), Some(ticket)) => {
+                        self.finish_creation(
+                            &ticket,
+                            CreationOutcome::Succeeded(created.id.clone()),
+                        );
+                        Ok(created)
+                    }
+                    (Err(error), Some(ticket)) => {
+                        // The creation did not happen: the key is free
+                        // again and a retry may take it.
+                        self.finish_creation(&ticket, CreationOutcome::Failed);
+                        Err(error)
+                    }
+                    (created, None) => created,
+                }
+            }
+        }
+    }
+
+    /// Claim the creation key of a request.
+    ///
+    /// The claim is taken BEFORE any effect: two requests with the same
+    /// key are one creation, and the second one waits for the first
+    /// instead of creating a second environment.
+    async fn claim_creation(
+        &self,
+        req: &CreateSandboxRequest,
+    ) -> Result<CreationClaimResult, ServiceError> {
+        let Some(raw_key) = req.creation_key.as_deref() else {
+            return Ok(CreationClaimResult::Create(None));
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            return Err(ServiceError::Contract {
+                code: error_codes::INVALID_PARAMETER,
+                message: "the creation key must not be empty".to_string(),
+            });
+        }
+        let fingerprint = compose::creation_fingerprint(req);
+        loop {
+            match self.claim_creation_key(key, &fingerprint) {
+                CreationClaim::Owned(ticket) => {
+                    return Ok(CreationClaimResult::Create(Some(ticket)));
+                }
+                CreationClaim::Existing(sandbox_id) => {
+                    return Ok(CreationClaimResult::Existing(sandbox_id));
+                }
+                CreationClaim::Conflict => {
+                    return Err(ServiceError::Contract {
+                        code: error_codes::CREATION_CONFLICT,
+                        message: format!(
+                            "the creation key {key:?} was already used with another body; \
+                             no environment was created and the environment of the first \
+                             request was not touched"
+                        ),
+                    });
+                }
+                CreationClaim::InFlight(mut outcome) => {
+                    // The owner is still working: the answer is its
+                    // answer, not a second environment.
+                    match tokio::time::timeout(CREATION_WAIT, await_creation_outcome(&mut outcome))
+                        .await
+                    {
+                        Ok(Some(CreationOutcome::Succeeded(sandbox_id))) => {
+                            return Ok(CreationClaimResult::Existing(sandbox_id));
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            return Err(ServiceError::Contract {
+                                code: error_codes::CREATION_IN_PROGRESS,
+                                message: format!(
+                                    "the creation with the key {key:?} is still in flight; \
+                                     no environment was created"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Claim a creation key in the registry.
+    fn claim_creation_key(&self, key: &str, fingerprint: &str) -> CreationClaim {
+        let mut registry = lock_creations(&self.creations);
+        let known = registry.get(key).map(|entry| {
+            (
+                entry.fingerprint.clone(),
+                entry.outcome.borrow().clone(),
+                entry.outcome.clone(),
+            )
+        });
+        if let Some((known_fingerprint, current, outcome)) = known {
+            if known_fingerprint != fingerprint {
+                return CreationClaim::Conflict;
+            }
+            match current {
+                CreationOutcome::Succeeded(sandbox_id) => {
+                    return CreationClaim::Existing(sandbox_id);
+                }
+                CreationOutcome::InFlight => {
+                    return CreationClaim::InFlight(outcome.subscribe());
+                }
+                CreationOutcome::Failed => {
+                    // The owner failed: the key is free again.
+                    registry.remove(key);
+                }
+            }
+        }
+        let (outcome, _receiver) = tokio::sync::watch::channel(CreationOutcome::InFlight);
+        registry.insert(
+            key.to_string(),
+            CreationEntry {
+                fingerprint: fingerprint.to_string(),
+                outcome: outcome.clone(),
+            },
+        );
+        CreationClaim::Owned(CreationTicket {
+            key: key.to_string(),
+            outcome,
+        })
+    }
+
+    /// Publish the outcome of a creation the request owned.
+    fn finish_creation(&self, ticket: &CreationTicket, outcome: CreationOutcome) {
+        let failed = matches!(outcome, CreationOutcome::Failed);
+        ticket.outcome.send_replace(outcome);
+        if failed {
+            // The creation did not happen: the key is free again.
+            lock_creations(&self.creations).remove(&ticket.key);
+        }
+    }
+
+    /// The environment a creation key produced, read back from the daemon.
+    async fn describe_creation(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<CreateSandboxResponse, ServiceError> {
+        let name = compose::container_name(sandbox_id);
+        let inspect = self.adapter.inspect(&name).await?;
+        creation_response_from_inspect(sandbox_id, &inspect).ok_or_else(|| ServiceError::Contract {
+            code: error_codes::SANDBOX_NOT_FOUND,
+            message: format!("the sandbox {sandbox_id} of this creation key is not there"),
+        })
+    }
+
+    /// Create the environment: the effects, in order.
+    async fn create_environment(
         &self,
         req: CreateSandboxRequest,
     ) -> Result<CreateSandboxResponse, ServiceError> {
@@ -291,18 +605,6 @@ impl LifecycleService {
             message: e.message,
         })?;
 
-        // Admission BEFORE anything is created: the global budget is a
-        // property of the server, not of the client that happens to ask.
-        if self.config.max_concurrent_environments.is_some() {
-            let live = self.adapter.list_sandbox_containers().await?.len();
-            compose::admit_creation(live, self.config.max_concurrent_environments).map_err(
-                |message| ServiceError::Contract {
-                    code: crate::model::error_codes::BUDGET_EXHAUSTED,
-                    message,
-                },
-            )?;
-        }
-
         let proxy = self
             .config
             .trust
@@ -313,17 +615,37 @@ impl LifecycleService {
                 code: error_codes::NETWORK_POLICY_VIOLATION,
                 message: "trusted egress proxy container is not configured".to_string(),
             })?;
+
+        // The identity of the environment is decided BEFORE the
+        // reservation: the reservation is keyed by it.
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        // The reservation is taken BEFORE any effect: an environment that
+        // is being created already occupies its slot, and two
+        // simultaneous creations cannot both take the last one. The
+        // reservation is released if the creation does not finish.
+        let mut reservation = self.reserve_budget(&sandbox_id, memory, nano_cpus)?;
         let image = req
             .image
             .as_ref()
             .expect("validated: image present")
             .clone();
         let entrypoint = req.entrypoint.clone().unwrap_or_default();
-        let sandbox_id = uuid::Uuid::new_v4().to_string();
         let created_at = Utc::now();
-        let expires_at = req
-            .timeout
-            .map(|t| created_at + chrono::Duration::seconds(t));
+        // The expiry is computed with a duration that FITS: a timeout that
+        // cannot be represented is refused by the validation, and this is
+        // the place where that promise is kept.
+        let expires_at = match req.timeout {
+            Some(seconds) => Some(
+                created_at
+                    + chrono::Duration::try_seconds(seconds).ok_or_else(|| {
+                        ServiceError::Contract {
+                            code: error_codes::INVALID_PARAMETER,
+                            message: format!("timeout {seconds}s is out of range"),
+                        }
+                    })?,
+            ),
+            None => None,
+        };
         let platform = req.platform.clone();
         let docker_platform = platform.as_ref().map(|p| format!("{}/{}", p.os, p.arch));
 
@@ -488,6 +810,9 @@ impl LifecycleService {
         // The sandbox exists: its network belongs to it now.
         guard.complete();
 
+        // The environment exists: the reservation becomes a commitment.
+        reservation.commit();
+
         Ok(CreateSandboxResponse {
             id: sandbox_id,
             image_id: Some(image_id),
@@ -501,6 +826,40 @@ impl LifecycleService {
             created_at,
             entrypoint: Some(entrypoint),
         })
+    }
+
+    /// Take the resources of an environment that is about to be created.
+    ///
+    /// The decision and the reservation are the SAME operation, under the
+    /// same lock: a creation that is admitted owns the resources, and a
+    /// creation that is refused owns nothing.
+    fn reserve_budget(
+        &self,
+        sandbox_id: &str,
+        memory_bytes: i64,
+        nano_cpus: i64,
+    ) -> Result<BudgetReservation<'_>, ServiceError> {
+        let resources = EnvironmentResources {
+            slots: 1,
+            memory_bytes,
+            nano_cpus,
+        };
+        let mut ledger = lock_admission(&self.admission);
+        match ledger.reserve(sandbox_id, resources) {
+            Ok(()) => Ok(BudgetReservation {
+                authority: &self.admission,
+                sandbox_id: sandbox_id.to_string(),
+                committed: false,
+            }),
+            Err(AdmissionError::Exhausted(refusal)) => Err(ServiceError::Contract {
+                code: error_codes::BUDGET_EXHAUSTED,
+                message: refusal.message,
+            }),
+            Err(AdmissionError::AlreadyAccounted(id)) => Err(ServiceError::Contract {
+                code: error_codes::INTERNAL,
+                message: format!("the environment {id} is already accounted for"),
+            }),
+        }
     }
 
     /// Remember the credential this server minted for a sandbox.
@@ -630,6 +989,17 @@ impl LifecycleService {
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, ServiceError> {
+        Ok(self
+            .observe_sandboxes()
+            .await?
+            .into_iter()
+            .map(|observed| observed.sandbox)
+            .collect())
+    }
+
+    /// The environments the daemon reports, with what each one takes of
+    /// the host and the creation intent it came from.
+    async fn observe_sandboxes(&self) -> Result<Vec<ObservedSandbox>, ServiceError> {
         let summaries = self.adapter.list_sandbox_containers().await?;
         let mut items = Vec::new();
         for summary in summaries {
@@ -637,11 +1007,65 @@ impl LifecycleService {
                 continue;
             };
             let inspect = self.adapter.inspect(&summary.id).await?;
-            if let Some(sandbox) = sandbox_from_inspect(id, &inspect) {
-                items.push(sandbox);
-            }
+            let Some(sandbox) = sandbox_from_inspect(id, &inspect) else {
+                continue;
+            };
+            let creation = match (
+                summary.labels.get(compose::LABEL_CREATION_KEY),
+                summary.labels.get(compose::LABEL_CREATION_FINGERPRINT),
+            ) {
+                (Some(key), Some(fingerprint)) => Some(CreationRecord {
+                    key: key.clone(),
+                    fingerprint: fingerprint.clone(),
+                }),
+                _ => None,
+            };
+            items.push(ObservedSandbox {
+                sandbox,
+                resources: resources_from_inspect(&inspect),
+                creation,
+            });
         }
         Ok(items)
+    }
+
+    /// Reconcile the authority with what the daemon reports.
+    ///
+    /// A server that restarts finds the environments it left behind, and
+    /// an environment that was removed by somebody else stops counting.
+    /// The creations that are in flight are not affected: they are not
+    /// visible to the daemon yet.
+    pub async fn reconcile(&self) -> Result<(), ServiceError> {
+        let horizon = lock_admission(&self.admission).sequence();
+        let observed = self.observe_sandboxes().await?;
+        self.reconcile_observed(&observed, horizon);
+        Ok(())
+    }
+
+    /// Apply an observation to the authority and to the creation registry.
+    fn reconcile_observed(&self, observed: &[ObservedSandbox], horizon: u64) {
+        let environments: Vec<(String, EnvironmentResources)> = observed
+            .iter()
+            .map(|item| (item.sandbox.id.clone(), item.resources))
+            .collect();
+        lock_admission(&self.admission).reconcile(&environments, horizon);
+        let mut registry = lock_creations(&self.creations);
+        for item in observed {
+            let Some(creation) = &item.creation else {
+                continue;
+            };
+            // The intents that are in flight are kept: the daemon does not
+            // know about them yet.
+            registry.entry(creation.key.clone()).or_insert_with(|| {
+                let (outcome, _receiver) = tokio::sync::watch::channel(CreationOutcome::Succeeded(
+                    item.sandbox.id.clone(),
+                ));
+                CreationEntry {
+                    fingerprint: creation.fingerprint.clone(),
+                    outcome,
+                }
+            });
+        }
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), ServiceError> {
@@ -670,7 +1094,11 @@ impl LifecycleService {
                         code: error_codes::INTERNAL,
                         message: "sandbox has no container identity".to_string(),
                     })?;
-                self.adapter.remove_container(id).await?;
+                // The removal is attempted a BOUNDED number of times: a
+                // daemon that refuses it once is a failure, not a lost
+                // environment. A removal that fails is NEVER reported as
+                // a removal.
+                self.remove_container_with_retry(id).await?;
                 true
             }
             Err(DockerError::Contract {
@@ -679,6 +1107,10 @@ impl LifecycleService {
             }) => false,
             Err(error) => return Err(error.into()),
         };
+        // The environment is gone: its slot is free again. The network may
+        // still be there —the reaper of orphans takes it— but the
+        // ENVIRONMENT is released.
+        lock_admission(&self.admission).release(sandbox_id);
         let had_network = self.adapter.remove_sandbox_network(sandbox_id).await?;
         // The release is visible: a sandbox that is gone and a network
         // that is gone are facts the operator can check.
@@ -693,24 +1125,67 @@ impl LifecycleService {
         Ok(())
     }
 
+    /// Remove the container of an environment, with a bounded number of
+    /// attempts.
+    ///
+    /// The attempt is bounded: a daemon that refuses the removal is a real
+    /// failure, and the caller has to see it. The wait between attempts
+    /// belongs to the configuration, so a test does not have to sleep.
+    async fn remove_container_with_retry(&self, container: &str) -> Result<(), ServiceError> {
+        let attempts = self.config.release_attempts.max(1);
+        let mut last_error: Option<ServiceError> = None;
+        for attempt in 1..=attempts {
+            match self.adapter.remove_container(container).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(
+                        "the removal of the container {container} failed \
+                         (attempt {attempt} of {attempts}): {error}"
+                    );
+                    last_error = Some(ServiceError::from(error));
+                    if attempt < attempts {
+                        tokio::time::sleep(self.config.release_delay).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| ServiceError::Contract {
+            code: error_codes::INTERNAL,
+            message: "the container was not removed".to_string(),
+        }))
+    }
+
     /// TTL sweep: release every sandbox whose recorded expiry is due.
-    /// Returns the ids this sweep removed (racing removes are fine: an
-    /// already-gone sandbox is not an error for the reaper).
+    ///
+    /// Returns the ids this sweep RELEASED. An environment whose release
+    /// failed is not in the list: it is still there, and saying otherwise
+    /// would be a lie the operator can check.
     pub async fn expire_due_sandboxes(&self) -> Vec<String> {
-        let entries: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = self
-            .list_sandboxes()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|sandbox| (sandbox.id, sandbox.expires_at))
+        let horizon = lock_admission(&self.admission).sequence();
+        let observed = self.observe_sandboxes().await.unwrap_or_default();
+        // The authority is reconciled BEFORE the releases: an
+        // environment that somebody else removed stops counting, and the
+        // creations in flight keep their reservation.
+        self.reconcile_observed(&observed, horizon);
+        let entries: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = observed
+            .iter()
+            .map(|item| (item.sandbox.id.clone(), item.sandbox.expires_at))
             .collect();
         let due = compose::expired_sandboxes(&entries, Utc::now());
+        let mut released = Vec::new();
         for id in &due {
-            // A failure to release a sandbox is reported, not swallowed:
-            // the environment is still there, and the operator has to
-            // know that it is.
-            if let Err(error) = self.delete_sandbox(id).await {
-                tracing::error!("the sandbox {id} could not be released: {error}");
+            match self.delete_sandbox(id).await {
+                Ok(()) => released.push(id.clone()),
+                Err(error) if error.code() == error_codes::SANDBOX_NOT_FOUND => {
+                    // The environment was already gone: a racing release
+                    // is not an error for the reaper.
+                }
+                Err(error) => {
+                    // A failure to release a sandbox is reported, not
+                    // swallowed: the environment is still there, and the
+                    // operator has to know that it is.
+                    tracing::error!("the sandbox {id} could not be released: {error}");
+                }
             }
         }
         // A sandbox whose container is gone but whose network is not
@@ -726,7 +1201,7 @@ impl LifecycleService {
         if helpers > 0 {
             tracing::info!("removed {helpers} abandoned execd artifact helpers");
         }
-        due
+        released
     }
 
     /// Remove the networks of sandboxes that no longer exist.
@@ -917,6 +1392,56 @@ pub fn sandbox_from_inspect(
         expires_at,
         created_at,
         entrypoint,
+    })
+}
+
+/// One environment observed in the daemon, with what it takes of the host.
+struct ObservedSandbox {
+    sandbox: Sandbox,
+    resources: EnvironmentResources,
+    /// The creation intent it came from, when it carries one.
+    creation: Option<CreationRecord>,
+}
+
+/// The creation intent an environment carries in its labels.
+struct CreationRecord {
+    key: String,
+    fingerprint: String,
+}
+
+/// The resources a container takes of the host, read back from it.
+///
+/// The limits are the ones the container REALLY runs under: the ones the
+/// daemon applied, not the ones the request asked for.
+fn resources_from_inspect(
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> EnvironmentResources {
+    let host = inspect.host_config.as_ref();
+    EnvironmentResources {
+        slots: 1,
+        memory_bytes: host.and_then(|host| host.memory).unwrap_or(0),
+        nano_cpus: host.and_then(|host| host.nano_cpus).unwrap_or(0),
+    }
+}
+
+/// The answer of a creation that already happened, read back from the
+/// daemon.
+///
+/// It is the same shape the creation answered with: the environment that
+/// the key produced, described as it is now.
+fn creation_response_from_inspect(
+    sandbox_id: &str,
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> Option<CreateSandboxResponse> {
+    let sandbox = sandbox_from_inspect(sandbox_id, inspect)?;
+    Some(CreateSandboxResponse {
+        id: sandbox.id,
+        image_id: inspect.image.clone().filter(|image| !image.is_empty()),
+        status: sandbox.status,
+        metadata: sandbox.metadata,
+        expires_at: sandbox.expires_at,
+        created_at: sandbox.created_at,
+        entrypoint: sandbox.entrypoint,
     })
 }
 

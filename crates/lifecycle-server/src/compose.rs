@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::model::{CreateSandboxRequest, PlatformSpec, error_codes};
 
@@ -18,6 +20,16 @@ pub const LABEL_PLATFORM_ARCH: &str = "opensandbox.io/platform-arch";
 pub const LABEL_METADATA_KEYS: &str = "opensandbox.io/metadata-keys";
 pub const LABEL_EXECD_HOST_PORT: &str = "opensandbox.io/embedding-proxy-port";
 pub const LABEL_HTTP_HOST_PORT: &str = "opensandbox.io/http-port";
+
+/// The label that carries the creation key of an environment.
+///
+/// The key is the idempotency key of the creation: it is written where the
+/// daemon can be asked about it, so a server that restarts still knows
+/// which environments came from which intent.
+pub const LABEL_CREATION_KEY: &str = "hodei.io/creation-key";
+/// The label that carries the fingerprint of the body the creation key was
+/// used with: the same key with another body is a conflict, not a repeat.
+pub const LABEL_CREATION_FINGERPRINT: &str = "hodei.io/creation-fingerprint";
 
 /// Container-internal ports exposed by every sandbox (docker_service.py).
 pub const EXECD_CONTAINER_PORT: &str = "44772/tcp";
@@ -134,16 +146,28 @@ pub fn validate_create_request(
         ));
     }
     if let Some(timeout) = req.timeout {
-        if timeout < 0 {
+        if timeout <= 0 {
             return Err(validation_error(
                 error_codes::INVALID_PARAMETER,
-                format!("timeout must be a non-negative number of seconds, got {timeout}"),
+                format!(
+                    "timeout must be a positive number of seconds, got {timeout}; \
+                     omit it to create an environment without expiration"
+                ),
             ));
         }
         if timeout > max_timeout_seconds {
             return Err(validation_error(
                 error_codes::INVALID_PARAMETER,
                 format!("timeout {timeout}s exceeds the server maximum of {max_timeout_seconds}s"),
+            ));
+        }
+        // The expiry is computed with the timeout: a value that does not
+        // fit in a duration is refused HERE, not when the environment is
+        // already being created.
+        if chrono::Duration::try_seconds(timeout).is_none() {
+            return Err(validation_error(
+                error_codes::INVALID_PARAMETER,
+                format!("timeout {timeout}s is out of range"),
             ));
         }
     }
@@ -185,6 +209,15 @@ pub fn build_labels(
         LABEL_CREATED_AT.to_string(),
         created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
     );
+    // The creation key travels with the environment: the daemon is where
+    // a restarted server looks for the intents it already served.
+    if let Some(key) = request.creation_key.as_deref() {
+        labels.insert(LABEL_CREATION_KEY.to_string(), key.to_string());
+        labels.insert(
+            LABEL_CREATION_FINGERPRINT.to_string(),
+            creation_fingerprint(request),
+        );
+    }
     if let Some(p) = platform {
         labels.insert(LABEL_PLATFORM_OS.to_string(), p.os.clone());
         labels.insert(LABEL_PLATFORM_ARCH.to_string(), p.arch.clone());
@@ -314,6 +347,10 @@ pub fn token_from_env(env: Vec<String>) -> Option<String> {
 }
 
 /// Parse a Docker-style memory limit ("2Gi", "512Mi", "262144000", plain bytes).
+///
+/// Only a FINITE, positive and representable limit is a limit: a value
+/// that overflows, that is not a number or that is not finite is refused
+/// instead of being clamped to a number nobody asked for.
 pub fn parse_memory_limit(raw: &str) -> Result<i64, ValidationError> {
     let s = raw.trim();
     if s.is_empty() {
@@ -330,11 +367,14 @@ pub fn parse_memory_limit(raw: &str) -> Result<i64, ValidationError> {
     for (suffix, mult) in units {
         if let Some(num) = s.strip_suffix(suffix) {
             let value: f64 = num.trim().parse().map_err(|_| bad_memory(raw))?;
-            let bytes = (value * mult as f64) as i64;
-            if bytes <= 0 {
+            if !value.is_finite() || value <= 0.0 {
                 return Err(bad_memory(raw));
             }
-            return Ok(bytes);
+            let bytes = value * mult as f64;
+            if !bytes.is_finite() || bytes < 1.0 || bytes > i64::MAX as f64 {
+                return Err(bad_memory(raw));
+            }
+            return Ok(bytes as i64);
         }
     }
     let bytes: i64 = s.parse().map_err(|_| bad_memory(raw))?;
@@ -435,25 +475,63 @@ pub fn expired_sandboxes(
         .collect()
 }
 
-/// Admission decision (pure): whether a NEW environment may be created
-/// given the live environments and the global slot budget.
+/// The intent of a creation: what the request asks for, WITHOUT the
+/// creation key.
 ///
-/// The budget is enforced in the CREATE PATH of the server, not in a
-/// client: a client-side ledger only bounds the clients that know
-/// about it. `None` means "no limit configured".
-///
-/// The rule itself (the free slots are `budget - live`) lives in
-/// `hodei-mh-budget`, so the server and the clients that predict its
-/// behaviour cannot drift apart.
-pub fn admit_creation(live_environments: usize, slot_budget: Option<usize>) -> Result<(), String> {
-    match slot_budget {
-        None => Ok(()),
-        Some(budget) if budget::ledger::admissible_creates(live_environments, budget) > 0 => Ok(()),
-        Some(budget) => Err(format!(
-            "global environment budget exhausted: {live_environments} of {budget} slots in use; \
-             no environment is created and the caller must WAIT (no silent admission)"
-        )),
+/// The key identifies the intent; the intent itself is what has to match
+/// for two requests to be the same creation. The credentials of the
+/// image are not part of it: a rotated credential is not another intent.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CreationIntent {
+    pub image: String,
+    pub entrypoint: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
+    pub timeout: Option<i64>,
+    pub memory: Option<String>,
+    pub cpu: Option<String>,
+    pub platform: Option<(String, String)>,
+}
+
+/// The intent a request expresses.
+pub fn creation_intent(req: &CreateSandboxRequest) -> CreationIntent {
+    CreationIntent {
+        image: req
+            .image
+            .as_ref()
+            .map(|image| image.uri.clone())
+            .unwrap_or_default(),
+        entrypoint: req.entrypoint.clone().unwrap_or_default(),
+        env: req.env.clone().unwrap_or_default(),
+        metadata: req.metadata.clone().unwrap_or_default(),
+        timeout: req.timeout,
+        memory: req
+            .resource_limits
+            .as_ref()
+            .and_then(|limits| limits.memory.clone()),
+        cpu: req
+            .resource_limits
+            .as_ref()
+            .and_then(|limits| limits.cpu.clone()),
+        platform: req
+            .platform
+            .as_ref()
+            .map(|platform| (platform.os.clone(), platform.arch.clone())),
     }
+}
+
+/// The fingerprint of a creation intent.
+///
+/// It is the digest of the CANONICAL form of the intent: the same intent
+/// always produces the same fingerprint, and two different intents never
+/// produce the same one. The digest is what the server keeps: the body
+/// itself never leaves the request.
+pub fn creation_fingerprint(req: &CreateSandboxRequest) -> String {
+    let canonical =
+        serde_json::to_vec(&creation_intent(req)).expect("an intent of owned data serializes");
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -557,17 +635,6 @@ mod tests {
             targets,
             vec!["due-past".to_string(), "due-exactly".to_string()]
         );
-    }
-
-    #[test]
-    fn the_slot_budget_is_enforced_before_the_environment_exists() {
-        assert!(admit_creation(0, Some(2)).is_ok());
-        assert!(admit_creation(1, Some(2)).is_ok());
-        let refused = admit_creation(2, Some(2)).expect_err("the budget is exhausted");
-        assert!(refused.contains("budget exhausted"), "{refused}");
-        assert!(refused.contains("WAIT"), "{refused}");
-        // No budget configured: every creation is admitted.
-        assert!(admit_creation(999, None).is_ok());
     }
 
     #[test]

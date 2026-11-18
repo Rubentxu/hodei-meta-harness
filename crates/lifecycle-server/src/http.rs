@@ -39,6 +39,7 @@ fn error_response(err: &ServiceError) -> Response {
         error_codes::INVALID_PARAMETER => StatusCode::BAD_REQUEST,
         error_codes::SANDBOX_NOT_FOUND => StatusCode::NOT_FOUND,
         error_codes::BUDGET_EXHAUSTED => StatusCode::TOO_MANY_REQUESTS,
+        error_codes::CREATION_CONFLICT | error_codes::CREATION_IN_PROGRESS => StatusCode::CONFLICT,
         error_codes::EXECD_START_FAILED | error_codes::EXECD_DISTRIBUTION_FAILED => {
             StatusCode::SERVICE_UNAVAILABLE
         }

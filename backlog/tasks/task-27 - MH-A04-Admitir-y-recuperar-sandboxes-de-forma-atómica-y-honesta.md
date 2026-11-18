@@ -1,9 +1,11 @@
 ---
 id: TASK-27
 title: '[MH-A04] Admitir y recuperar sandboxes de forma atómica y honesta'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-18T11:49:00Z'
+updated_date: '2026-11-18T22:47:00Z'
 labels:
   - audit-v0.2
   - lifecycle
@@ -33,3 +35,9 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 - [ ] #3 Un fallo DELETE no aparece como liberado y se reintenta de forma acotada; no se eliminan entornos ajenos.
 - [ ] #4 NaN, infinito, cero inválido y valores desbordados se rechazan; prueba concurrente determinista y un smoke real.
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+6. Verificar: pruebas offline (admision concurrente determinista con un daemon simulado, conflicto de clave, liberacion tras fallo y tras reinicio reconciliado, fallo de DELETE), cargo fmt, cargo clippy -D warnings, scripts/fast-check.sh y un smoke real en la pista de sondas (creates concurrentes contra el presupuesto real y la misma clave de creacion).
+<!-- SECTION:PLAN:END -->

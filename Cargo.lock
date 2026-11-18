@@ -747,6 +747,7 @@ dependencies = [
  "hodei-mh-budget",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tar",
  "thiserror",
