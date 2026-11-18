@@ -101,6 +101,15 @@ pub struct Snapshot {
     pub last_action: Option<ActionOutcome>,
     /// Environment TTL remaining (seconds), if one is being tracked.
     pub ttl_remaining_seconds: Option<u64>,
+    /// Epoch of the current run. It advances only when a run starts — it
+    /// is not the event count.
+    pub epoch: u64,
+    /// The effect scope the current grant authorizes, stated explicitly.
+    /// Empty means the supervisor authorizes NO effect by itself.
+    pub grant_effects: Vec<String>,
+    /// Set when the core recovered from a poisoned lock. Visible, never
+    /// silently swallowed.
+    pub degraded: Option<String>,
 }
 
 #[cfg(test)]
@@ -146,6 +155,9 @@ mod tests {
             wait_reason: None,
             last_action: None,
             ttl_remaining_seconds: None,
+            epoch: 0,
+            grant_effects: Vec::new(),
+            degraded: None,
         };
         let encoded = serde_json::to_string(&snapshot).expect("encode");
         let back: Snapshot = serde_json::from_str(&encoded).expect("re-parse");

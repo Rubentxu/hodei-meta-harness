@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use release::idle::{IdleGate, ReleaseDecision, release_on_idle};
 use release::reconcile::{
-    CreateOutcome, EnvironmentMeta, ReconcileDecision, RequestTag, orphans_to_release,
+    CreateOutcome, EnvironmentMeta, ReconcileDecision, RequestTag, TagLookup, orphans_to_release,
     reconcile_create,
 };
 use release::recovery::{self, SandboxLoss};
@@ -20,11 +20,6 @@ use serde_json::{Value, json};
 use verify::digest::CandidateDigest;
 
 const CANDIDATE_CONTENT: &str = "durable-candidate-payload-v1\n";
-/// In production this comes from `createdAt`; the time filter itself is
-/// covered by unit tests. Here the probe exercises the OWNERSHIP filter
-/// against real listed environments, so every listed item is treated as
-/// long-idle and the decision must still separate ours from foreign.
-const IDLE_PROOF_SECS: u64 = 9_999;
 const ORPHAN_THRESHOLD_SECS: u64 = 1_800;
 
 struct Check {
@@ -33,17 +28,27 @@ struct Check {
     detail: String,
 }
 
-async fn list_sandboxes(client: &reqwest::Client, server: &str) -> Vec<Value> {
-    let response = client.get(format!("{server}/v1/sandboxes")).send().await;
-    let value: Value = match response {
-        Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => Value::Null,
-    };
-    value
+/// List the sandboxes. An error is an ERROR: returning an empty list on
+/// failure would make "the sandbox is not there" indistinguishable from
+/// "I could not ask" — and that confusion licenses a duplicate.
+async fn list_sandboxes(client: &reqwest::Client, server: &str) -> Result<Vec<Value>, String> {
+    let response = client
+        .get(format!("{server}/v1/sandboxes"))
+        .send()
+        .await
+        .map_err(|e| format!("list sandboxes failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("list sandboxes returned {}", response.status()));
+    }
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("list sandboxes body unreadable: {e}"))?;
+    Ok(value
         .get("items")
         .and_then(|i| i.as_array())
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn find_by_tag(items: &[Value], tag: &str) -> Option<String> {
@@ -72,8 +77,10 @@ fn metadata_of(item: &Value) -> Option<&Value> {
     item.get("metadata")
 }
 
-/// Map one REAL listed sandbox into the reconciliation input.
-fn environment_meta(item: &Value) -> Option<EnvironmentMeta> {
+/// Map one REAL listed sandbox into the reconciliation input. The idle
+/// age comes from the environment's REAL `createdAt`: a fabricated
+/// constant would make the idle filter untestable.
+fn environment_meta(item: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<EnvironmentMeta> {
     let id = item.get("id")?.as_str()?.to_string();
     let metadata = metadata_of(item);
     let owned_by_us = metadata
@@ -81,11 +88,21 @@ fn environment_meta(item: &Value) -> Option<EnvironmentMeta> {
         .and_then(|v| v.as_str())
         == Some("hodei-mh");
     let claimed = metadata.is_some_and(|m| m.get("claimed-by").is_some());
+    let created_at = item
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    let idle_for_secs = created_at
+        .map(|created| (now - created).num_seconds().max(0) as u64)
+        // No `createdAt` → the age is UNKNOWN, and an unknown age is not
+        // "infinitely idle": it is not eligible for release.
+        .unwrap_or(0);
     Some(EnvironmentMeta {
         id,
         owned_by_us,
         claimed,
-        idle_for_secs: IDLE_PROOF_SECS,
+        idle_for_secs,
     })
 }
 
@@ -120,13 +137,17 @@ async fn create_sandbox(
     }
 }
 
+/// Whether the sandbox is REALLY gone. Only a 404 proves it: a transport
+/// error or a 500 means "I could not ask", which is NOT "it is gone".
 async fn sandbox_exists(client: &reqwest::Client, server: &str, id: &str) -> bool {
-    client
+    match client
         .get(format!("{server}/v1/sandboxes/{id}"))
         .send()
         .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    {
+        Ok(response) => response.status() != reqwest::StatusCode::NOT_FOUND,
+        Err(_) => true,
+    }
 }
 
 async fn delete_sandbox(client: &reqwest::Client, server: &str, id: &str) -> bool {
@@ -251,7 +272,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         // Search by tag before ANY retry, polling until the in-flight effect
         // becomes visible.
         for _ in 0..25 {
-            let items = list_sandboxes(&client, server).await;
+            let items = list_sandboxes(&client, server).await.unwrap_or_default();
             if let Some(id) = find_by_tag(&items, &tag) {
                 reconciled_id = Some(id);
                 break;
@@ -259,13 +280,16 @@ pub async fn run(server: &str, image: &str) -> i32 {
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
-    let items_after = list_sandboxes(&client, server).await;
+    let items_after = list_sandboxes(&client, server).await.unwrap_or_default();
     let decision = match reconciled_id.clone() {
         Some(_) => reconcile_create(
             CreateOutcome::Unknown {
                 tag: RequestTag(tag.clone()),
             },
-            |t| find_by_tag(&items_after, t.0.as_str()),
+            |t| match find_by_tag(&items_after, t.0.as_str()) {
+                Some(id) => TagLookup::Found { id },
+                None => TagLookup::NotFound,
+            },
         ),
         None => {
             // No trace anywhere: retry is SAFE (no duplicate possible).
@@ -291,7 +315,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
     };
     let decision_logged = format!("{decision:?}");
-    let final_items = list_sandboxes(&client, server).await;
+    let final_items = list_sandboxes(&client, server).await.unwrap_or_default();
     let effect_count = count_by_tag(&final_items, &tag);
     let adopted_not_duplicated = matches!(
         decision,
@@ -325,9 +349,24 @@ pub async fn run(server: &str, image: &str) -> i32 {
     if !foreign_id.is_empty() {
         created.push(foreign_id.clone());
     }
-    let listed = list_sandboxes(&client, server).await;
-    let metas: Vec<EnvironmentMeta> = listed.iter().filter_map(environment_meta).collect();
-    let targets = orphans_to_release(&metas, ORPHAN_THRESHOLD_SECS);
+    let listed = list_sandboxes(&client, server).await.unwrap_or_default();
+    let now = chrono::Utc::now();
+    let metas: Vec<EnvironmentMeta> = listed
+        .iter()
+        .filter_map(|item| environment_meta(item, now))
+        .collect();
+    // The idle ages come from the REAL `createdAt` of each environment.
+    // The threshold used here is the AGE the probe's own environments
+    // have reached (they were just created), so the OWNERSHIP filter is
+    // what this check exercises; the time filter itself is covered by
+    // the unit tests of `orphans_to_release`.
+    let probe_age = metas
+        .iter()
+        .find(|m| m.id == reconciled_id.clone().unwrap_or_default())
+        .map(|m| m.idle_for_secs)
+        .unwrap_or(0);
+    let threshold = probe_age.min(ORPHAN_THRESHOLD_SECS);
+    let targets = orphans_to_release(&metas, threshold);
     let foreign_in_targets = targets.contains(&foreign_id);
     let ours_released = match targets.iter().find(|id| reconciled_id.as_ref() == Some(id)) {
         Some(id) => delete_sandbox(&client, server, id).await,
@@ -346,7 +385,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             && !foreign_in_targets
             && foreign_alive,
         detail: format!(
-            "released {} hodei-mh orphan(s), deleted={ours_released}, gone(404)={ours_gone}; foreign sandbox untouched={foreign_alive} (deleted by the probe itself afterwards, not by the reconciler)",
+            "idle ages come from the REAL createdAt of each listed environment (threshold {threshold}s, the age this probe's own environment reached); released {} hodei-mh orphan(s), deleted={ours_released}, gone(404)={ours_gone}; foreign sandbox untouched={foreign_alive} (deleted by the probe itself afterwards, not by the reconciler)",
             targets.len(),
         ),
     });

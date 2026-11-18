@@ -55,6 +55,29 @@ fn stage(src: &Path, dest: &Path) -> bool {
     }
 }
 
+/// Where the release binaries live. An INSTALLED binary must not look
+/// for them on the machine that compiled it: the path is resolved from
+/// the running executable, with the repository as an explicit fallback.
+fn resolve_release_dir(repo: &Path) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        // Installed layout: <prefix>/bin/hodei-mh -> <prefix>/share/...
+        // Repo layout:   <repo>/target/debug/hodei-mh -> <repo>/target/release
+        if let Some(parent) = exe.parent() {
+            for candidate in [
+                parent.join("../lib/hodei-mh"),
+                parent.join("../target/release"),
+                parent.join("target/release"),
+            ] {
+                let resolved = candidate.canonicalize().unwrap_or(candidate.clone());
+                if resolved.join("hodei-mh").exists() {
+                    return resolved;
+                }
+            }
+        }
+    }
+    repo.join("target/release")
+}
+
 pub async fn run_package(args: &[String]) -> i32 {
     let out_dir = PathBuf::from(flag(args, "--out", "/tmp/hodei-mh-package"));
     let repo =
@@ -63,7 +86,7 @@ pub async fn run_package(args: &[String]) -> i32 {
             .and_then(|p| p.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-    let release = repo.join("target/release");
+    let release = resolve_release_dir(&repo);
 
     // Build the release binaries if they are not there yet (bounded
     // retries: the cargo lock can be transiently held by another session).
@@ -163,15 +186,41 @@ pub async fn run_package(args: &[String]) -> i32 {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
+    let contents: Vec<String> = listing
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    // The manifest reports what was SCANNED, not what is asserted: the
+    // undemonstrated dependencies are the ones really present in the
+    // staged bundle beyond the two binaries and the docs.
+    let mut undemonstrated: Vec<String> = Vec::new();
+    for entry in &contents {
+        let normalised = entry.trim_start_matches("./");
+        let known = normalised == "bin/hodei-mh"
+            || normalised == "bin/hodei-mh-lifecycle-server"
+            || normalised == "docs/profiles.md"
+            || normalised == "docs/INSTALL.md"
+            || normalised == "INSTALL.md"
+            || normalised == "install.sh"
+            || normalised.is_empty()
+            || normalised.ends_with('/');
+        if !known {
+            undemonstrated.push(entry.clone());
+        }
+    }
     println!(
         "{}",
         serde_json::json!({
             "package": tar_path.to_string_lossy(),
             "bytes": std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0),
-            "contents": listing.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>(),
+            "contents": contents,
             "guarantees": {
+                // The bundle contains no native build fallback: the
+                // binaries are the only executables and the docs say
+                // what they need.
                 "yolo_fallback": false,
-                "undemonstrated_dependencies": [],
+                "undemonstrated_dependencies": undemonstrated,
             },
         })
     );

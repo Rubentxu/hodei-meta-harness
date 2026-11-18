@@ -40,6 +40,9 @@ pub struct ServiceConfig {
     pub server_env: BTreeMap<String, String>,
     pub execd_run_as_init: bool,
     pub max_timeout_seconds: i64,
+    /// Global budget of concurrent environments. `None` means no limit.
+    /// Enforced in the create path, so it bounds EVERY client.
+    pub max_concurrent_environments: Option<usize>,
 }
 
 impl Default for ServiceConfig {
@@ -49,6 +52,7 @@ impl Default for ServiceConfig {
             server_env: BTreeMap::new(),
             execd_run_as_init: true,
             max_timeout_seconds: 86_400,
+            max_concurrent_environments: None,
         }
     }
 }
@@ -78,6 +82,18 @@ impl LifecycleService {
                 code: e.code,
                 message: e.message,
             })?;
+
+        // Admission BEFORE anything is created: the global budget is a
+        // property of the server, not of the client that happens to ask.
+        if self.config.max_concurrent_environments.is_some() {
+            let live = self.adapter.list_sandbox_containers().await?.len();
+            compose::admit_creation(live, self.config.max_concurrent_environments).map_err(
+                |message| ServiceError::Contract {
+                    code: crate::model::error_codes::BUDGET_EXHAUSTED,
+                    message,
+                },
+            )?;
+        }
 
         let image = req
             .image

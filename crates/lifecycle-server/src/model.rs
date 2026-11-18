@@ -135,6 +135,8 @@ pub mod error_codes {
     pub const EXECD_DISTRIBUTION_FAILED: &str = "SANDBOX::EXECD_DISTRIBUTION_FAILED";
     pub const NOT_IMPLEMENTED: &str = "SANDBOX::NOT_IMPLEMENTED";
     pub const INTERNAL: &str = "SANDBOX::INTERNAL";
+    /// The global environment budget is exhausted: nothing was created.
+    pub const BUDGET_EXHAUSTED: &str = "SANDBOX::BUDGET_EXHAUSTED";
 }
 
 #[cfg(test)]

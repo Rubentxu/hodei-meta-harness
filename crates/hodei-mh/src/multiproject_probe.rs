@@ -30,6 +30,9 @@ struct Step {
 const RUST_IMAGE: &str =
     "rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea";
 
+/// The slot budget the lifecycle server under test is configured with.
+const BUDGET_SLOTS: usize = 2;
+
 fn flag(args: &[String], name: &str, default: &str) -> String {
     args.iter()
         .position(|a| a == name)
@@ -126,6 +129,71 @@ async fn supervisor_alive(bin: &Path, socket: &str) -> bool {
         .await
         .0
         == 0
+}
+
+/// The lifecycle server binary: it lives NEXT TO the hodei-mh binary
+/// (both are built by the same workspace).
+fn lifecycle_server_bin(bin: &Path) -> PathBuf {
+    bin.parent()
+        .map(|dir| dir.join("hodei-mh-lifecycle-server"))
+        .unwrap_or_else(|| PathBuf::from("hodei-mh-lifecycle-server"))
+}
+
+/// Start a lifecycle server with a global budget of concurrent
+/// environments, so the budget can be observed in the CREATE path.
+fn spawn_budget_server(bin: &Path, server_url: &str) -> Command {
+    let port = server_url.rsplit(':').next().unwrap_or("8099");
+    let mut command = Command::new(lifecycle_server_bin(bin));
+    command
+        .env("PORT", port)
+        .env("MAX_CONCURRENT_ENVIRONMENTS", "2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
+/// Whether the lifecycle server answers its readiness probe.
+async fn wait_lifecycle_ready(server_url: &str) -> bool {
+    let client = reqwest::Client::new();
+    for _ in 0..30 {
+        if let Ok(response) = client
+            .get(format!("{server_url}/ready"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    false
+}
+
+/// How many environments the server currently lists.
+async fn count_sandboxes(server_url: &str) -> usize {
+    let client = reqwest::Client::new();
+    match client
+        .get(format!("{server_url}/v1/sandboxes"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => response
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("items")
+                    .and_then(|i| i.as_array())
+                    .map(|items| items.len())
+            })
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 async fn wait_supervisor(bin: &Path, socket: &str) -> bool {
@@ -328,6 +396,12 @@ impl PressureSampler {
                 .unwrap_or_else(|| "n/a (PSI unavailable)".into())
         )
     }
+
+    /// How many samples were actually collected. A pressure report with
+    /// no samples is NOT a measurement.
+    fn sample_count(&self) -> usize {
+        self.samples.lock().map(|g| g.len()).unwrap_or(0)
+    }
 }
 
 fn os_id() -> String {
@@ -430,6 +504,75 @@ pub async fn run(args: &[String]) -> i32 {
         detail: format!(
             "admissions: {:?} — gamma and delta were waitlisted BEFORE any sandbox create call",
             admissions,
+        ),
+    });
+
+    // ---- the budget is enforced by the SERVER, not only by the client --
+    // A client-side ledger only bounds the clients that know about it. A
+    // server configured with a slot budget must REFUSE the create.
+    let budget_server = format!("http://127.0.0.1:{}", 8099);
+    let mut budget_child = spawn_budget_server(&bin, &budget_server).spawn().ok();
+    let budget_ready = wait_lifecycle_ready(&budget_server).await;
+    // The budget is GLOBAL for the host: the environments that already
+    // exist count against it. The check measures the real count.
+    let preexisting = count_sandboxes(&budget_server).await;
+    let mut refused_by_budget: Option<String> = None;
+    let mut created_ids: Vec<String> = Vec::new();
+    if budget_ready {
+        for _ in 0..(BUDGET_SLOTS + 2) {
+            let response = reqwest::Client::new()
+                .post(format!("{budget_server}/v1/sandboxes"))
+                .json(&json!({
+                    "image": {"uri": "rust:1-bookworm"},
+                    "entrypoint": ["sleep", "infinity"],
+                    "timeout": 300,
+                    "metadata": {"managed-by": "hodei-mh", "purpose": "budget-probe"},
+                }))
+                .send()
+                .await;
+            match response {
+                Ok(r) if r.status().is_success() => {
+                    let body: Value = r.json().await.unwrap_or_default();
+                    if let Some(id) = body["id"].as_str() {
+                        created_ids.push(id.to_string());
+                    }
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    refused_by_budget = Some(format!("{status}: {body}"));
+                    break;
+                }
+                Err(e) => {
+                    refused_by_budget = Some(format!("transport error: {e}"));
+                    break;
+                }
+            }
+        }
+    }
+    // The refusal happens exactly when the slots are exhausted, and no
+    // environment is created for the refused request.
+    let budget_enforced = refused_by_budget
+        .as_ref()
+        .is_some_and(|body| body.contains("429") || body.contains("BUDGET_EXHAUSTED"))
+        && preexisting + created_ids.len() == BUDGET_SLOTS;
+    for id in &created_ids {
+        let _ = reqwest::Client::new()
+            .delete(format!("{budget_server}/v1/sandboxes/{id}"))
+            .send()
+            .await;
+    }
+    if let Some(mut child) = budget_child.take() {
+        let _ = child.kill().await;
+    }
+    steps.push(Step {
+        name: "the-global-budget-is-enforced-by-the-server-create-path",
+        passed: budget_enforced,
+        detail: format!(
+            "a lifecycle server started with a {BUDGET_SLOTS}-slot budget found {preexisting} environment(s) already alive, created {} more and REFUSED the next one (slots exhausted at {}); the refusal was {:?} — the limit is a property of the server, not of a client-side ledger",
+            created_ids.len(),
+            preexisting + created_ids.len(),
+            refused_by_budget,
         ),
     });
 
@@ -672,9 +815,12 @@ pub async fn run(args: &[String]) -> i32 {
     // ---- AC-3: host pressure recorded during the builds -----------------
     let os = os_id();
     let bazzite = os == "bazzite";
+    // The step passes only if REAL samples were collected: a pressure
+    // report with no samples is not a measurement, it is a claim.
+    let samples = sampler.sample_count();
     steps.push(Step {
         name: "host-pressure-recorded-bazzite-certification-honest",
-        passed: true,
+        passed: samples > 0,
         detail: format!(
             "{}; host OS id='{os}' -> bazzite-certified={}{}",
             sampler.summary(),
@@ -747,16 +893,26 @@ pub async fn run(args: &[String]) -> i32 {
             })
         })
         .unwrap_or(false);
+    // The manifest's guarantees are ASSERTED, not printed: the manifest
+    // reports what was scanned, and the probe checks it.
+    let yolo_false = pkg_record["guarantees"]["yolo_fallback"] == Value::Bool(false);
+    let no_undemonstrated = pkg_record["guarantees"]["undemonstrated_dependencies"]
+        .as_array()
+        .map(|items| items.is_empty())
+        .unwrap_or(false);
     steps.push(Step {
         name: "installable-package-e2e",
         passed: pkg_code == 0
             && extracted
             && install_code == 0
             && install_out.contains("PROCEED")
-            && manifest_clean,
+            && manifest_clean
+            && yolo_false
+            && no_undemonstrated,
         detail: format!(
-            "package built and extracted; the bundled binary ran doctor against the live API and PROCEEDED; manifest contains only bin/, docs/, install.sh, INSTALL.md (no undemonstrated extras); yolo_fallback={:?}",
-            pkg_record["guarantees"]["yolo_fallback"].as_bool(),
+            "package built and extracted; the bundled binary ran doctor against the live API and PROCEEDED; manifest contains only bin/, docs/, install.sh, INSTALL.md; yolo_fallback={} (asserted false); undemonstrated_dependencies={} (asserted empty)",
+            pkg_record["guarantees"]["yolo_fallback"],
+            pkg_record["guarantees"]["undemonstrated_dependencies"],
         ),
     });
     let _ = std::fs::remove_dir_all(&extract_dir);

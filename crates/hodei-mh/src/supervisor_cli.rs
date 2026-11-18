@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use supervisor::client::{self, SupervisorClient};
+use supervisor::client;
 use supervisor::engine;
 use supervisor::protocol::{ResourceObservation, Snapshot, StructuredEvent, SupervisorAction};
 use supervisor::render::{render_event, render_snapshot};
@@ -42,6 +42,9 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // Ownership of the socket file: only OUR file is removed on exit, so a
+    // successor supervisor that already replaced it keeps its socket.
+    let owned_socket = server::identity_of(std::path::Path::new(&socket));
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new({
         let mut core = engine::default_core(project);
         // The boot decision is the supervisor's own: logged with automatic
@@ -66,16 +69,22 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // included, credentials already redacted by the engine. Flush after
     // every line: a service whose log is stuck in a buffer is no log.
     tokio::spawn(async move {
-        let mut printed = 0usize;
+        // The log follows the SEQUENCE, not an index: the engine's history
+        // is a ring buffer, so an index would reprint or skip events.
+        let mut printed_seq: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let pending: Vec<String> = {
-                let Ok(guard) = log_core.lock() else {
-                    return;
+                // A poisoned lock must not silence the log: recover the core
+                // and keep printing (the supervisor marks itself degraded).
+                let guard = match log_core.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
-                let start = printed.min(guard.events.len());
-                let lines: Vec<String> = guard.events[start..]
+                let lines: Vec<String> = guard
+                    .events
                     .iter()
+                    .filter(|e| e.seq > printed_seq)
                     .map(|e| {
                         format!(
                             "[{}] {}\n",
@@ -84,7 +93,9 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
                         )
                     })
                     .collect();
-                printed = guard.events.len();
+                if let Some(last) = guard.events.last() {
+                    printed_seq = last.seq;
+                }
                 lines
             };
             if pending.is_empty() {
@@ -99,7 +110,9 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
         }
     });
     let served = server::serve(listener, core).await;
-    let _ = std::fs::remove_file(&socket);
+    if let Some(identity) = owned_socket {
+        server::unlink_if_owned(std::path::Path::new(&socket), identity);
+    }
     if served.is_err() {
         return 1;
     }
@@ -118,7 +131,7 @@ fn provenance_label(provenance: &supervisor::protocol::Provenance) -> &'static s
 fn parse_action(args: &[String], name: &str) -> Option<SupervisorAction> {
     match name {
         "start" => Some(SupervisorAction::Start {
-            project: flag(args, "--project", "hodei-mh"),
+            project: flag(args, "--project", ""),
             ticket: opt_flag(args, "--ticket"),
             revision: opt_flag(args, "--revision"),
         }),
@@ -177,6 +190,27 @@ pub async fn run_action(args: &[String]) -> i32 {
             eprintln!("{e}");
             return 1;
         }
+    };
+    // A Start names a project. When the caller does not name one, the
+    // SUPERVISOR's own project is used: the supervisor serves one project
+    // and refuses a Start for another one.
+    let action = match action {
+        SupervisorAction::Start {
+            project,
+            ticket,
+            revision,
+        } if project.is_empty() => match client.snapshot().await {
+            Ok(snapshot) => SupervisorAction::Start {
+                project: snapshot.project,
+                ticket,
+                revision,
+            },
+            Err(e) => {
+                eprintln!("cannot read the supervisor's project: {e}");
+                return 1;
+            }
+        },
+        other => other,
     };
     match client.action(action).await {
         Ok(outcome) => {
@@ -238,6 +272,10 @@ pub async fn run_events(args: &[String]) -> i32 {
 pub async fn run_attach_terminal(args: &[String]) -> i32 {
     let socket = flag(args, "--socket", DEFAULT_SOCKET);
     let max_events: u64 = flag(args, "--exit-after-events", "0").parse().unwrap_or(0);
+    // A viewer whose supervisor never answers must NOT hang forever: the
+    // deadline turns a dead supervisor into an explicit failure.
+    let deadline_secs: u64 = flag(args, "--deadline-seconds", "60").parse().unwrap_or(60);
+    let started = std::time::Instant::now();
     println!(
         "attached terminal viewer: read-only event tail; leaving does not affect the objective"
     );
@@ -267,6 +305,12 @@ pub async fn run_attach_terminal(args: &[String]) -> i32 {
         }
         if max_events > 0 && delivered >= max_events {
             return 0;
+        }
+        if started.elapsed().as_secs() >= deadline_secs {
+            eprintln!(
+                "viewer deadline reached after {deadline_secs}s: delivered {delivered} events (wanted {max_events})"
+            );
+            return 1;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -299,6 +343,9 @@ pub fn simulated_snapshot() -> Snapshot {
         wait_reason: None,
         last_action: None,
         ttl_remaining_seconds: Some(1800),
+        epoch: 1,
+        grant_effects: Vec::new(),
+        degraded: None,
     }
 }
 
@@ -324,6 +371,3 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
         },
     ]
 }
-
-#[allow(dead_code)]
-fn _unused_helper(_client: &SupervisorClient) {}

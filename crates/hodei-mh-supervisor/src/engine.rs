@@ -11,6 +11,11 @@ use crate::protocol::{
 };
 use crate::provenance::{Provenance, redact};
 
+/// Upper bound on the retained event history. The log is a RING: the
+/// oldest events are dropped, the sequence numbers keep growing. A
+/// supervisor that ran for days must not grow without bound.
+pub const MAX_RETAINED_EVENTS: usize = 1000;
+
 /// The supervisor's whole observable world. `run` reuses the run crate's
 /// state machine — the supervisor adds pause/wait semantics around it, it
 /// does NOT reimplement session control.
@@ -29,7 +34,16 @@ pub struct SupervisorCore {
     /// their disconnect must not alter the objective.
     pub terminal_viewers: u32,
     pub events: Vec<StructuredEvent>,
+    /// Monotonic sequence counter. Independent of `events.len()` so the
+    /// ring buffer never renumbers history.
+    pub next_seq: u64,
+    /// Monotonic epoch of the CURRENT run. Bumped on every Start; it is
+    /// NOT the event count (that changes on every event).
+    pub epoch: u64,
     pub last_action: Option<ActionOutcome>,
+    /// Set when the core had to recover from a poisoned lock: the state
+    /// is usable but the incident is visible, never silently swallowed.
+    pub degraded: Option<String>,
 }
 
 pub fn default_core(project: impl Into<String>) -> SupervisorCore {
@@ -46,7 +60,10 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         ttl_remaining_seconds: None,
         terminal_viewers: 0,
         events: Vec::new(),
+        next_seq: 1,
+        epoch: 0,
         last_action: None,
+        degraded: None,
     }
 }
 
@@ -58,7 +75,8 @@ pub fn emit_event(
     payload: serde_json::Value,
     provenance: Provenance,
 ) -> StructuredEvent {
-    let seq = core.events.len() as u64 + 1;
+    let seq = core.next_seq;
+    core.next_seq += 1;
     let event = StructuredEvent {
         seq,
         kind: kind.into(),
@@ -68,7 +86,29 @@ pub fn emit_event(
         provenance,
     };
     core.events.push(event.clone());
+    // Ring buffer: the oldest events fall off, the sequence keeps going.
+    if core.events.len() > MAX_RETAINED_EVENTS {
+        let excess = core.events.len() - MAX_RETAINED_EVENTS;
+        core.events.drain(0..excess);
+    }
     event
+}
+
+/// Mark the core as degraded after recovering from a poisoned lock. The
+/// incident is recorded as an event with automatic provenance.
+pub fn mark_degraded(core: &mut SupervisorCore, reason: &str) {
+    if core.degraded.is_some() {
+        return;
+    }
+    core.degraded = Some(reason.to_string());
+    emit_event(
+        core,
+        "supervisor/degraded",
+        serde_json::Value::String(reason.to_string()),
+        Provenance::Automatic {
+            rule: "poison-recovery".into(),
+        },
+    );
 }
 
 /// Ingest observed telemetry. `unknown: true` is recorded AS unknown: the
@@ -132,7 +172,18 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
             ticket,
             revision,
         } => {
-            if core
+            if project != &core.project {
+                // One controller PER PROJECT: a Start naming another
+                // project is refused, not applied under a different name.
+                outcome(
+                    &action,
+                    false,
+                    format!(
+                        "project mismatch: this supervisor serves '{}', not '{project}'",
+                        core.project
+                    ),
+                )
+            } else if core
                 .run
                 .as_ref()
                 .is_some_and(|run| run.phase == Phase::Running)
@@ -141,12 +192,17 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                 // tolerated silently.
                 outcome(&action, false, "already running: not a second controller")
             } else {
-                let grant = Grant::new(project, "supervisor-run", core.events.len() as u64, vec![]);
+                core.epoch += 1;
+                let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
                 core.run = Some(RunState::start(grant, "supervisor-session"));
                 core.ticket = ticket.clone();
                 core.revision = revision.clone();
                 core.paused = false;
-                outcome(&action, true, format!("run started for {project}"))
+                outcome(
+                    &action,
+                    true,
+                    format!("run started for {project} (epoch {})", core.epoch),
+                )
             }
         }
         SupervisorAction::Pause => {
@@ -218,11 +274,26 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
         wait_reason: core.paused.then(|| "paused by user".to_string()),
         last_action: core.last_action.clone(),
         ttl_remaining_seconds: core.ttl_remaining_seconds,
+        epoch: core.epoch,
+        // The grant's effect scope, stated explicitly: an empty scope
+        // means the supervisor authorizes NO effect by itself.
+        grant_effects: core
+            .run
+            .as_ref()
+            .map(|run| {
+                run.grant
+                    .effects
+                    .iter()
+                    .map(|effect| format!("{effect:?}"))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        degraded: core.degraded.clone(),
     }
 }
 
 pub fn events_since(core: &SupervisorCore, since: u64) -> (Vec<StructuredEvent>, u64) {
-    let next_seq = core.events.len() as u64 + 1;
+    let next_seq = core.next_seq;
     let events = core
         .events
         .iter()
@@ -277,6 +348,108 @@ mod tests {
         let resume = apply(&mut core, SupervisorAction::Resume);
         assert!(resume.applied);
         assert!(!core.paused);
+    }
+
+    #[test]
+    fn a_start_for_another_project_is_refused_not_applied() {
+        let mut core = default_core("alpha");
+        let start = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: "beta".into(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(!start.applied);
+        assert!(
+            start.detail.contains("project mismatch"),
+            "{}",
+            start.detail
+        );
+        // The core keeps serving ITS project, with no run started.
+        assert!(core.run.is_none());
+        assert_eq!(snapshot(&core).project, "alpha");
+        assert_eq!(snapshot(&core).phase, Phase::Idle);
+    }
+
+    #[test]
+    fn the_epoch_advances_only_on_start_not_on_every_event() {
+        let mut core = default_core("gc");
+        let first = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: "gc".into(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(first.applied);
+        let epoch_after_start = core.epoch;
+        assert_eq!(epoch_after_start, 1);
+        // Events (and other actions) do not move the epoch.
+        ingest_telemetry(
+            &mut core,
+            ResourceObservation::Unknown {
+                reason: "cgroup unavailable".into(),
+            },
+        );
+        viewer_connected(&mut core);
+        apply(&mut core, SupervisorAction::Pause);
+        assert_eq!(core.epoch, epoch_after_start);
+        // A new run after a stop advances it again.
+        apply(&mut core, SupervisorAction::Stop);
+        let second = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: "gc".into(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(second.applied);
+        assert_eq!(core.epoch, 2);
+    }
+
+    #[test]
+    fn the_snapshot_states_the_grant_scope_instead_of_implying_one() {
+        let mut core = default_core("gc");
+        apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: "gc".into(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        let snap = snapshot(&core);
+        assert_eq!(snap.phase, Phase::Running);
+        // The supervisor run authorizes no effect on its own — and says so.
+        assert!(
+            snap.grant_effects.is_empty(),
+            "the declared scope must match the grant: {:?}",
+            snap.grant_effects
+        );
+    }
+
+    #[test]
+    fn the_event_history_is_bounded_and_the_sequence_keeps_growing() {
+        let mut core = default_core("gc");
+        for index in 0..(MAX_RETAINED_EVENTS + 50) {
+            emit_event(
+                &mut core,
+                "test/event",
+                serde_json::Value::String(format!("event {index}")),
+                Provenance::Human,
+            );
+        }
+        assert_eq!(core.events.len(), MAX_RETAINED_EVENTS);
+        // The oldest events fell off, but the sequence never restarted.
+        assert_eq!(core.events.first().map(|e| e.seq), Some(51));
+        assert_eq!(core.next_seq, MAX_RETAINED_EVENTS as u64 + 51);
+        let (events, next_seq) = events_since(&core, 1);
+        assert_eq!(events.len(), MAX_RETAINED_EVENTS);
+        assert_eq!(next_seq, MAX_RETAINED_EVENTS as u64 + 51);
     }
 
     #[test]

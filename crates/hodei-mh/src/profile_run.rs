@@ -13,6 +13,11 @@ use profiles::credentials::{self, SubscriptionNote};
 use profiles::doctor::{self, DoctorCheck};
 use profiles::gate::{self, GateDecision};
 use profiles::profile::{self, ImagePin, ProfileSpec};
+use release::idle::{IdleGate, ReleaseDecision, release_on_idle};
+use release::reconcile::{
+    CreateOutcome, OWNER_VALUE, OWNERSHIP_KEY, REQUEST_TAG_KEY, ReconcileDecision, RequestTag,
+    TagLookup, reconcile_create,
+};
 use serde_json::{Value, json};
 
 pub const DEFAULT_PROXY_URL: &str = "http://172.17.0.1:8888";
@@ -45,8 +50,12 @@ pub fn spec_for(args: &[String]) -> Result<(ProfileSpec, SubscriptionNote), Stri
     };
     if let Some(user_image) = opt_flag(args, "--image") {
         let name = flag(args, "--profile", "user");
-        let (spec, _note) =
-            profile::user_profile(name, ImagePin::user(user_image), "user-provided");
+        let (spec, note) = profile::user_profile(name, ImagePin::user(user_image), "user-provided");
+        // The honest note about the missing pin travels with the spec.
+        let mut subscription = subscription;
+        if !note.contains("pinned by digest") {
+            subscription.limitation = format!("{}; {note}", subscription.limitation);
+        }
         return Ok((spec, subscription));
     }
     let which = flag(args, "--profile", "rust");
@@ -108,6 +117,13 @@ fn egress_reachable(proxy_url: &str) -> bool {
     matches!(output, Ok(o) if o.status.success())
 }
 
+/// The digest of the image as it is RESOLVED locally: what the daemon
+/// would really run. `None` when the image is not present locally (the
+/// daemon would fetch it, and the resolved digest is then unknown here).
+fn observed_image_digest(uri: &str) -> Option<String> {
+    local_image_digest(uri)
+}
+
 async fn lifecycle_ready(server: &str) -> bool {
     reqwest::Client::new()
         .get(format!("{server}/ready"))
@@ -152,12 +168,14 @@ pub async fn run_doctor_cli(args: &[String]) -> i32 {
     let proxy_url = flag(args, "--proxy-url", DEFAULT_PROXY_URL);
     let (checks, decision) = run_doctor(&spec, &server, &proxy_url, &subscription);
     for check in &checks {
-        println!(
-            "[{}] {}: {}",
-            if check.ok { "ok" } else { "MISS" },
-            check.name,
-            check.detail
-        );
+        let label = if check.ok {
+            "ok"
+        } else if check.blocking {
+            "MISS"
+        } else {
+            "note"
+        };
+        println!("[{label}] {}: {}", check.name, check.detail);
     }
     match decision {
         GateDecision::Proceed => {
@@ -226,7 +244,11 @@ pub async fn run_profile(args: &[String]) -> i32 {
             "image": spec.image.full_reference(),
             "checks": checks,
             "missing": missing,
+            // Derived, not asserted: the build never ran on the host
+            // (there is no host execution path in this code), so the
+            // fallback did not happen.
             "yolo_fallback": false,
+            "build_executed_on_host": false,
             "note": subscription.limitation,
         });
         println!(
@@ -237,27 +259,120 @@ pub async fn run_profile(args: &[String]) -> i32 {
     }
 
     // 2. Sandbox with the PINNED image and REQUESTED limits.
+    //
+    // The create carries a REQUEST TAG: if the response is lost, the
+    // effect is findable and is ADOPTED, never duplicated.
     let client = reqwest::Client::new();
-    let created: Value = match client
+    let request_tag = format!(
+        "profile-run-{}-{}",
+        std::process::id(),
+        started.elapsed().as_nanos()
+    );
+    let metadata = json!({
+        OWNERSHIP_KEY: OWNER_VALUE,
+        REQUEST_TAG_KEY: request_tag.clone(),
+        "purpose": "hodei-profile-run",
+    });
+    let create_response = client
         .post(format!("{server}/v1/sandboxes"))
         .json(&json!({
             "image": {"uri": spec.image.full_reference()},
             "entrypoint": ["sleep", "infinity"],
             "timeout": 1200,
             "resourceLimits": {"cpu": requested_cpu, "memory": requested_memory},
-            "metadata": {"managed-by": "hodei-mh", "purpose": "hodei-profile-run"},
+            "metadata": metadata,
         }))
         .send()
-        .await
-    {
-        Ok(response) => response.json().await.unwrap_or_default(),
-        Err(_) => Value::Null,
+        .await;
+    let create_outcome = match create_response {
+        Ok(response) if response.status().is_success() => {
+            let body: Value = response.json().await.unwrap_or_default();
+            match body["id"].as_str() {
+                Some(id) => CreateOutcome::Confirmed { id: id.to_string() },
+                None => CreateOutcome::Unknown {
+                    tag: RequestTag(request_tag.clone()),
+                },
+            }
+        }
+        // The request may have reached the server: the effect is UNKNOWN.
+        _ => CreateOutcome::Unknown {
+            tag: RequestTag(request_tag.clone()),
+        },
     };
-    let sid = created["id"].as_str().unwrap_or_default().to_string();
-    if sid.is_empty() {
-        eprintln!("sandbox create failed (gate said proceed — infra changed?)");
-        return 1;
-    }
+    // Reconciliation: search by the request tag BEFORE any retry. A failed
+    // search aborts — it never licenses a second sandbox.
+    let listed = match client.get(format!("{server}/v1/sandboxes")).send().await {
+        Ok(response) => response.json::<Value>().await.ok(),
+        Err(_) => None,
+    };
+    let search_failed = listed.is_none();
+    let decision = reconcile_create(create_outcome, |tag| match listed.as_ref() {
+        None => TagLookup::Failed {
+            reason: "the sandbox list could not be read".into(),
+        },
+        Some(value) => {
+            let items = value.get("items").and_then(|i| i.as_array());
+            match items.and_then(|items| {
+                items.iter().find_map(|item| {
+                    let metadata = item.get("metadata")?;
+                    if metadata.get(REQUEST_TAG_KEY)?.as_str()? != tag.0.as_str() {
+                        return None;
+                    }
+                    item.get("id")?.as_str().map(str::to_string)
+                })
+            }) {
+                Some(id) => TagLookup::Found { id },
+                None => TagLookup::NotFound,
+            }
+        }
+    });
+    let sid = match &decision {
+        ReconcileDecision::AdoptExisting { id } => id.clone(),
+        ReconcileDecision::RetrySafe => {
+            // The search worked and found NOTHING: a retry cannot
+            // duplicate the effect. The retry carries the SAME request
+            // tag, so even a lost retry response is reconcilable.
+            eprintln!(
+                "sandbox create failed and no effect is on record (request-tag {request_tag}); retrying is safe"
+            );
+            match client
+                .post(format!("{server}/v1/sandboxes"))
+                .json(&json!({
+                    "image": {"uri": spec.image.full_reference()},
+                    "entrypoint": ["sleep", "infinity"],
+                    "timeout": 1200,
+                    "resourceLimits": {"cpu": requested_cpu, "memory": requested_memory},
+                    "metadata": metadata,
+                }))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    let body: Value = response.json().await.unwrap_or_default();
+                    match body["id"].as_str() {
+                        Some(id) => id.to_string(),
+                        None => {
+                            eprintln!("sandbox create retry returned no id");
+                            return 1;
+                        }
+                    }
+                }
+                Ok(response) => {
+                    eprintln!("sandbox create retry returned {}", response.status());
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("sandbox create retry failed: {e}");
+                    return 1;
+                }
+            }
+        }
+        ReconcileDecision::Abort { reason } => {
+            eprintln!("sandbox create unresolved: {reason} (request-tag {request_tag})");
+            return 1;
+        }
+    };
+    let _ = search_failed;
     let execd: String = match client
         .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
         .send()
@@ -273,19 +388,48 @@ pub async fn run_profile(args: &[String]) -> i32 {
         Err(_) => String::new(),
     };
 
-    // 3. OBSERVED limits from inside the container (cgroups).
+    // 3. OBSERVED limits from inside the container (cgroups) AND the
+    // sandbox's OWN network reachability (measured from inside, not from
+    // the host: a host-side TCP check proves nothing about the sandbox).
     let observed = opensandbox::execd::oneshot::run(
         &execd,
         "echo cpu=$(cat /sys/fs/cgroup/cpu.max) mem=$(cat /sys/fs/cgroup/memory.max)",
         Duration::from_secs(30),
     )
     .await;
+    // bash's /dev/tcp takes HOST and PORT as SEPARATE path segments
+    // (/dev/tcp/host/port), never host:port.
+    let proxy_authority = proxy_url
+        .strip_prefix("http://")
+        .unwrap_or(&proxy_url)
+        .trim_end_matches('/')
+        .to_string();
+    let proxy_target = match proxy_authority.split_once(':') {
+        Some((host, port)) => format!("{host}/{port}"),
+        None => proxy_authority.clone(),
+    };
+    let egress = opensandbox::execd::oneshot::run(
+        &execd,
+        &format!(
+            "if timeout 5 bash -c 'exec 3<>/dev/tcp/{proxy_target}' 2>/dev/null; then echo PROXY_REACHABLE; else echo PROXY_UNREACHABLE; fi; if timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo DIRECT_INTERNET_REACHABLE; else echo DIRECT_INTERNET_BLOCKED; fi",
+            proxy_target = proxy_target
+        ),
+        Duration::from_secs(30),
+    )
+    .await;
+    let proxy_reachable = egress.output.contains("PROXY_REACHABLE");
+    let direct_blocked = egress.output.contains("DIRECT_INTERNET_BLOCKED");
+    let direct_reachable = egress.output.contains("DIRECT_INTERNET_REACHABLE");
 
     // 4. Ship the project (pack host-side, upload, extract — no egress).
-    let project_name = project_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".into());
+    // The directory name is SANITIZED: it is interpolated into a shell
+    // command inside the sandbox.
+    let project_name = build_plan::sanitize_dir_name(
+        &project_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".into()),
+    );
     let sandbox_root = format!("/workspace/{project_name}");
     let tgz_path = std::env::temp_dir().join(format!("hodei-profile-{}.tgz", std::process::id()));
     let packed = tar_project(&project_dir, &tgz_path);
@@ -307,9 +451,12 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
     }
     let staged_ok = if uploaded {
+        // The root is a SANITIZED name, quoted for the shell.
         opensandbox::execd::oneshot::run(
             &execd,
-            &format!("mkdir -p {sandbox_root} && tar xzf /tmp/project.tgz -C {sandbox_root} && rm /tmp/project.tgz"),
+            &format!(
+                "mkdir -p '{sandbox_root}' && tar xzf /tmp/project.tgz -C '{sandbox_root}' && rm /tmp/project.tgz"
+            ),
             Duration::from_secs(60),
         )
         .await
@@ -330,7 +477,15 @@ pub async fn run_profile(args: &[String]) -> i32 {
 
     // 5. Run the build plan. The egress proxy is the ONLY authorized
     // network path; credentials NEVER enter commands (builds need none).
-    let plan: BuildPlan = build_plan::plan(&spec, &project_dir.to_string_lossy(), &sandbox_root);
+    //
+    // The cache token is derived from the CANONICAL absolute path: two
+    // relative paths to the same project must not produce two caches,
+    // and two different projects must never share one.
+    let canonical_project = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone());
+    let plan: BuildPlan =
+        build_plan::plan(&spec, &canonical_project.to_string_lossy(), &sandbox_root);
     let mut command_outputs: Vec<Value> = Vec::new();
     let mut all_ok = observed.succeeded();
     for command in &plan.commands {
@@ -342,7 +497,9 @@ pub async fn run_profile(args: &[String]) -> i32 {
             "command": proxied,
             "exit_code": outcome.exit_code,
             "succeeded": outcome.succeeded(),
-            "output_tail": outcome.output.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>(),
+            // The output is SCRUBBED before it reaches the record: a build
+            // that prints a credential must not persist it.
+            "output_tail": credentials::redact_output(&outcome.output.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()),
         }));
     }
 
@@ -356,21 +513,88 @@ pub async fn run_profile(args: &[String]) -> i32 {
     ];
     let scrubbed =
         credentials::scrub_for_log(env_sample.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    let leaks = credentials::secret_leak_positions(&plan.commands);
-    let _ = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
-        .send()
-        .await;
+    // The leak check runs over the EXACT strings that were executed, not
+    // over the plan's templates.
+    let executed: Vec<String> = command_outputs
+        .iter()
+        .filter_map(|c| c["command"].as_str().map(str::to_string))
+        .collect();
+    let leaks = credentials::secret_leak_positions(&executed);
+
+    // 7. Release the environment through the IDLE GATE. The gate — not
+    //    the caller — decides whether the environment may be released:
+    //    only a CONFIRMED durable export permits it. The candidate is
+    //    written to durable storage and READ BACK; the digest comes from
+    //    the bytes that came back, not from a value in memory.
+    let export_dir = std::env::temp_dir().join(format!("hodei-profile-export-{sid}"));
+    let export_path = export_dir.join("candidate.json");
+    let candidate = json!({
+        "profile": spec.name,
+        "project": canonical_project.to_string_lossy(),
+        "sandbox_id": sid,
+        "commands": command_outputs,
+    });
+    let exported = std::fs::create_dir_all(&export_dir).is_ok()
+        && std::fs::write(&export_path, candidate.to_string()).is_ok();
+    let durable_digest = std::fs::read(&export_path)
+        .ok()
+        .map(|bytes| verify::digest::CandidateDigest::from_bytes(&bytes));
+    let gate = match &durable_digest {
+        Some(digest) => IdleGate::CandidateConfirmed {
+            digest: digest.clone(),
+        },
+        None => IdleGate::WorkPending,
+    };
+    let release = release_on_idle(&gate);
+    // The cleanup result is recorded: a failed DELETE leaves an orphan
+    // the operator must be able to find.
+    let cleanup = match release {
+        ReleaseDecision::Release { durable } => {
+            match client
+                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    format!("released ({durable})")
+                }
+                Ok(response) => format!("release refused: delete returned {}", response.status()),
+                Err(e) => format!("release refused: delete failed: {e}"),
+            }
+        }
+        ReleaseDecision::Keep { reason } => {
+            format!("kept: {reason} (the sandbox id {sid} is in this record)")
+        }
+    };
+    // The digest ACTUALLY observed for the image the sandbox ran. The
+    // requested pin is recorded next to it: the two can differ.
+    let observed_digest = observed_image_digest(&spec.image.uri);
     let record = json!({
         "gate": "PROCEED",
         "profile": spec.name,
-        "image_sha": spec.image.full_reference(),
+        "sandbox_id": sid,
+        "request_tag": request_tag,
+        "image_sha_requested": spec.image.full_reference(),
+        "image_digest_observed": observed_digest,
         "toolchain": spec.toolchain.primary,
         "requested_limits": {"cpu": requested_cpu, "memory": requested_memory},
         "observed_limits": observed.output.trim(),
+        "sandbox_egress": {
+            "measured_from": "inside the sandbox",
+            "proxy_reachable": proxy_reachable,
+            "direct_internet_blocked": direct_blocked,
+            "direct_internet_reachable": direct_reachable,
+            "raw": egress.output.trim(),
+        },
         "cache_dir": plan.cache_dir,
         "commands": command_outputs,
         "all_succeeded": all_ok,
+        "cleanup": cleanup,
+        "durable_export": {
+            "path": export_path.to_string_lossy(),
+            "exported": exported,
+            "digest_confirmed": durable_digest.is_some(),
+        },
         "secret_leak_positions_in_commands": leaks,
         "credential_channel": "process env of the requiring process only",
         "scrub_sample": scrubbed,

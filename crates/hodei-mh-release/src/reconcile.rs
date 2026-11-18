@@ -10,6 +10,21 @@ use serde::{Deserialize, Serialize};
 /// it strictly: untagged foreign environments are NEVER touched.
 pub const OWNERSHIP_TAG: &str = "managed-by=hodei-mh";
 
+/// The metadata KEY whose value names the owner. The value is
+/// [`OWNER_VALUE`]; the pair is what identifies a hodei-mh environment.
+pub const OWNERSHIP_KEY: &str = "managed-by";
+
+/// The owner value written into the metadata of every hodei-mh sandbox.
+pub const OWNER_VALUE: &str = "hodei-mh";
+
+/// The metadata key carrying the per-request tag.
+pub const REQUEST_TAG_KEY: &str = "request-tag";
+
+/// Whether a metadata/labels map belongs to a hodei-mh environment.
+pub fn is_owned_by_us(metadata: &std::collections::BTreeMap<String, String>) -> bool {
+    metadata.get(OWNERSHIP_KEY).map(String::as_str) == Some(OWNER_VALUE)
+}
+
 /// Per-request tag stored in the environment metadata at create time,
 /// making the effect findable after a lost response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +36,19 @@ pub enum CreateOutcome {
     Confirmed { id: String },
     /// The create was sent but the response was lost (timeout/disconnect).
     Unknown { tag: RequestTag },
+}
+
+/// The result of looking the request tag up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagLookup {
+    /// The search worked: this is the sandbox that carries the tag.
+    Found { id: String },
+    /// The search worked and no sandbox carries the tag: the effect
+    /// really did not happen.
+    NotFound,
+    /// The search itself FAILED. "I could not ask" is NOT "it is not
+    /// there": treating it as such licenses a duplicate.
+    Failed { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,15 +63,21 @@ pub enum ReconcileDecision {
 
 /// Reconcile an unknown create outcome: search by the request tag before
 /// any retry (AC-1).
+///
+/// A FAILED search is never a license to retry: the effect may well have
+/// happened, and a retry would duplicate it.
 pub fn reconcile_create(
     outcome: CreateOutcome,
-    find_by_tag: impl Fn(&RequestTag) -> Option<String>,
+    find_by_tag: impl Fn(&RequestTag) -> TagLookup,
 ) -> ReconcileDecision {
     match outcome {
         CreateOutcome::Confirmed { id } => ReconcileDecision::AdoptExisting { id },
         CreateOutcome::Unknown { tag } => match find_by_tag(&tag) {
-            Some(id) => ReconcileDecision::AdoptExisting { id },
-            None => ReconcileDecision::RetrySafe,
+            TagLookup::Found { id } => ReconcileDecision::AdoptExisting { id },
+            TagLookup::NotFound => ReconcileDecision::RetrySafe,
+            TagLookup::Failed { reason } => ReconcileDecision::Abort {
+                reason: format!("could not search for the request tag: {reason}"),
+            },
         },
     }
 }
@@ -56,7 +90,9 @@ pub struct EnvironmentMeta {
     pub owned_by_us: bool,
     /// Whether an active run claims it right now.
     pub claimed: bool,
-    /// Age of the last activity.
+    /// Age of the last activity, derived from the environment's real
+    /// creation time. A caller that cannot compute it does NOT pass 0
+    /// (which would look instantly idle): it uses [`UnknownIdle`].
     pub idle_for_secs: u64,
 }
 
@@ -76,6 +112,7 @@ pub fn orphans_to_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn unknown_create_adopts_existing_effect_by_tag() {
@@ -85,9 +122,11 @@ mod tests {
             },
             |tag| {
                 if tag.0 == "req-7" {
-                    Some("sbx-found".into())
+                    TagLookup::Found {
+                        id: "sbx-found".into(),
+                    }
                 } else {
-                    None
+                    TagLookup::NotFound
                 }
             },
         );
@@ -105,7 +144,7 @@ mod tests {
             CreateOutcome::Unknown {
                 tag: RequestTag("req-8".into()),
             },
-            |_| None,
+            |_| TagLookup::NotFound,
         );
         assert_eq!(retry, ReconcileDecision::RetrySafe);
 
@@ -116,6 +155,41 @@ mod tests {
             confirmed,
             ReconcileDecision::AdoptExisting { id: "sbx-1".into() }
         );
+    }
+
+    #[test]
+    fn a_failed_search_never_licenses_a_duplicate() {
+        let decision = reconcile_create(
+            CreateOutcome::Unknown {
+                tag: RequestTag("req-9".into()),
+            },
+            |_| TagLookup::Failed {
+                reason: "server restarting".into(),
+            },
+        );
+        match decision {
+            ReconcileDecision::Abort { reason } => {
+                assert!(reason.contains("could not search"), "{reason}");
+            }
+            other => panic!("a failed search must abort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ownership_is_read_from_the_metadata_pair() {
+        let mut ours = BTreeMap::new();
+        ours.insert(OWNERSHIP_KEY.to_string(), OWNER_VALUE.to_string());
+        assert!(is_owned_by_us(&ours));
+
+        let mut foreign = BTreeMap::new();
+        foreign.insert(OWNERSHIP_KEY.to_string(), "someone-else".to_string());
+        assert!(!is_owned_by_us(&foreign));
+
+        let mut impostor = BTreeMap::new();
+        impostor.insert("managed-by-hodei-mh".to_string(), String::new());
+        assert!(!is_owned_by_us(&impostor));
+
+        assert!(!is_owned_by_us(&BTreeMap::new()));
     }
 
     #[test]

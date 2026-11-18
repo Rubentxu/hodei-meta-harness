@@ -340,9 +340,9 @@ async fn acp_probe(args: &[String]) -> i32 {
             });
         }
         "claude" => {
-            // The sandbox has no direct internet: install host-side, pack,
-            // upload, extract. The adapter is pure JS (node) so it is
-            // portable; nothing is persisted beyond the sandbox.
+            // Install host-side, pack, upload, extract. The adapter is pure
+            // JS (node) so it is portable; nothing is persisted beyond the
+            // sandbox.
             let install_dir = std::env::temp_dir().join("hodei-ccacp");
             let host_install = Command::new("npm")
                 .args([
@@ -428,8 +428,10 @@ async fn acp_probe(args: &[String]) -> i32 {
             } else {
                 format!("ANTHROPIC_BASE_URL={base} ")
             };
-            // The sandbox has no direct internet: the host bridge proxy
-            // (docker gateway IP) provides the HTTPS egress the agent needs.
+            // The host bridge proxy (docker gateway IP) provides the HTTPS
+            // egress the agent uses. Direct internet is NOT blocked by the
+            // harness: the proxy is the authorized path, not an enforced
+            // boundary (see docs/profiles.md).
             format!(
                 "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY=http://172.17.0.1:8888 {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp"
             )

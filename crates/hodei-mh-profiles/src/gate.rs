@@ -11,11 +11,13 @@ pub struct GateInput {
     /// The pinned image is present locally (or the registry is reachable
     /// and the reference resolves).
     pub image_available: bool,
-    /// The local image content matches the pinned digest (when the profile
-    /// pins one and the image is already local).
+    /// The local image content matches the pinned digest. For an UNPINNED
+    /// user image there is no digest to mismatch: the image is simply
+    /// present (or not).
     pub digest_matches: bool,
     /// The restricted egress path required by the build (proxy for the
-    /// docker backend) is reachable.
+    /// docker backend) is reachable — measured FROM INSIDE a sandbox, not
+    /// from the host.
     pub egress_available: bool,
     /// The OpenSandbox lifecycle API answers.
     pub opensandbox_available: bool,
