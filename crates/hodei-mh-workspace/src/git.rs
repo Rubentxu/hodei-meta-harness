@@ -63,6 +63,64 @@ fn run_mutator(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Re
     run_raw(operation, args, cwd).map(|_| ())
 }
 
+/// Prepare a scratch repository for automation.
+///
+/// The repository is initialised and taken OUT of the host's git
+/// governance: the host may install hooks globally (through the
+/// configuration itself), and those hooks would judge the history of a
+/// fixture that is never pushed and never classified. Automation owns
+/// the history it builds; the user's policy owns the user's
+/// repositories.
+///
+/// The hooks path points at an empty directory inside the repository,
+/// and every hook the host inherits is disabled, by name, in the
+/// repository's OWN configuration: every git invocation in it —
+/// including the product's own promotion — is free of inherited hooks,
+/// and nothing outside the fixture changes.
+pub fn init_fixture_repo(repo: &Path) -> Result<(), GitError> {
+    std::fs::create_dir_all(repo).map_err(GitError::Unavailable)?;
+    run_mutator("init", &["init", "-q", "-b", "main"], Some(repo))?;
+    let hooks = repo.join(".git/hodei-no-hooks");
+    std::fs::create_dir_all(&hooks).map_err(GitError::Unavailable)?;
+    run_mutator(
+        "config hooksPath",
+        &["config", "core.hooksPath", hooks.to_string_lossy().as_ref()],
+        Some(repo),
+    )?;
+    neutralize_inherited_hooks(repo)
+}
+
+/// Disable the hooks the HOST inherits, by name, inside this fixture.
+///
+/// git can install hooks through the configuration itself
+/// (`hook.<name>.command` in the user's global or system config), and
+/// those hooks run wherever they are inherited: they would judge the
+/// commits and the ref updates of a scratch repository that is never
+/// pushed. The fixture turns each inherited hook into a no-op in its
+/// OWN configuration — the hooks of the user's real repositories keep
+/// doing their job.
+fn neutralize_inherited_hooks(repo: &Path) -> Result<(), GitError> {
+    for scope in ["--global", "--system"] {
+        let listing = run_raw(
+            "list inherited hooks",
+            &["config", scope, "--get-regexp", r"^hook\..*\.command$"],
+            None,
+        )
+        .unwrap_or_default();
+        for line in listing.lines() {
+            let Some((key, _command)) = line.split_once(' ') else {
+                continue;
+            };
+            run_mutator(
+                "disable inherited hook",
+                &["config", "--local", key, "true"],
+                Some(repo),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Build a commit from the staged index with git's PLUMBING commands
 /// (`write-tree` + `commit-tree` + `update-ref`) and return its id.
 ///
@@ -211,9 +269,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let repo = tmp.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "probe@hodei"]);
-        git(&repo, &["config", "user.name", "probe"]);
+        init_fixture_repo(&repo).unwrap();
         commit_file(&repo, "README.md", "base\n", "base commit");
         let base = run("rev-parse HEAD", &["rev-parse", "HEAD"], Some(&repo)).unwrap();
         let base = base.trim().to_string();

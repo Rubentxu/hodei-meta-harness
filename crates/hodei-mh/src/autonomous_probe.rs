@@ -71,7 +71,7 @@ fn commit_file(dir: &Path, name: &str, message: &str) -> Option<String> {
 fn make_fixture(base: &Path) -> Option<Fixture> {
     let root = base.join("project");
     std::fs::create_dir_all(&root).ok()?;
-    if !run_cmd(&root, "git", &["init", "-q", "-b", "main"]) {
+    if workspace_git::init_fixture_repo(&root).is_err() {
         return None;
     }
     backlog_cwd(

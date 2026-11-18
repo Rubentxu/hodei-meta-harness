@@ -60,7 +60,7 @@ fn make_example_project(base_dir: &Path) -> Option<ExampleProject> {
     let root = base_dir.join("project");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).ok()?;
-    git_out(&root, &["init", "-q", "-b", "main"])?;
+    workspace_git::init_fixture_repo(&root).ok()?;
 
     let init = Command::new("backlog")
         .arg("init")

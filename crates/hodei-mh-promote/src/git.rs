@@ -226,8 +226,40 @@ mod tests {
         commit
     }
 
+    /// Initialise the fixture repository OUT of the host's git
+    /// governance: the host may install hooks globally (through the
+    /// configuration itself), and those hooks would judge a scratch
+    /// repository that is never pushed. Every inherited hook is
+    /// disabled, by name, in the repository's OWN configuration: the
+    /// promotion under test is free of them and nothing outside the
+    /// fixture changes.
     fn init_repo(repo: &Path) {
         must(repo, "init", &["init", "-q", "-b", "main"]).unwrap();
+        let hooks = repo.join(".git/hodei-no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        must(
+            repo,
+            "config hooksPath",
+            &["config", "core.hooksPath", &hooks.to_string_lossy()],
+        )
+        .unwrap();
+        let inherited = run_git(
+            repo,
+            &["config", "--global", "--get-regexp", r"^hook\..*\.command$"],
+        )
+        .map(|(_, out, _)| out)
+        .unwrap_or_default();
+        for line in inherited.lines() {
+            let Some((key, _command)) = line.split_once(' ') else {
+                continue;
+            };
+            must(
+                repo,
+                "disable inherited hook",
+                &["config", "--local", key, "true"],
+            )
+            .unwrap();
+        }
     }
 
     #[test]

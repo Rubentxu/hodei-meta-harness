@@ -72,7 +72,7 @@ fn git(dir: &Path, args: &[&str]) -> bool {
 fn make_project(base: &Path, name: &str, marker: &str) -> Option<PathBuf> {
     let root = base.join(name);
     std::fs::create_dir_all(root.join("src")).ok()?;
-    if !git(&root, &["init", "-q", "-b", "main"]) {
+    if workspace_git::init_fixture_repo(&root).is_err() {
         return None;
     }
     let init = std::process::Command::new("backlog")

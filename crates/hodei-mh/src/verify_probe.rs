@@ -70,7 +70,7 @@ fn make_example_repo() -> Option<ExampleRepo> {
     if !write_file(&root.join(".gitignore"), "fixture.local\n") {
         return None;
     }
-    if !run_git(&root, &["init", "-q", "-b", "main"]) {
+    if workspace_git::init_fixture_repo(&root).is_err() {
         return None;
     }
     if !run_git(&root, &["add", "-A"]) {
