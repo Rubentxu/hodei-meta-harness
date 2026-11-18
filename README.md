@@ -6,21 +6,111 @@ speak ACP v1, and promote verified Git results back to the host.
 
 ## Install
 
-Grab the release asset and unpack it:
+The v0.1.0 release ships **standalone** binaries and an installable bundle:
+
+| Asset | SHA-256 |
+|---|---|
+| `hodei-mh-v0.1.0-linux-x86_64` | `d1bcfb4e146fe9c1479184b8eda95b6c249bd64a62e499f09d0bfd0de68ca9b4` |
+| `hodei-mh-lifecycle-server-v0.1.0-linux-x86_64` | `9f7f699be012332699c73f8a263ee40693f75dd2a47675ff153b18104bee1a09` |
+| `hodei-mh-v0.1.0-linux-x86_64.tar.gz` | `d9c40b63ad41a5bced18739b4fb2729309a1e669d0f689c9cf38855542561c26` |
+
+Requirements: Docker (the sandbox backend), a host that can pull the pinned images,
+and the restricted-egress proxy for sandboxes (see
+[docs/profiles.md](docs/profiles.md)).
+
+### 1. Download
 
 ```bash
-curl -L -O https://github.com/Rubentxu/hodei-meta-harness/releases/download/v0.1.0/hodei-mh-v0.1.0-linux-x86_64.tar.gz
-tar xzf hodei-mh-v0.1.0-linux-x86_64.tar.gz
-sh install.sh            # binaries into ~/.local/bin
+REPO=Rubentxu/hodei-meta-harness
+TAG=v0.1.0
+BASE=https://github.com/$REPO/releases/download/$TAG
+
+# the installable bundle plus the manifest of digests
+curl -L -O "$BASE/hodei-mh-v0.1.0-linux-x86_64.tar.gz"
+curl -L -O "$BASE/SHA256SUMS"
+
+# or the binaries on their own
+curl -L -O "$BASE/hodei-mh-v0.1.0-linux-x86_64"
+curl -L -O "$BASE/hodei-mh-lifecycle-server-v0.1.0-linux-x86_64"
+chmod +x hodei-mh-v0.1.0-linux-x86_64 hodei-mh-lifecycle-server-v0.1.0-linux-x86_64
 ```
 
-The binaries are **standalone**: statically linked, with no dynamic loader, so they
-need no glibc, no libgcc and no other system library from your distro. They run on
-any Linux x86_64 (kernel 3.2+), whatever glibc it ships.
+`curl` writes what the server sends, and the server sends no executable bit: the
+binaries taken one by one need `chmod +x` before they can run. The bundle needs
+nothing — its binaries already carry the bit, and `install.sh` copies them as they
+are.
 
-Requirements: Docker (the sandbox backend), a host that can pull the pinned
-images, and the restricted-egress proxy for sandboxes (see
-[docs/profiles.md](docs/profiles.md)).
+### 2. Verify the checksums
+
+`SHA256SUMS` carries the digests above. With every published asset in the same
+directory:
+
+```bash
+LC_ALL=C sha256sum -c SHA256SUMS
+```
+
+```
+hodei-mh-v0.1.0-linux-x86_64: OK
+hodei-mh-lifecycle-server-v0.1.0-linux-x86_64: OK
+hodei-mh-v0.1.0-linux-x86_64.tar.gz: OK
+```
+
+If you only took the bundle, check it against the digest published in the release
+notes:
+
+```bash
+echo "d9c40b63ad41a5bced18739b4fb2729309a1e669d0f689c9cf38855542561c26  hodei-mh-v0.1.0-linux-x86_64.tar.gz" | sha256sum -c -
+```
+
+### 3. Install outside the repository
+
+The bundle is self-contained: `bin/`, `docs/profiles.md`, `install.sh` and
+`INSTALL.md`, nothing else. Unpack it anywhere and run the installer with the
+prefix you want — the repository is not needed at runtime:
+
+```bash
+tar xzf hodei-mh-v0.1.0-linux-x86_64.tar.gz
+sh install.sh                      # into ~/.local/bin
+sh install.sh /opt/hodei-mh        # or into any prefix you can write to
+```
+
+```
+installed to /opt/hodei-mh/bin (hodei-mh, hodei-mh-lifecycle-server)
+```
+
+The binaries land in `<prefix>/bin` and the documentation in
+`<prefix>/share/hodei-mh/docs`. Nothing else is required: no runtime, no shared
+library, no plugin.
+
+## Why the binaries need no system libraries
+
+The release binaries are **statically linked**: the kernel loads the image
+directly, with no dynamic loader in between. They carry no `PT_INTERP` segment and
+no `DT_NEEDED` entry, so they need **no glibc, no libgcc and no other system
+library** from your distribution — only the Linux kernel (3.2 or newer). That is
+what makes them usable on a distro whose glibc is *older* than the one they were
+built against, which is the usual way a binary like this stops working.
+
+You can check that claim yourself, on the file you downloaded:
+
+```bash
+file hodei-mh
+# ELF 64-bit LSB pie executable, x86-64, ..., static-pie linked, for GNU/Linux 3.2.0
+
+ldd hodei-mh
+#	statically linked
+
+readelf -l hodei-mh | grep -c INTERP
+# 0        (no dynamic loader)
+
+readelf -d hodei-mh | grep -c NEEDED
+# 0        (no shared library required)
+```
+
+The same binaries were run in an image built `FROM scratch` — no libc, no loader,
+no shell — and answered `hodei-mh 0.1.0`. `hodei-mh package` refuses to build a
+bundle from binaries that need a dynamic loader, and its manifest reports the
+measured fact instead of asserting it.
 
 ## First run
 
