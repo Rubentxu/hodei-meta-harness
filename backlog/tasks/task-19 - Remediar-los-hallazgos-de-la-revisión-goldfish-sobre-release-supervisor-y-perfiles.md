@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@Ruben'
 created_date: '2026-11-18T05:34:00Z'
-updated_date: '2026-11-18T05:57:00Z'
+updated_date: '2026-11-18T07:22:00Z'
 labels: []
 dependencies: []
 ordinal: 19000
@@ -21,10 +21,10 @@ Remediar los hallazgos verificados de la revisión goldfish (2 revisores: codeba
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Ningún hallazgo CRITICAL o HIGH reproducible queda abierto: el split-brain del socket, la reconciliación que confunde 'no existe' con 'no pude preguntar', el create del producto sin request-tag, el rechazo indebido de imágenes de usuario, el egress no medido, el detector de fugas vacío y el literal de YOLO están corregidos y cubiertos por test o por un check de probe.
-- [ ] #2 Cada garantía afirmada en docs/profiles.md corresponde a algo MEDIDO por el producto (digest observado, egress desde dentro del sandbox, no destructividad del doctor, digest releído del almacenamiento durable) o está explícitamente marcada como no garantizada.
-- [ ] #3 Gates en verde: fmt limpio, clippy --workspace --all-targets -D warnings limpio, suite del workspace completa en verde y los cuatro probes re-ejecutados contra la infra viva con todos sus checks en verde.
-- [ ] #4 Los hallazgos que NO se cierran (aislamiento de red del sandbox, reaper del servidor, metadata en labels de docker, paginación de la TUI) quedan registrados con su motivo y su veredicto (FALTA_EVIDENCIA / ACEPTAR_RIESGO), no en silencio.
+- [x] #1 Ningún hallazgo CRITICAL o HIGH reproducible queda abierto: el split-brain del socket, la reconciliación que confunde 'no existe' con 'no pude preguntar', el create del producto sin request-tag, el rechazo indebido de imágenes de usuario, el egress no medido, el detector de fugas vacío y el literal de YOLO están corregidos y cubiertos por test o por un check de probe.
+- [x] #2 Cada garantía afirmada en docs/profiles.md corresponde a algo MEDIDO por el producto (digest observado, egress desde dentro del sandbox, no destructividad del doctor, digest releído del almacenamiento durable) o está explícitamente marcada como no garantizada.
+- [x] #3 Gates en verde: fmt limpio, clippy --workspace --all-targets -D warnings limpio, suite del workspace completa en verde y los cuatro probes re-ejecutados contra la infra viva con todos sus checks en verde.
+- [x] #4 Los hallazgos que NO se cierran (aislamiento de red del sandbox, reaper del servidor, metadata en labels de docker, paginación de la TUI) quedan registrados con su motivo y su veredicto (FALTA_EVIDENCIA / ACEPTAR_RIESGO), no en silencio.
 <!-- AC:END -->
 
 ## Implementation Plan
