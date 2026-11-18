@@ -93,5 +93,26 @@ jobs:
       - name: Docker is available
         run: docker version --format '{{.Server.Version}}'
 
+      - name: Install the official Backlog.md CLI
+        # The probes drive the REAL tracker, so the lane needs the
+        # official CLI. The version is pinned: the probes must not change
+        # behaviour because a floating dependency moved.
+        run: npm install -g backlog.md@1.55.3
+
+      - name: The probe prerequisites are present
+        # The lane states what it needs and refuses to run without it,
+        # with the reason.
+        run: scripts/probes.sh --preflight
+
       - name: Run the probes
         run: scripts/probes.sh --rounds 1
+
+      - name: Publish the probe output
+        # WHY a probe failed lives in these files, not in the job log:
+        # the JSON result and the stderr of every probe.
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-output
+          path: /tmp/hodei-probes
+          if-no-files-found: warn

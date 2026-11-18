@@ -3,9 +3,11 @@ id: TASK-37
 title: >-
   Hacer verde el carril de sondas en CI: prerrequisitos del runner (CLI
   Backlog.md y proxy de egreso restringido)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-11-18T14:07:00Z'
+updated_date: '2026-11-18T15:35:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -40,3 +42,13 @@ REFERENCIAS: .github/workflows/ci.yml (job integration), scripts/probes.sh, crat
 - [ ] #3 El job integration termina en verde en main y, cuando una sonda falla, sus ficheros JSON y stderr se publican como artefacto para poder diagnosticar
 - [ ] #4 Ningun prerrequisito ausente degrada el carril en silencio: el job falla con el motivo
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Versionar el proxy de egreso restringido en scripts/egress-proxy.py: HTTP CONNECT, solo clientes de las subredes Docker, ligado a la direccion del gateway de Docker (no a 0.0.0.0: un runner con IP publica no debe exponer un proxy abierto) y con una linea de 'listo' para que el carril pueda esperar su disponibilidad.
+2. Anadir a scripts/probes.sh un PREFLIGHT que compruebe los prerrequisitos que el carril NO puede aportar y falle con el motivo: el CLI oficial de Backlog.md en el PATH (las sondas usan el tracker real), docker disponible y la direccion del gateway de Docker igual a la que usan las sondas (172.17.0.1). Ningun prerrequisito ausente degrada el carril en silencio.
+3. El carril ARRANCA el proxy versionado cuando no hay ninguno alcanzable, lo para al final, y registra el estado del proxy en el log. Modo --preflight para diagnosticar el runner sin correr sondas.
+4. En .github/workflows/ci.yml: instalar el CLI oficial de Backlog.md (npm, version fijada) antes de las sondas, ejecutar el preflight, y publicar los ficheros de salida de las sondas (JSON y stderr) como artefacto cuando el carril falla.
+5. Verificar: en local, el carril con el CLI ausente DEBE fallar con el motivo y con el proxy versionado arrancado por el propio carril las sondas pasan; en CI, dispatch del job integration sobre la rama en verde antes de fusionar.
+<!-- SECTION:PLAN:END -->

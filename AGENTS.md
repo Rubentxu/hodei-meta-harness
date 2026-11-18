@@ -110,6 +110,13 @@ probes when the change touches the sandbox, the ACP flow or the release.
 The probes are expensive on purpose, and they are kept in their own lane so
 the cheap gate never hides their cost.
 
+The **integration** lane has prerequisites, and it states them instead of
+degrading: the official Backlog.md CLI (the probes drive the real tracker),
+Docker, and a restricted egress proxy (the profiles' gate refuses to build
+without one, and it does not fall back). `scripts/probes.sh --preflight`
+checks them and fails with the reason; the lane starts the versioned proxy
+(`scripts/egress-proxy.py`) when none is running, and stops it at the end.
+
 Two rules about those probes:
 
 - **A probe is only removed when its invariant is asserted in the productive

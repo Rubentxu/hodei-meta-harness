@@ -16,7 +16,9 @@ The v0.1.1 release ships **standalone** binaries and an installable bundle:
 
 Requirements: Docker (the sandbox backend), a host that can pull the pinned images,
 and the restricted-egress proxy for sandboxes (see
-[docs/profiles.md](docs/profiles.md)).
+[docs/profiles.md](docs/profiles.md); the repository ships one at
+`scripts/egress-proxy.py`). The E2E probes that drive the real tracker also
+need the official Backlog.md CLI (`npm install -g backlog.md`).
 
 ### 1. Download
 
