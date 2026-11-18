@@ -16,6 +16,8 @@ use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 mod autonomous_probe;
 mod budget_probe;
 mod custom_goal_probe;
+mod digest;
+mod docs;
 mod elf;
 mod goal_probe;
 mod interact_probe;
@@ -62,9 +64,19 @@ probes (evidence about this host):
 options:
   --version                            print the version and exit
   --help                               print this help and exit
-
-documentation: docs/profiles.md
 ";
+
+/// The help text, with the documentation the consumer REALLY has.
+///
+/// The pointer is resolved at RUN time: a path written in the source
+/// points at a file that only exists in a checkout, and the consumer
+/// of an installation has the documentation next to the binary.
+fn usage() -> String {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    let source = docs::choose(&docs::candidates(exe.as_deref(), cwd.as_deref()));
+    format!("{USAGE}\n{}", docs::pointer_line(source.as_ref()))
+}
 
 #[tokio::main]
 async fn main() {
@@ -205,11 +217,11 @@ async fn main() {
             std::process::exit(0);
         }
         Some("--help") | Some("-h") | Some("help") => {
-            print!("{USAGE}");
+            print!("{}", usage());
             std::process::exit(0);
         }
         _ => {
-            eprint!("{USAGE}");
+            eprint!("{}", usage());
             std::process::exit(2);
         }
     }
