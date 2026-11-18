@@ -34,6 +34,17 @@ const PORT: &str = "44772";
 /// keeps talking is never interrupted.
 const IDLE_DEADLINE: Duration = Duration::from_secs(900);
 
+/// How long a connection may live, however much it talks.
+///
+/// The idle deadline alone does not bound the slots: a local process that
+/// keeps a connection busy would hold it forever and starve the client
+/// that owns the sandbox. This bound is generous enough for a real
+/// workload and short enough that the slots come back.
+const MAX_LIFETIME: Duration = Duration::from_secs(7200);
+
+/// How many connections may be open at the same time.
+const MAX_CONNECTIONS: usize = 32;
+
 /// Owns the listener and all connection tasks. Dropping it cancels them.
 #[must_use]
 pub struct RelayHandle {
@@ -100,26 +111,52 @@ pub async fn start(
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let argv = Arc::new(helper_argv);
-    let slots = Arc::new(tokio::sync::Semaphore::new(32));
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (socket, _) = accepted?;
-                    let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else { continue };
+                    let (socket, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            // The listener cannot continue, but the reason
+                            // is not logged: a daemon answer may carry
+                            // output. The KIND is enough to tell a
+                            // transient refusal from a dead listener.
+                            tracing::warn!(kind = ?error.kind(), "the relay listener failed");
+                            break;
+                        }
+                    };
+                    let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                        // The slots are full: the connection is closed
+                        // instead of waiting, and the refusal is
+                        // visible instead of silent.
+                        tracing::warn!("the relay refused a connection: every slot is taken");
+                        continue;
+                    };
                     let docker = docker.clone();
                     let container = container.clone();
                     let argv = Arc::clone(&argv);
                     connections.spawn(async move {
                         let _permit = permit;
                         // Errors can contain daemon responses or helper output; never log them.
-                        let _ = relay_connection(docker, &container, &argv, socket).await;
+                        if let Err(error) = relay_connection(docker, &container, &argv, socket).await {
+                            tracing::warn!(kind = ?error.kind(), "a relay connection ended with an error");
+                        }
                     });
                 }
-                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!("a relay connection task panicked");
+                        let _ = error;
+                    }
+                }
             }
         }
+        // The listener ended: the relay is dead, and the next
+        // resolution will replace it.
+        Ok(())
     });
     Ok(RelayHandle {
         address,
@@ -173,7 +210,7 @@ where
     O: Stream<Item = Result<LogOutput, E>> + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    forward_with_deadline(socket, input, output, IDLE_DEADLINE).await
+    forward_with_deadline(socket, input, output, IDLE_DEADLINE, MAX_LIFETIME).await
 }
 
 async fn forward_with_deadline<S, W, O, E>(
@@ -181,6 +218,7 @@ async fn forward_with_deadline<S, W, O, E>(
     mut input: W,
     mut output: O,
     idle: Duration,
+    lifetime: Duration,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -188,28 +226,37 @@ where
     O: Stream<Item = Result<LogOutput, E>> + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let (mut reader, mut writer) = tokio::io::split(socket);
-    let upload = async {
-        copy_until_idle(&mut reader, &mut input, idle).await?;
-        input.shutdown().await
-    };
-    let download = async {
-        while let Some(frame) = tokio::time::timeout(idle, output.next())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle relay connection"))?
-        {
-            match frame.map_err(io::Error::other)? {
-                LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    writer.write_all(&message).await?
+    let relayed = async {
+        let (mut reader, mut writer) = tokio::io::split(socket);
+        let upload = async {
+            copy_until_idle(&mut reader, &mut input, idle).await?;
+            input.shutdown().await
+        };
+        let download = async {
+            while let Some(frame) = tokio::time::timeout(idle, output.next())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle relay connection"))?
+            {
+                match frame.map_err(io::Error::other)? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        writer.write_all(&message).await?
+                    }
+                    // stderr is deliberately not attached and must never enter the protocol.
+                    _ => {}
                 }
-                // stderr is deliberately not attached and must never enter the protocol.
-                _ => {}
             }
-        }
-        writer.shutdown().await
+            writer.shutdown().await
+        };
+        tokio::try_join!(upload, download)?;
+        Ok(())
     };
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    match tokio::time::timeout(lifetime, relayed).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the relay connection reached its maximum lifetime",
+        )),
+    }
 }
 
 /// Copy until the source ends or the connection stays silent for too long.
@@ -284,6 +331,7 @@ mod tests {
             input,
             output,
             Duration::from_millis(150),
+            Duration::from_secs(30),
         ));
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -309,6 +357,7 @@ mod tests {
             input,
             output,
             Duration::from_secs(30),
+            Duration::from_secs(60),
         ));
         client.write_all(b"\xffrequest\0").await.unwrap();
         client.shutdown().await.unwrap();
