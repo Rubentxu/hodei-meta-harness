@@ -3,7 +3,7 @@ id: TASK-19
 title: >-
   Remediar los hallazgos de la revisión goldfish sobre release, supervisor y
   perfiles
-status: In Progress
+status: Done
 assignee:
   - '@Ruben'
 created_date: '2026-11-18T05:34:00Z'
@@ -92,3 +92,9 @@ HALLAZGOS QUE NO SE CIERRAN (decisión explícita, con motivo):
 
 VERIFICACIÓN EMPÍRICA (no lectura): 224 tests del workspace verdes (antes 193); fmt limpio; clippy -D warnings limpio; probes re-ejecutados contra la infra viva: supervisor-probe 9/9, profile-probe 10/10, release-probe 7/7, multiproject-probe 12/12. Durante la verificación se discovered y corrigió un bug propio: el probe de egress usaba /dev/tcp/host:port (con dos puntos) en vez de /dev/tcp/host/port, por lo que reportaba el proxy como inalcanzable.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Remediación de los hallazgos de la revisión goldfish (2 revisores) cerrada sobre los hallazgos verificados: split-brain del socket, reconciliación que confundía 'no existe' con 'no pude preguntar', create del producto sin request-tag, rechazo indebido de imágenes de usuario, egress no medido, detector de fugas vacío, literal de YOLO, presupuesto solo en el cliente, y el release sin gate de durabilidad. Cada corrección lleva test o check de probe; los gates (fmt, clippy -D warnings, 224 tests, 4 probes) están en verde. Los hallazgos que no se cierran (aislamiento de red del sandbox, reaper del servidor, metadata en labels de docker, paginación de la TUI) quedan registrados con su veredicto y su motivo.
+<!-- SECTION:FINAL_SUMMARY:END -->
