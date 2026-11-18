@@ -22,8 +22,9 @@ without evidence.
    `$BIN` = `target/x86_64-unknown-linux-gnu/release` (the triple is
    explicit because the static flags must not reach the proc-macros).
 3. Restricted egress proxy for sandboxes (the authorized network path):
-   `python3 /tmp/hodei-connect-proxy.py` — binds `172.17.0.1:8888`, accepts
-   CONNECT only from the docker subnet.
+   `python3 scripts/egress-proxy.py` — binds `172.17.0.1:8888`, accepts
+   CONNECT only from the docker subnet. The probe lane starts it when
+   none is running and stops it at the end.
 
    **Direct internet from a sandbox is NOT blocked by the harness.** The
    lifecycle server runs sandboxes on Docker's default `bridge` network
