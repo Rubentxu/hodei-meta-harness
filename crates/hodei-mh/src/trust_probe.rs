@@ -35,6 +35,22 @@ const EXECD_PORT: u16 = 44772;
 /// A public IPv6 address used to measure whether IPv6 is really gone.
 const PUBLIC_IPV6: &str = "2606:4700:4700::1111";
 
+/// The marker that identifies the environments of this probe run.
+///
+/// Every environment the probe creates carries it in its metadata, so
+/// an environment whose identifier was LOST is still recoverable: the
+/// control plane lists it, and the probe can delete it.
+fn run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
 /// The verdict of one check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Verdict {
@@ -55,6 +71,27 @@ impl Verdict {
         }
     }
 }
+
+/// The properties that are measured FROM INSIDE a sandbox.
+///
+/// When the measurement program does not answer, none of them was
+/// measured, and the report has to say so: a skipped check is not a
+/// passed check, and a reader that only sees the ids would otherwise
+/// take the silence for a verdict.
+const INSIDE_CHECKS: [(&str, &str); 9] = [
+    ("P10", "the sandbox has no default route"),
+    ("P11", "the sandbox has no global IPv6 address"),
+    ("P12", "the sandbox cannot resolve an external name"),
+    ("P13", "the sandbox cannot reach the host"),
+    ("P14", "the sandbox cannot reach the internet directly"),
+    ("P15", "the sandbox cannot reach an IPv6 destination"),
+    ("P16", "the sandbox can reach the authorized proxy"),
+    (
+        "P21",
+        "the execd refuses an unauthenticated request even from inside the sandbox",
+    ),
+    ("P23", "the sandbox cannot reach the internet over UDP"),
+];
 
 /// One measured property of the boundary.
 struct Check {
@@ -95,10 +132,21 @@ impl Report {
         self.record(id, name, Verdict::NotMeasured, detail.into());
     }
 
-    /// The overall verdict: a single failure fails the boundary.
+    /// The overall verdict: a single failure fails the boundary, and a
+    /// check that could not be measured does NOT pass it.
+    ///
+    /// The absence of evidence is not evidence of absence: a boundary
+    /// whose properties were not all measured has not been shown to
+    /// hold, and the probe must not say that it does.
     fn verdict(&self) -> Verdict {
         if self.checks.iter().any(|c| c.verdict == Verdict::Fail) {
             Verdict::Fail
+        } else if self
+            .checks
+            .iter()
+            .any(|c| c.verdict == Verdict::NotMeasured)
+        {
+            Verdict::NotMeasured
         } else {
             Verdict::Pass
         }
@@ -106,12 +154,21 @@ impl Report {
 
     /// The checks that were not measured: they are reported apart, so a
     /// reader never mistakes an absence of evidence for evidence.
+    ///
+    /// A check is measured once per sandbox, so the same id can appear
+    /// twice: the list carries it once.
     fn not_measured_ids(&self) -> Vec<&'static str> {
-        self.checks
+        let mut ids: Vec<&'static str> = Vec::new();
+        for check in self
+            .checks
             .iter()
             .filter(|c| c.verdict == Verdict::NotMeasured)
-            .map(|c| c.id)
-            .collect()
+        {
+            if !ids.contains(&check.id) {
+                ids.push(check.id);
+            }
+        }
+        ids
     }
 
     fn to_json(&self) -> Value {
@@ -246,6 +303,24 @@ def resolvers():
     except OSError:
         return []
 
+def udp_dns(host, port=53, timeout=3):
+    # A query about a name that no resolver knows. An ANSWER, even a
+    # refusal, proves a UDP path out of the sandbox. The absence of an
+    # answer does not prove the packet never left, so the two cases
+    # are reported apart.
+    query = b"\xaa\xbb\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(query, (host, int(port)))
+        s.recvfrom(4096)
+        s.close()
+        return "answered"
+    except socket.timeout:
+        return "no-answer"
+    except OSError:
+        return "blocked"
+
 def own_ip():
     try:
         return socket.gethostbyname(socket.gethostname())
@@ -294,6 +369,7 @@ print(json.dumps({
     "ipv6_addresses": ipv6_addresses(),
     "external_dns": external_dns(),
     "resolvers": resolvers(),
+    "udp_dns": {host: udp_dns(host) for host in ["1.1.1.1", "8.8.8.8"]},
     "execd_without_credential": execd_without_credential(),
     "targets": results,
 }))
@@ -780,6 +856,13 @@ pub async fn run(args: &[String]) -> i32 {
                     "the sandbox can be measured from inside",
                     format!("sandbox {label}: {reason}"),
                 );
+                for (id, name) in INSIDE_CHECKS {
+                    report.not_measured(
+                        id,
+                        name,
+                        format!("sandbox {label}: the measurement program did not answer, so this property was not measured"),
+                    );
+                }
                 continue;
             }
         };
@@ -969,6 +1052,55 @@ pub async fn run(args: &[String]) -> i32 {
                 format!("sandbox {label} did not report the answer of its own execd"),
             ),
         }
+
+        // No UDP path out of the sandbox. A TCP measurement does not
+        // speak about UDP: a sandbox that could send a packet to the
+        // internet could carry data out of it without opening a
+        // connection. An answer, even a refusal, proves the path.
+        let udp = measurement["udp_dns"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut answered = Vec::new();
+        let mut undecided = Vec::new();
+        for (host, verdict) in &udp {
+            match verdict.as_str() {
+                Some("blocked") => {}
+                Some("answered") => answered.push(host.clone()),
+                _ => undecided.push(host.clone()),
+            }
+        }
+        if !answered.is_empty() {
+            report.fail(
+                "P23",
+                "the sandbox cannot reach the internet over UDP",
+                format!(
+                    "sandbox {label} received a UDP answer from {}",
+                    answered.join(", ")
+                ),
+            );
+        } else if !undecided.is_empty() {
+            report.not_measured(
+                "P23",
+                "the sandbox cannot reach the internet over UDP",
+                format!(
+                    "sandbox {label} got no UDP answer from {}: a drop cannot be told from a path that goes nowhere",
+                    undecided.join(", ")
+                ),
+            );
+        } else if udp.is_empty() {
+            report.not_measured(
+                "P23",
+                "the sandbox cannot reach the internet over UDP",
+                format!("sandbox {label} did not report the UDP measurement"),
+            );
+        } else {
+            report.pass(
+                "P23",
+                "the sandbox cannot reach the internet over UDP",
+                format!("sandbox {label} has no UDP path to the internet"),
+            );
+        }
     }
 
     // --- The sandbox cannot reach another sandbox. ------------------
@@ -1052,13 +1184,16 @@ async fn credential_ownership(
     other_token: Option<&str>,
 ) -> (String, Result<String, String>) {
     let chosen = "a-credential-of-the-caller";
+    // The environments of this run BEFORE the request: the ones that
+    // appear afterwards are the ones the request created.
+    let before = run_sandboxes(authorized).await;
     let response = authorized
         .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
             "timeout": 1800,
-            "metadata": {"purpose": "hodei-trust-probe"},
+            "metadata": {"purpose": "hodei-trust-probe", "run": run_id()},
             "env": {
                 "EXECD_ACCESS_TOKEN=x": chosen,
                 "OPENSANDBOX_ID=z": "an-identity-of-the-caller",
@@ -1067,16 +1202,18 @@ async fn credential_ownership(
         .send()
         .await;
     let Ok(response) = response else {
+        let recovered = recover_created(authorized, &before).await;
         return (
-            String::new(),
+            recovered,
             Err("the create request did not reach the control plane".to_string()),
         );
     };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
+        let recovered = recover_created(authorized, &before).await;
         return (
-            String::new(),
+            recovered,
             Err(format!(
                 "the create request answered {status}: {}",
                 error_of(&body)
@@ -1085,8 +1222,11 @@ async fn credential_ownership(
     }
     let body: Value = response.json().await.unwrap_or_default();
     let Some(id) = body["id"].as_str().map(str::to_string) else {
+        // The environment exists even if its identifier did not travel
+        // back: it is recovered by its marker, so it can be deleted.
+        let recovered = recover_created(authorized, &before).await;
         return (
-            String::new(),
+            recovered,
             Err("the create response carried no environment id".to_string()),
         );
     };
@@ -1101,6 +1241,12 @@ async fn credential_ownership(
             Err("the endpoint of the environment carried no credential".to_string()),
         );
     };
+    if token.is_empty() {
+        return (
+            id,
+            Err("the server handed over an empty credential".to_string()),
+        );
+    }
     if token == chosen || token == format!("x={chosen}") {
         return (
             id,
@@ -1113,13 +1259,138 @@ async fn credential_ownership(
             Err("two sandboxes were given the same credential".to_string()),
         );
     }
+    let Some(endpoint) = endpoint else {
+        return (
+            id,
+            Err("the endpoint of the environment could not be resolved".to_string()),
+        );
+    };
+    // The credential the server hands out has to be the one the
+    // EXECUTION PLANE honors, and the credential the caller asked for
+    // has to be refused by it. Without this, the probe would only say
+    // what the server believes about its own container.
+    if !oneshot::wait_until_ready(&endpoint, EXECD_READY_TIMEOUT).await {
+        return (
+            id,
+            Err("the execution plane of the environment never became ready".to_string()),
+        );
+    }
+    match execd_answer_for(&endpoint, chosen).await {
+        Some(401) | Some(403) => {}
+        Some(status) if (200..300).contains(&status) => {
+            return (
+                id,
+                Err("the execution plane accepted the credential the caller asked for".to_string()),
+            );
+        }
+        Some(status) => {
+            return (
+                id,
+                Err(format!(
+                    "the execution plane answered {status} to the credential the caller asked for"
+                )),
+            );
+        }
+        None => {
+            return (
+                id,
+                Err(
+                    "the execution plane did not answer to the credential the caller asked for"
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    match execd_answer_for(&endpoint, &token).await {
+        Some(status) if (200..300).contains(&status) => {}
+        Some(status) => {
+            return (
+                id,
+                Err(format!(
+                    "the execution plane answered {status} to the credential the server handed over"
+                )),
+            );
+        }
+        None => {
+            return (
+                id,
+                Err(
+                    "the execution plane did not answer to the credential the server handed over"
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    // The identity of the environment belongs to the server too: the
+    // caller asked for one, and the environment must carry another.
+    match sandbox_identity(&endpoint).await {
+        Some(identity) if identity == id => {}
+        Some(identity) => {
+            return (
+                id,
+                Err(format!(
+                    "the environment carries the identity {identity:?} instead of its own"
+                )),
+            );
+        }
+        None => {
+            return (
+                id,
+                Err("the identity of the environment could not be read from inside it".to_string()),
+            );
+        }
+    }
     (
         id,
         Ok(format!(
-            "the server kept the credential of the environment ({} characters) and gave this sandbox a different one",
+            "the server kept the credential of the environment ({} characters), the execution plane refused the one the caller asked for and honors this one, and the identity of the environment is its own",
             token.len()
         )),
     )
+}
+
+/// The status the execution plane answers a session request with, when
+/// it is asked with a given credential.
+///
+/// `None` means the execution plane ACCEPTED the credential: the
+/// session was created.
+/// The status the execution plane answers with.
+///
+/// `None` means there was NO answer: the transport failed. `Some(status)`
+/// is the HTTP status, and a 2xx means the credential was ACCEPTED.
+async fn execd_answer_for(endpoint: &ExecdEndpoint, token: &str) -> Option<u16> {
+    let with_token = ExecdEndpoint::with_token(endpoint.base_url(), Some(token.to_string()));
+    let request = CreateSessionRequest {
+        cwd: None,
+        command: Some("true"),
+    };
+    match api::create_session_with_timeout(&with_token, request, Duration::from_secs(20)).await {
+        Ok(_) => Some(200),
+        Err(api::ExecdApiError::Status { status, .. }) => Some(status),
+        Err(_) => None,
+    }
+}
+
+/// The identity the environment carries, read from inside it.
+async fn sandbox_identity(endpoint: &ExecdEndpoint) -> Option<String> {
+    if !oneshot::wait_until_ready(endpoint, EXECD_READY_TIMEOUT).await {
+        return None;
+    }
+    let outcome = oneshot::run(
+        endpoint,
+        "sh -c 'printf %s \"$OPENSANDBOX_ID\"'",
+        SANDBOX_COMMAND_TIMEOUT,
+    )
+    .await;
+    if !outcome.succeeded() {
+        return None;
+    }
+    let identity = outcome.output.trim();
+    if identity.is_empty() {
+        None
+    } else {
+        Some(identity.to_string())
+    }
 }
 
 /// Print the report and clean up. The exit code is 0 when the boundary
@@ -1146,6 +1417,9 @@ async fn finish(authorized: &ControlPlane, created: &[String], mut report: Repor
     }
     let verdict = report.verdict();
     println!("{}", report.to_json());
+    // Only a boundary whose properties were ALL measured passes: a
+    // check that could not be measured leaves the verdict open, and an
+    // open verdict is not a pass.
     if verdict == Verdict::Pass { 0 } else { 1 }
 }
 
@@ -1166,7 +1440,16 @@ struct Cleanup {
 async fn cleanup(authorized: &ControlPlane, created: &[String]) -> Cleanup {
     let mut deleted = 0;
     let mut failures = Vec::new();
-    for id in created {
+    // The environments of this run that the probe could not NAME are
+    // still found by their marker: an environment whose identifier was
+    // lost is deleted too, instead of being left behind.
+    let mut ids: Vec<String> = created.to_vec();
+    for id in run_sandboxes(authorized).await {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    for id in &ids {
         let response = authorized
             .delete(&ControlPlane::sandbox_path(id))
             .send()
@@ -1226,13 +1509,56 @@ async fn sandbox_count(authorized: &ControlPlane) -> Option<usize> {
     )
 }
 
+/// The environments of THIS run the control plane reports.
+///
+/// The marker travels in the metadata of every environment the probe
+/// creates, so the list finds the ones whose identifier the probe
+/// lost.
+async fn run_sandboxes(authorized: &ControlPlane) -> Vec<String> {
+    let Some(response) = authorized
+        .get(ControlPlane::sandboxes_path())
+        .send()
+        .await
+        .ok()
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = response.json::<Value>().await else {
+        return Vec::new();
+    };
+    let Some(items) = body["items"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| item["metadata"]["run"].as_str() == Some(run_id()))
+        .filter_map(|item| item["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The environment that appeared while the request was in flight.
+///
+/// The answer of a create may be lost; the environment still exists.
+/// The list is polled for a short while, because the container is not
+/// visible the very instant it is created.
+async fn recover_created(authorized: &ControlPlane, before: &[String]) -> String {
+    for _ in 0..20 {
+        let after = run_sandboxes(authorized).await;
+        if let Some(id) = after.into_iter().find(|id| !before.contains(id)) {
+            return id;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    String::new()
+}
+
 /// The body of a create request.
 fn create_body(image: &str) -> Value {
     json!({
         "image": {"uri": image},
         "entrypoint": ["sleep", "infinity"],
         "timeout": 1800,
-        "metadata": {"purpose": "hodei-trust-probe"},
+        "metadata": {"purpose": "hodei-trust-probe", "run": run_id()},
     })
 }
 
@@ -1467,8 +1793,10 @@ mod tests {
         let mut report = Report::new();
         report.pass("P01", "one", "fine");
         assert_eq!(report.verdict(), Verdict::Pass);
+        // An unmeasured check is NOT a pass: the aggregate stays
+        // unmeasured until every check has an answer.
         report.not_measured("P02", "two", "unknown");
-        assert_eq!(report.verdict(), Verdict::Pass);
+        assert_eq!(report.verdict(), Verdict::NotMeasured);
         report.fail("P03", "three", "broken");
         assert_eq!(report.verdict(), Verdict::Fail);
         assert_eq!(report.not_measured_ids(), vec!["P02"]);
@@ -1489,5 +1817,18 @@ mod tests {
         assert!(!program.contains("__TARGETS__"));
         assert!(program.contains("default_route"));
         assert!(program.contains("ipv6_addresses"));
+        assert!(program.contains("udp_dns"));
+    }
+
+    #[test]
+    fn every_environment_the_probe_creates_carries_the_run_marker() {
+        // The marker is what makes an environment RECOVERABLE when its
+        // identifier never travels back.
+        let body = create_body("python:3.12-slim");
+        assert_eq!(
+            body["metadata"]["purpose"].as_str(),
+            Some("hodei-trust-probe")
+        );
+        assert_eq!(body["metadata"]["run"].as_str(), Some(run_id()));
     }
 }
