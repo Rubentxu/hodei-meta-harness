@@ -104,7 +104,10 @@ bearer credential over an unprotected network. Sandbox ports are not published:
 a per-sandbox loopback relay carries the traffic to the execd. The relay has
 NO credential of its own — the barrier is the execd's own per-sandbox
 credential, which the control plane hands over in the endpoint contract and
-which the execd demands in the `X-EXECD-ACCESS-TOKEN` header.
+which the execd demands in the `X-EXECD-ACCESS-TOKEN` header. The relay is
+bounded: 32 open connections per sandbox, 900 seconds of silence close a
+connection, and no connection lives longer than 2 hours, so a client that
+keeps a connection busy cannot starve the one that owns the sandbox.
 
 One supervisor per project, enforced by the socket itself: starting a
 second supervisor on a LIVE socket is refused (`a supervisor is already
@@ -134,6 +137,10 @@ verified by the server:
   all (measured from inside: `/proc/net/route` carries no default).
 - The subnet is allocated by Docker from the `172.17.0.0/16`–`172.31.0.0/16`
   pools, so a sandbox never shares a subnet with the host's default bridge.
+  The server reads the allocated subnet back and REFUSES one that falls
+  outside the range the operator declared (`SANDBOX_ADDRESS_POOL`, by default
+  `172.16.0.0/12`, the same range the proxy accepts clients from): an
+  allocation the operator did not ask for is a boundary nobody chose.
 - The container is attached to that network ALONE, and the server reads the
   attachment back: a container attached somewhere else fails the creation.
 - `NET_ADMIN` and `NET_RAW` are dropped, so the sandbox cannot add a route
@@ -164,15 +171,48 @@ is read by the execd, so the server owns it:
 - The operator's variables win over the request's, always.
 - A request may NOT write into the `EXECD_` or `OPENSANDBOX_` namespaces:
   the execd takes its configuration from there.
+- The IMAGE may not write into them either: the daemon merges the
+  environment of the image with the one of the container, so an image that
+  declares `EXECD_*` or `OPENSANDBOX_*` would reach the execution plane by
+  a door the composition does not cover. The server inspects the image and
+  refuses it.
 - The credential and the identity of the sandbox belong to the server. The
   credential is read back from the container by EXACT name, and an
   environment entry that merely starts with the same name is not the
   credential — a request cannot choose the credential the server hands out.
+  The value read back is compared with the one the server minted, and a
+  sandbox whose credential is not that one is refused.
 
 **What the server verifies before answering a create.** The attachment of
 the container to its network, the applied resource limits and the real state
 of the container. A sandbox whose isolation could not be established is a
 failure, not a sandbox that reports itself as running.
+
+**What the server does when a sandbox is released.** The container and its
+bridge go away, and the release is written to the log with what it removed.
+A network whose removal is refused (Docker still holds the proxy's endpoint)
+is retried, and every attempt makes sure the proxy is really detached. A
+bridge that survives anyway is not lost: the sweep removes the networks of
+sandboxes that no longer exist, two minutes after they were created.
+
+**What happens to the bridge of a creation that never finishes.** The bridge
+is created BEFORE the container, so a creation that fails — or that is
+abandoned because its client gave up — would leave a bridge on the host that
+no sandbox owns. The creation holds that bridge until it finishes: whatever
+the reason it did not finish, the bridge goes away with it.
+
+**How the boundary is measured.** `hodei-mh trust-probe` does not assert the
+properties above: it measures them, from the host and from inside a real
+sandbox. The checks that run inside cover the routing table, the IPv6
+addresses, the name resolution, the reachability of the host, of the internet
+(TCP and UDP), of an IPv6 destination and of the authorized proxy, the refusal
+of the execd without its credential, and the ownership of the credential and
+of the identity of the environment. A check that could not be measured is
+reported as `NOT_MEASURED` and the probe FAILS: an absence of evidence is
+never evidence. The report carries no credential, and the environments the
+probe creates are deleted before it finishes — even the one whose identifier
+it never received, which is found again by the marker it left in the
+metadata.
 
 ## Doctor (strictly non-destructive)
 
