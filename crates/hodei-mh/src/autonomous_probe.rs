@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use hodei_mh_workspace::git as workspace_git;
 use opensandbox::acp;
 use opensandbox::execd::frames::ServerEvent;
 use serde_json::{Value, json};
@@ -57,16 +58,13 @@ fn backlog_cwd(dir: &Path, args: &[&str]) -> Option<String> {
 
 fn commit_file(dir: &Path, name: &str, message: &str) -> Option<String> {
     std::fs::write(dir.join(name), format!("{name} content\n")).ok()?;
-    if !run_cmd(dir, "git", &["add", name])
-        || !run_cmd(dir, "git", &["commit", "-q", "-m", message])
-    {
+    if !run_cmd(dir, "git", &["add", name]) {
         return None;
     }
-    Command::new("git")
-        .args(["-C", dir.to_string_lossy().as_ref(), "rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    // The fixture commits with git's PLUMBING: automation must not
+    // depend on the host's `git commit` path, which can be governed by a
+    // policy that refuses repositories it does not classify.
+    workspace_git::commit_index(dir, message).ok()
 }
 
 /// Fixture project: git repo + real backlog + five dependent tasks.

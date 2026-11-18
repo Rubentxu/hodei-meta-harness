@@ -328,10 +328,14 @@ pub fn expired_sandboxes(
 /// The budget is enforced in the CREATE PATH of the server, not in a
 /// client: a client-side ledger only bounds the clients that know
 /// about it. `None` means "no limit configured".
+///
+/// The rule itself (the free slots are `budget - live`) lives in
+/// `hodei-mh-budget`, so the server and the clients that predict its
+/// behaviour cannot drift apart.
 pub fn admit_creation(live_environments: usize, slot_budget: Option<usize>) -> Result<(), String> {
     match slot_budget {
         None => Ok(()),
-        Some(budget) if live_environments < budget => Ok(()),
+        Some(budget) if budget::ledger::admissible_creates(live_environments, budget) > 0 => Ok(()),
         Some(budget) => Err(format!(
             "global environment budget exhausted: {live_environments} of {budget} slots in use; \
              no environment is created and the caller must WAIT (no silent admission)"

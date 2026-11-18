@@ -234,7 +234,7 @@ fn build_base_fixture() -> Result<BaseFixture, String> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("repo")).map_err(|e| e.to_string())?;
     let repo = dir.join("repo");
-    let git = |args: &[&str]| {
+    let run_git = |args: &[&str]| {
         let status = Command::new("git")
             .args(args)
             .current_dir(&repo)
@@ -246,20 +246,13 @@ fn build_base_fixture() -> Result<BaseFixture, String> {
             Err(String::from_utf8_lossy(&status.stderr).to_string())
         }
     };
-    git(&["init", "-q", "-b", "main"])?;
-    git(&["config", "user.email", "probe@hodei"])?;
-    git(&["config", "user.name", "probe"])?;
+    run_git(&["init", "-q", "-b", "main"])?;
     std::fs::write(repo.join("README.md"), "base revision fixture\n").map_err(|e| e.to_string())?;
-    git(&["add", "-A"])?;
-    git(&["commit", "-q", "-m", "base"])?;
-    let base = {
-        let out = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo)
-            .output()
-            .map_err(|e| e.to_string())?;
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
+    run_git(&["add", "-A"])?;
+    // The fixture commits with git's PLUMBING: automation must not
+    // depend on the host's `git commit` path, which can be governed by a
+    // policy that refuses repositories it does not classify.
+    let base = git::commit_index(&repo, "base").map_err(|e| e.to_string())?;
     let bundle = dir.join("base.bundle");
     git::create_bundle(&repo, &bundle, "--all").map_err(|e| e.to_string())?;
     Ok(BaseFixture {
