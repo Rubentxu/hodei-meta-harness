@@ -182,6 +182,9 @@ impl CleanRunner {
                 "image": {"uri": self.image},
                 "entrypoint": ["sleep", "infinity"],
                 "timeout": 1800,
+                // The marker is also the creation key: a repeated request is
+                // answered with the same sandbox, never with a second one.
+                "creationKey": marker,
                 "metadata": {
                     "purpose": "hodei-mh-clean-verify",
                     RUNNER_MARKER_KEY: marker,

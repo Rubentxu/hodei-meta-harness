@@ -157,7 +157,10 @@ compiled for, and **refuses** to package binaries that carry a dynamic loader.
   on disk, in the repo, in logs or in records.
 - The lifecycle server enforces a global budget of concurrent environments
   (`MAX_CONCURRENT_ENVIRONMENTS`), refusing over-budget creates with
-  `429 SANDBOX::BUDGET_EXHAUSTED`.
+  `429 SANDBOX::BUDGET_EXHAUSTED`. The budget is reserved atomically before any
+  effect, so simultaneous creates cannot overshoot it, and a create carrying a
+  `creationKey` never produces two sandboxes (`docs/profiles.md`, "Global
+  environment budget").
 - The coordinator of a project keeps its claims and its effect intents in a SQLite
   state file under the user's state directory (`$XDG_STATE_HOME/hodei-mh/<project>/`,
   or `~/.local/state/hodei-mh/<project>/`), never inside the workspace. A claim is

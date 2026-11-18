@@ -306,3 +306,40 @@ When the budget is exhausted the create is REFUSED with
 `429 SANDBOX::BUDGET_EXHAUSTED` and NO environment is created — the caller
 must wait. The limit lives in the server's create path, so it bounds every
 client, not only the ones that keep a local ledger.
+
+**One authority, reserved before any effect.** Admission is decided in ONE
+place: the lifecycle server counts the environments that already exist plus
+the reservations of the creations still in flight, each with its effective
+CPU, memory and slot. The reservation is taken BEFORE the first effect (the
+network, the container), so two simultaneous creates against a budget of one
+admit exactly one and refuse the other with `429`. A reservation is released
+when its creation fails or is abandoned, and a restarted server rebuilds its
+count from the environments it finds, never from what it remembers. The
+reconciliation never deletes an environment created after the instant it
+looked.
+
+**Creation keys.** A create may carry `creationKey`. The server hashes the
+intent (image, entrypoint, limits, timeout, metadata and so on, never the
+image credentials) and stores the key and the hash as labels of the
+environment, so they survive a restart:
+
+- the same key with the same body answers with the SAME sandbox, whether the
+  first creation is finished or still in flight (the second caller waits for
+  it); it never creates a second one;
+- the same key with a different body is refused with
+  `409 SANDBOX::CREATION_CONFLICT`;
+- a key whose creation failed or was abandoned is free again.
+
+`hodei-mh profile-run` and the clean verification runner send their own
+unique marker as the key.
+
+**Honest release.** A sandbox is reported as released only when the daemon
+confirmed the delete. A failed `DELETE` keeps the reservation, is retried a
+bounded number of times and is then reported as a failure; the server only
+deletes environments that carry its own identity label, so an environment it
+did not create is never touched.
+
+**Invalid limits are refused, not clamped.** A memory or CPU limit that is
+`NaN`, infinite, zero or that overflows the representation is rejected with a
+`400` before any reservation is taken, and so is a timeout that is not
+positive.
