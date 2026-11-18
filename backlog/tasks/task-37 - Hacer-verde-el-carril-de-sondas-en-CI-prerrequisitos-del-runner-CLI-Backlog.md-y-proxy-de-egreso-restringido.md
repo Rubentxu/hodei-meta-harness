@@ -3,11 +3,11 @@ id: TASK-37
 title: >-
   Hacer verde el carril de sondas en CI: prerrequisitos del runner (CLI
   Backlog.md y proxy de egreso restringido)
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-18T14:07:00Z'
-updated_date: '2026-11-18T15:52:00Z'
+updated_date: '2026-11-18T16:01:00Z'
 labels: []
 dependencies: []
 priority: high
@@ -37,10 +37,10 @@ REFERENCIAS: .github/workflows/ci.yml (job integration), scripts/probes.sh, crat
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 El runner tiene el CLI oficial de Backlog.md instalado y el carril COMPRUEBA su presencia antes de las sondas, fallando con el motivo si falta
-- [ ] #2 El proxy de egreso restringido esta versionado en el repo, arranca en el runner antes de las sondas y el doctor lo ve alcanzable
-- [ ] #3 El job integration termina en verde en main y, cuando una sonda falla, sus ficheros JSON y stderr se publican como artefacto para poder diagnosticar
-- [ ] #4 Ningun prerrequisito ausente degrada el carril en silencio: el job falla con el motivo
+- [x] #1 El runner tiene el CLI oficial de Backlog.md instalado y el carril COMPRUEBA su presencia antes de las sondas, fallando con el motivo si falta
+- [x] #2 El proxy de egreso restringido esta versionado en el repo, arranca en el runner antes de las sondas y el doctor lo ve alcanzable
+- [x] #3 El job integration termina en verde en main y, cuando una sonda falla, sus ficheros JSON y stderr se publican como artefacto para poder diagnosticar
+- [x] #4 Ningun prerrequisito ausente degrada el carril en silencio: el job falla con el motivo
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -91,3 +91,9 @@ LIMITES
 - El carril reutiliza un proxy que ya este escuchando en esa direccion (el del host de desarrollo) en vez de pelearse con el: solo arranca el suyo cuando no hay ninguno.
 - El carril descarga las imagenes de los perfiles si no estan en el daemon. Es una mutacion del host, y la hace ANTES de cualquier sonda y a la vista (dice cual descarga); la alternativa (que el `doctor` descargara) romperia su contrato de solo lectura.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+El carril de integracion de CI queda VERDE en main por primera vez. Los tres prerrequisitos que el runner no tenia estan resueltos, y el carril los DECLARA en vez de degradarse en silencio: (1) el CLI oficial de Backlog.md instalado en el runner (npm, version fijada 1.55.3) y comprobado por el preflight, que falla con el motivo si falta; (2) el proxy de egreso restringido VERSIONADO en el repo (scripts/egress-proxy.py: CONNECT, solo clientes de las subredes Docker, ligado al gateway del bridge y nunca a todas las interfaces), que el carril arranca cuando no hay ninguno y detiene al terminar; (3) las imagenes de los perfiles en el daemon local, que el carril descarga antes de las sondas porque el doctor es de solo lectura y rechaza una imagen ausente. Ademas, el job publica como artefacto el JSON y el stderr de cada sonda cuando el carril falla: el diagnostico ya no se pierde en un path de /tmp, y ese artefacto fue justamente lo que revelo el tercer prerrequisito, que el log del job habia perdido. VERIFICACION (medida): el preflight local falla con el motivo tanto sin el CLI en el PATH como con un gateway de bridge distinto del que usan las sondas; el carril local da 5/5 sondas PASS y 0 residuos con el proxy arrancado por el propio carril; el job integration sobre la rama queda VERDE (workspace gate y 5/5 sondas PASS con 0 residuos, run 44339307422); los artefactos se publicaron y se descargaron en un fallo real (run 44337960980); el job integration de main (run 44341079234, sha 558ff079) queda VERDE: workspace gate y probe lane en success. La documentacion se actualizo en el mismo cambio (AGENTS.md, README.md, docs/profiles.md).
+<!-- SECTION:FINAL_SUMMARY:END -->
