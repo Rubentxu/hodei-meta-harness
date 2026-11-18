@@ -4,11 +4,15 @@
 //! evidence, checks are satisfied individually, and neither NOT_RUN nor an
 //! empty commit can vouch progress.
 //!
-//! Evidence is minted from measurements only: the constructor is private to
-//! the crate, so the only producer of evidence is the runner that observed
-//! the checks. What the evidence is bound to travels with it: the revision,
-//! the content and transport digests, the required checks with their
-//! authorized commands, and the image the checks actually ran in.
+//! What the evidence is bound to travels with it: the revision, the content
+//! and transport digests, the required checks with their authorized
+//! commands, and the environment the checks actually ran in.
+//!
+//! The constructor is private to the crate, so the RUNNER that observed the
+//! checks is the only code that mints evidence. A document that arrives from
+//! a store is deserialized, and its authenticity is the store's
+//! responsibility: the promotion gate checks that the document speaks for
+//! the candidate, not who wrote it.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +41,10 @@ pub struct EvidenceBinding {
     pub required_checks: Vec<CheckBinding>,
     /// The image the checks ran in, as the runtime resolved it.
     pub image_id: String,
+    /// The fingerprint of the run that produced the evidence: the image
+    /// and the sandbox. Every result of the set must come from THIS
+    /// environment.
+    pub environment: String,
 }
 
 impl EvidenceBinding {
@@ -63,6 +71,10 @@ pub struct BoundResult {
     pub tree: GitTree,
     /// The bytes that carried the candidate into the sandbox.
     pub transport_digest: TransportDigest,
+    /// The command this result answers, as the policy authorized it. The
+    /// record below carries the line that really ran, which wraps it to
+    /// run inside the checkout.
+    pub command: String,
     pub record: ExecutionRecord,
 }
 
@@ -173,12 +185,15 @@ fn cause_for(entry: &EvidenceEntry, binding: &EvidenceBinding) -> Option<String>
             "the check {} is no longer required",
             entry.result.check_id
         )),
-        Some(command) if command != entry.result.record.command => Some(format!(
+        Some(command) if command != entry.result.command => Some(format!(
             "the authorized command of {} changed",
             entry.result.check_id
         )),
         Some(_) if binding.image_id != entry.result.image_id => {
             Some("the image the checks ran in changed".to_string())
+        }
+        Some(_) if binding.environment != entry.result.environment => {
+            Some("the environment the checks ran in changed".to_string())
         }
         Some(_) => None,
     }
@@ -257,6 +272,7 @@ mod tests {
                 command: command.into(),
             }],
             image_id: image_id.into(),
+            environment: format!("{image_id}::sandbox-1"),
         }
     }
 
@@ -267,6 +283,7 @@ mod tests {
             image_id: image.into(),
             tree: content.clone(),
             transport_digest: TransportDigest::of(b"bundle"),
+            command: command.into(),
             record: ExecutionRecord::terminal(command, 0, "ok"),
         }
     }
@@ -278,6 +295,7 @@ mod tests {
             image_id: "img".into(),
             tree: content.clone(),
             transport_digest: TransportDigest::of(b"bundle"),
+            command: "make check".into(),
             record: ExecutionRecord::terminal("make check", 1, "assertion failed"),
         }
     }
@@ -306,6 +324,7 @@ mod tests {
             image_id: "img".into(),
             tree: content.clone(),
             transport_digest: TransportDigest::of(b"bundle"),
+            command: "make check".into(),
             record: ExecutionRecord::absent("make check", "timeout"),
         };
         let set = EvidenceSet::bind("TASK-9", bound.clone(), vec![absent]);
@@ -463,6 +482,23 @@ mod tests {
 
         let mut other = bound;
         other.transport_digest = TransportDigest::of(b"another bundle");
+        assert_eq!(set.binding_changed(&other), 1);
+        assert!(!set.check_satisfied("AC-1"));
+    }
+
+    #[test]
+    fn a_changed_environment_invalidates_the_evidence() {
+        let content = tree("3d5f1b7c9e1b3d51f0c3a5b7d9e246183a5c7e9b");
+        let bound = binding("img", "make check");
+        let mut set = EvidenceSet::bind(
+            "TASK-9",
+            bound.clone(),
+            vec![passing("AC-1", &content, "make check", "img")],
+        );
+        assert!(set.check_satisfied("AC-1"));
+
+        let mut other = bound;
+        other.environment = "img::other-sandbox".into();
         assert_eq!(set.binding_changed(&other), 1);
         assert!(!set.check_satisfied("AC-1"));
     }

@@ -117,10 +117,11 @@ impl LifecycleService {
                 password: Some(a.password.clone()),
                 ..Default::default()
             });
-        // The id the runtime resolved for the image is reported back: the
-        // environment a check ran in is identified by the id, not the tag.
-        let image_id = self
-            .adapter
+        // The image must be present before the container is created. Its
+        // id is NOT resolved from the tag: a tag is a name, and an image
+        // pinned by digest has none. The id comes from the container
+        // itself, below.
+        self.adapter
             .ensure_image_available(&image.uri, credentials, docker_platform.as_deref())
             .await?;
 
@@ -147,6 +148,17 @@ impl LifecycleService {
                 &host,
             )
             .await?;
+
+        // The id of the image the container RUNS is what identifies the
+        // environment: it is read from the container, never guessed from
+        // the tag that was requested.
+        let image_id = match self.adapter.container_image_id(&container_id).await {
+            Ok(image_id) => image_id,
+            Err(e) => {
+                let _ = self.adapter.remove_container(&container_id).await;
+                return Err(e.into());
+            }
+        };
 
         let prepared = self
             .inject_execd_runtime(&container_id, docker_platform.as_deref())

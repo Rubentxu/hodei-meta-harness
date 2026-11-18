@@ -202,7 +202,7 @@ pub async fn run() -> i32 {
     let _ = std::fs::write(&ledger_path, ledger.to_json().unwrap_or_default());
 
     // CAS promotion against the verified base.
-    let promoted = git::promote_ff_only(
+    let promoted = git::promote_ff_only_unchecked(
         &project.root,
         "hodei-mh/main",
         &bundle,
@@ -343,7 +343,7 @@ pub async fn run() -> i32 {
         None
     };
     git_out(&project.root, &["checkout", "-q", "main"]);
-    let moved = git::promote_ff_only(
+    let moved = git::promote_ff_only_unchecked(
         &project.root,
         "hodei-mh/main",
         &bundle,

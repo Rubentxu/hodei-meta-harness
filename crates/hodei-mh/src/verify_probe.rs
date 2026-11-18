@@ -297,6 +297,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             });
             let _ = std::fs::remove_dir_all(&repo.root);
             let _ = std::fs::remove_file(&repo.bundle);
+            let _ = std::fs::remove_file(&repo.base_bundle);
             return finish(&checks, started.elapsed());
         }
     };
@@ -307,6 +308,36 @@ pub async fn run(server: &str, image: &str) -> i32 {
             "verified revision {}.. tree {}..",
             &repo.revision.as_str()[..12],
             &repo.tree.as_str()[..12]
+        ),
+    });
+
+    // The clean verifier really RAN the command and saw it FAIL: the
+    // dev environment passed the same command only because of the
+    // residue it accumulated.
+    let clean_verdict = set.effective_verdict("clean-check");
+    checks.push(ProbeCheck {
+        name: "clean-verifier-fails-uncontaminated",
+        passed: clean_verdict == verify::result::Verdict::Fail,
+        detail: format!("clean-check verdict={clean_verdict:?} (dev passed the same command)"),
+    });
+
+    // AC-1: a timeout produced an ABSENT record — never a PASS.
+    let timeout_entry = set
+        .entries
+        .iter()
+        .find(|e| e.result.check_id == "timeout-check");
+    let absent_ok = timeout_entry
+        .map(|e| {
+            e.result.record.exit_code.is_none()
+                && set.effective_verdict("timeout-check") == verify::result::Verdict::NotRun
+        })
+        .unwrap_or(false);
+    checks.push(ProbeCheck {
+        name: "absent-result-never-pass",
+        passed: absent_ok,
+        detail: format!(
+            "timeout-check exit={:?}",
+            timeout_entry.and_then(|e| e.result.record.exit_code)
         ),
     });
 
@@ -524,10 +555,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
         ),
     });
 
-    // Cleanup.
-    let cleaned = std::fs::remove_dir_all(&repo.root).is_ok()
-        && std::fs::remove_file(&repo.bundle).is_ok()
-        && std::fs::remove_file(&repo.base_bundle).is_ok();
+    // Cleanup: every artifact is removed, even if one of them resists.
+    let mut cleaned = true;
+    for removed in [
+        std::fs::remove_dir_all(&repo.root).is_ok(),
+        std::fs::remove_file(&repo.bundle).is_ok(),
+        std::fs::remove_file(&repo.base_bundle).is_ok(),
+    ] {
+        cleaned &= removed;
+    }
     checks.push(ProbeCheck {
         name: "cleanup",
         passed: cleaned,

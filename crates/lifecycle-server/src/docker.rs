@@ -71,17 +71,31 @@ impl DockerAdapter {
         }
     }
 
-    /// Make sure the image is available and report the id the runtime
-    /// resolved for it: the id, not the tag, is what identifies the
-    /// environment a check actually ran in.
+    /// Make sure the image is available locally: present, or pulled.
+    ///
+    /// The id of the image is NOT resolved here. A tag is a name, and an
+    /// image pinned by digest has no tag to match; the id that identifies
+    /// the environment is the one the container actually runs, and it is
+    /// read from the container (`container_image_id`).
     pub async fn ensure_image_available(
         &self,
         image: &str,
         credentials: Option<DockerCredentials>,
         platform: Option<&str>,
-    ) -> Result<String, DockerError> {
-        if let Some(id) = self.find_image_id(image).await? {
-            return Ok(id);
+    ) -> Result<(), DockerError> {
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("reference".to_string(), vec![image.to_string()])]);
+        let options = ListImagesOptionsBuilder::new().filters(&filters).build();
+        let existing = self
+            .docker
+            .list_images(Some(options))
+            .await
+            .map_err(DockerError::op("list images"))?;
+        let present = existing
+            .iter()
+            .any(|summary| summary.repo_tags.iter().any(|tag| tag == image));
+        if present {
+            return Ok(());
         }
         let create = CreateImageOptionsBuilder::new()
             .from_image(image)
@@ -94,28 +108,22 @@ impl DockerAdapter {
                 source: e,
             })?;
         }
-        self.find_image_id(image)
-            .await?
-            .ok_or_else(|| DockerError::Contract {
-                code: error_codes::INVALID_PARAMETER,
-                message: format!("the image {image} is not available after pulling it"),
-            })
+        Ok(())
     }
 
-    /// The id of the image as the runtime resolved it, if it is present.
-    async fn find_image_id(&self, image: &str) -> Result<Option<String>, DockerError> {
-        let filters: HashMap<String, Vec<String>> =
-            HashMap::from([("reference".to_string(), vec![image.to_string()])]);
-        let options = ListImagesOptionsBuilder::new().filters(&filters).build();
-        let existing = self
-            .docker
-            .list_images(Some(options))
-            .await
-            .map_err(DockerError::op("list images"))?;
-        Ok(existing
-            .iter()
-            .find(|summary| summary.repo_tags.iter().any(|tag| tag == image))
-            .map(|summary| summary.id.clone()))
+    /// The id of the image the container runs: the environment a check ran
+    /// in is identified by that id, not by the tag it was requested with.
+    /// It is read from the container, so it holds for an image pinned by
+    /// digest and for an untagged image alike.
+    pub async fn container_image_id(&self, container: &str) -> Result<String, DockerError> {
+        let inspected = self.inspect(container).await?;
+        inspected
+            .image
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| DockerError::Contract {
+                code: error_codes::INTERNAL,
+                message: format!("the container {container} does not report the image it runs"),
+            })
     }
 
     /// Extract execd + bootstrap.sh archives from the execd image, caching per

@@ -3,7 +3,9 @@
 //! A candidate moves into the managed branch only with the evidence that
 //! speaks for it: the same work, the same commit and the very bundle that
 //! was verified. Evidence that is absent, stale or foreign stops the
-//! promotion — a candidate that was never verified never moves.
+//! promotion — a candidate that was never verified never moves. Evidence
+//! that demands nothing is refused too: an empty policy is a hole, not a
+//! proof.
 
 use verify::evidence::{EvidenceSet, EvidenceStatus};
 use verify::git::GitRevision;
@@ -38,6 +40,8 @@ pub enum EvidenceError {
     Stale { cause: String },
     #[error("the evidence does not satisfy the check {check_id}")]
     Unsatisfied { check_id: String },
+    #[error("the evidence requires no check at all: it demands nothing")]
+    EmptyPolicy,
     #[error("the evidence is not coherent with its own binding: {detail}")]
     Inconsistent { detail: String },
 }
@@ -64,6 +68,11 @@ pub fn require_evidence(
     if evidence.binding.transport_digest != candidate.transport_digest {
         return Err(EvidenceError::UnverifiedBundle);
     }
+    // Evidence that requires nothing vouches for nothing: a policy with
+    // no checks is a hole, not a proof.
+    if evidence.binding.required_checks.is_empty() {
+        return Err(EvidenceError::EmptyPolicy);
+    }
     for entry in &evidence.entries {
         if let EvidenceStatus::Invalidated { cause } = &entry.status {
             return Err(EvidenceError::Stale {
@@ -72,7 +81,8 @@ pub fn require_evidence(
         }
     }
     // The document must speak with one voice: every result answers the
-    // content, the transport and the image its own binding declares.
+    // content, the transport, the image, the environment and the command
+    // its own binding declares.
     for entry in &evidence.entries {
         let check_id = entry.result.check_id.as_str();
         if entry.result.tree != evidence.binding.tree {
@@ -89,6 +99,26 @@ pub fn require_evidence(
             return Err(EvidenceError::Inconsistent {
                 detail: format!("the result of {check_id} ran in another image"),
             });
+        }
+        if entry.result.environment != evidence.binding.environment {
+            return Err(EvidenceError::Inconsistent {
+                detail: format!("the result of {check_id} ran in another environment"),
+            });
+        }
+        match evidence.binding.command_of(check_id) {
+            None => {
+                return Err(EvidenceError::Inconsistent {
+                    detail: format!(
+                        "the result of {check_id} answers a check that is not required"
+                    ),
+                });
+            }
+            Some(command) if command != entry.result.command => {
+                return Err(EvidenceError::Inconsistent {
+                    detail: format!("the result of {check_id} ran another command"),
+                });
+            }
+            Some(_) => {}
         }
     }
     for check in &evidence.binding.required_checks {
@@ -126,7 +156,8 @@ mod tests {
                 "tree": TREE,
                 "transport_digest": TransportDigest::of(transport.as_bytes()).as_str(),
                 "required_checks": [{"id": "AC-1", "command": "make check"}],
-                "image_id": "sha256:image"
+                "image_id": "sha256:image",
+                "environment": "sha256:image::sandbox-1"
             },
             "entries": [{
                 "result": {
@@ -135,6 +166,7 @@ mod tests {
                     "image_id": "sha256:image",
                     "tree": TREE,
                     "transport_digest": TransportDigest::of(transport.as_bytes()).as_str(),
+                    "command": "make check",
                     "record": {
                         "command": "make check",
                         "exit_code": 0,
@@ -236,6 +268,45 @@ mod tests {
         let mut document = evidence_document("TASK-9", REVISION, "the bundle", json!("Valid"));
         document["entries"][0]["result"]["transport_digest"] =
             json!(TransportDigest::of(b"another transport").as_str());
+        let evidence: EvidenceSet =
+            serde_json::from_value(document).expect("the evidence document is well formed");
+        assert!(matches!(
+            require_evidence(&evidence, &candidate),
+            Err(EvidenceError::Inconsistent { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_that_requires_nothing_is_refused() {
+        let candidate = candidate("TASK-9", REVISION, "the bundle");
+        let mut document = evidence_document("TASK-9", REVISION, "the bundle", json!("Valid"));
+        document["binding"]["required_checks"] = json!([]);
+        let evidence: EvidenceSet =
+            serde_json::from_value(document).expect("the evidence document is well formed");
+        assert!(matches!(
+            require_evidence(&evidence, &candidate),
+            Err(EvidenceError::EmptyPolicy)
+        ));
+    }
+
+    #[test]
+    fn evidence_of_another_environment_is_refused() {
+        let candidate = candidate("TASK-9", REVISION, "the bundle");
+        let mut document = evidence_document("TASK-9", REVISION, "the bundle", json!("Valid"));
+        document["entries"][0]["result"]["environment"] = json!("sha256:image::other-sandbox");
+        let evidence: EvidenceSet =
+            serde_json::from_value(document).expect("the evidence document is well formed");
+        assert!(matches!(
+            require_evidence(&evidence, &candidate),
+            Err(EvidenceError::Inconsistent { .. })
+        ));
+    }
+
+    #[test]
+    fn evidence_that_ran_another_command_is_refused() {
+        let candidate = candidate("TASK-9", REVISION, "the bundle");
+        let mut document = evidence_document("TASK-9", REVISION, "the bundle", json!("Valid"));
+        document["entries"][0]["result"]["command"] = json!("make another-check");
         let evidence: EvidenceSet =
             serde_json::from_value(document).expect("the evidence document is well formed");
         assert!(matches!(

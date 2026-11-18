@@ -106,7 +106,12 @@ pub fn candidate_head(bundle: &Path, candidate_branch: &str) -> Result<String, P
 
 /// Promote the candidate into the managed branch as a fast-forward, guarded
 /// by a native CAS on the verified base. Returns the candidate head commit.
-pub fn promote_ff_only(
+///
+/// UNCHECKED: this function knows nothing about evidence. It moves a
+/// candidate that was never verified, and it is named after that fact so
+/// the call site cannot hide it. The product path is `promote_verified`,
+/// which demands the evidence of the candidate before calling this.
+pub fn promote_ff_only_unchecked(
     repo: &Path,
     managed_branch: &str,
     bundle: &Path,
@@ -193,7 +198,7 @@ pub fn promote_verified(
             detail: error.to_string(),
         }
     })?;
-    promote_ff_only(
+    promote_ff_only_unchecked(
         repo,
         managed_branch,
         bundle,
@@ -338,7 +343,7 @@ mod tests {
         must(&repo, "branch", &["branch", "-q", "hodei-mh/main", &base]).unwrap();
 
         let promoted =
-            promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap();
+            promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap();
         assert_eq!(promoted, head);
         assert_eq!(
             current_ref(&repo, "hodei-mh/main").unwrap().as_deref(),
@@ -375,7 +380,8 @@ mod tests {
         let human = commit_file(&repo, "c.txt", "human change on managed");
         must(&repo, "checkout", &["checkout", "-q", "main"]).unwrap();
 
-        let err = promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap_err();
+        let err = promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base)
+            .unwrap_err();
         match err {
             PromoteError::BaseMoved { current, .. } => assert_eq!(current, human),
             other => panic!("expected BaseMoved, got {other:?}"),
@@ -415,7 +421,8 @@ mod tests {
             .trim()
             .to_string();
 
-        let err = promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap_err();
+        let err = promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base)
+            .unwrap_err();
         assert_eq!(err, PromoteError::NotFastForward);
         let _ = std::fs::remove_dir_all(&repo);
     }

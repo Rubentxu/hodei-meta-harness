@@ -1,7 +1,8 @@
 //! Clean-environment runner (AC-4, effects adapter): materializes the
 //! candidate from a git bundle inside a throwaway sandbox — never the
 //! developer's working tree — executes the policy commands there, and binds
-//! every result to the candidate digest and environment fingerprint.
+//! every result to the content, the transport and the environment that
+//! produced it.
 //! A timeout or lost session yields an ABSENT record: never a PASS.
 //!
 //! Nothing runs until the candidate is the one it claims to be: the
@@ -32,6 +33,10 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the candidate is materialized inside the sandbox.
 const CHECKOUT: &str = "/workspace/checkout";
+
+/// The metadata key that carries the runner's token: it identifies the
+/// sandboxes of this run even when the create response cannot be read.
+const RUNNER_MARKER_KEY: &str = "hodei-mh/runner";
 
 /// One named verification command (e.g. check "AC-1" runs `cargo test`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,8 +76,13 @@ pub struct CleanRunner {
 impl CleanRunner {
     /// Verify the candidate in a fresh sandbox: upload bundle → real clone
     /// (integrity gate) → observe what was actually checked out → run each
-    /// check → bind results. The sandbox is deleted on every path,
-    /// including errors.
+    /// check → bind results.
+    ///
+    /// The sandbox is deleted on every path: a create that fails after the
+    /// container exists is found by the runner's marker and deleted too.
+    /// A deletion that cannot reach the control plane leaves the sandbox
+    /// until its TTL expires; the failure is logged, and the evidence
+    /// stands: the checks really ran in that sandbox.
     pub async fn verify(
         &self,
         work_ref: &str,
@@ -91,10 +101,20 @@ impl CleanRunner {
         }
 
         let client = reqwest::Client::new();
-        let (sandbox_id, created) = self.create_sandbox(&client).await?;
+        // Every sandbox of this run carries a unique token in its
+        // metadata: a create that fails after the server created the
+        // container is still findable, so no path leaves residue.
+        let marker = runner_marker();
+        let (sandbox_id, created) = match self.create_sandbox(&client, &marker).await {
+            Ok(created) => created,
+            Err(error) => {
+                let cleaned = self.delete_marked(&client, &marker).await;
+                return Err(RunnerError(format!("{error}; orphan cleanup: {cleaned}")));
+            }
+        };
         // Everything that can fail AFTER the sandbox exists runs inside
-        // this block, so the sandbox is deleted on every path: a response
-        // the runner cannot read must not leave the host with residue.
+        // this block, so the sandbox is deleted on every path: a failure
+        // in the checks must not leave the host with residue.
         let outcome = async {
             let image_id = observed_image_id(&created)?;
             let (bound, observed) = self
@@ -116,14 +136,19 @@ impl CleanRunner {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false);
-        let (bound, observed, image_id) = outcome?;
+        // The deletion failure is logged BEFORE the outcome error: a
+        // residue on the host must not hide behind the error that stopped
+        // the verification. It does not invalidate the evidence: the
+        // checks really ran in that sandbox.
         if !deleted {
             tracing::warn!(%sandbox_id, "clean sandbox deletion failed");
         }
+        let (bound, observed, image_id) = outcome?;
         // The evidence records what was OBSERVED, not what was declared:
         // the head and the content git reported in the checkout that ran,
         // and the bytes that really travelled. The declarations were
         // compared with them; a difference never reached this point.
+        let environment = format!("{image_id}::{sandbox_id}");
         let binding = EvidenceBinding {
             revision: observed.revision,
             tree: observed.tree,
@@ -136,15 +161,18 @@ impl CleanRunner {
                 })
                 .collect(),
             image_id,
+            environment,
         };
         Ok(EvidenceSet::bind(work_ref, binding, bound))
     }
 
     /// Create the clean sandbox: its id and the response that describes
-    /// it. This fails only when NO sandbox was created.
+    /// it. The sandbox carries the runner's marker, so a create that
+    /// fails after the container exists still leaves a findable sandbox.
     async fn create_sandbox(
         &self,
         client: &reqwest::Client,
+        marker: &str,
     ) -> Result<(String, serde_json::Value), RunnerError> {
         let response = client
             .post(format!("{}/v1/sandboxes", self.lifecycle_url))
@@ -152,7 +180,10 @@ impl CleanRunner {
                 "image": {"uri": self.image},
                 "entrypoint": ["sleep", "infinity"],
                 "timeout": 1800,
-                "metadata": {"purpose": "hodei-mh-clean-verify"},
+                "metadata": {
+                    "purpose": "hodei-mh-clean-verify",
+                    RUNNER_MARKER_KEY: marker,
+                },
             }))
             .send()
             .await
@@ -172,6 +203,46 @@ impl CleanRunner {
             .map(str::to_string)
             .ok_or_else(|| RunnerError("sandbox create returned no id".into()))?;
         Ok((sandbox_id, value))
+    }
+
+    /// Delete the sandboxes of this run whose response could not be read:
+    /// the marker in their metadata identifies them. Returns what the
+    /// cleanup did, for the error the caller reports.
+    async fn delete_marked(&self, client: &reqwest::Client, marker: &str) -> String {
+        let listed = client
+            .get(format!("{}/v1/sandboxes", self.lifecycle_url))
+            .send()
+            .await;
+        let Ok(response) = listed else {
+            return "the control plane could not be asked for the orphans".to_string();
+        };
+        let Ok(value) = response.json::<serde_json::Value>().await else {
+            return "the sandbox list could not be read".to_string();
+        };
+        let Some(items) = value["items"].as_array() else {
+            return "the sandbox list carries no items".to_string();
+        };
+        let mut removed = 0usize;
+        for item in items {
+            if item["metadata"][RUNNER_MARKER_KEY].as_str() != Some(marker) {
+                continue;
+            }
+            let Some(id) = item["id"].as_str() else {
+                continue;
+            };
+            let deleted = client
+                .delete(format!("{}/v1/sandboxes/{id}", self.lifecycle_url))
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false);
+            if deleted {
+                removed += 1;
+            } else {
+                tracing::warn!(%id, "orphan sandbox could not be deleted");
+            }
+        }
+        format!("{removed} orphan sandbox(es) removed")
     }
 
     async fn run_checks_on(
@@ -282,6 +353,7 @@ impl CleanRunner {
                 image_id: image_id.to_string(),
                 tree: observed_tree.clone(),
                 transport_digest: transport.clone(),
+                command: check.command.clone(),
                 record,
             });
         }
@@ -303,11 +375,29 @@ struct ObservedCandidate {
     tree: GitTree,
 }
 
+/// A token unique to this run: it identifies the sandboxes the runner
+/// created even when the create response could not be read.
+fn runner_marker() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!("hodei-mh-verify-{}-{nanos}-{sequence}", std::process::id())
+}
+
 /// The id of the image the runtime resolved, read from the create
 /// response: the environment the checks ran in is identified by the id,
-/// not by the tag. The control plane names every field of its contract in
-/// camelCase; the snake_case spelling is accepted as an alias, and an
-/// absent id is a failure: the binding needs the image, not the tag.
+/// not by the tag.
+///
+/// This is a requirement of the control plane the runner speaks to, not a
+/// field of the upstream create contract: the control plane must report
+/// the id of the image it resolved. The control plane names every field of
+/// its contract in camelCase; the snake_case spelling is accepted as an
+/// alias. An absent id is a FAILURE on purpose: without the id the
+/// environment cannot be identified, and a tag cannot replace it (two
+/// images can answer to the same tag).
 fn observed_image_id(created: &serde_json::Value) -> Result<String, RunnerError> {
     created["imageId"]
         .as_str()
