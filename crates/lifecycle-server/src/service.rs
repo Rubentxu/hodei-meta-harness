@@ -535,7 +535,12 @@ impl LifecycleService {
             .collect();
         let due = compose::expired_sandboxes(&entries, Utc::now());
         for id in &due {
-            let _ = self.delete_sandbox(id).await;
+            // A failure to release a sandbox is reported, not swallowed:
+            // the environment is still there, and the operator has to
+            // know that it is.
+            if let Err(error) = self.delete_sandbox(id).await {
+                tracing::error!("the sandbox {id} could not be released: {error}");
+            }
         }
         // A sandbox whose container is gone but whose network is not
         // would leave an isolated bridge on the host forever: nothing
@@ -851,7 +856,19 @@ mod tests {
         );
         // A new service with no proxy configured simulates restart/reconfiguration.
         let service = LifecycleService::new(adapter.clone(), config);
+        // The removal is RETIRED before it is reported as a failure:
+        // Docker releases the endpoint of a disconnected container
+        // asynchronously, and a removal that gives up at the first
+        // refusal leaves the network on the host.
+        let started = std::time::Instant::now();
         assert!(service.delete_sandbox(&id).await.is_err());
+        assert!(
+            started.elapsed()
+                >= crate::docker::NETWORK_REMOVAL_DELAY
+                    * (crate::docker::NETWORK_REMOVAL_ATTEMPTS as u32 - 1),
+            "the removal gave up without retrying: {:?}",
+            started.elapsed()
+        );
         assert!(adapter.inspect(&other).await.is_ok());
         let removed = std::process::Command::new("docker")
             .args(["rm", "-f", &other])

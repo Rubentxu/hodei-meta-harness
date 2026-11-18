@@ -253,10 +253,46 @@ impl DockerAdapter {
         }
         .await;
         if result.is_err() {
-            // Only the ID returned by this create operation may be rolled back.
-            let _ = self.docker.remove_network(&created.id).await;
+            // Only the ID returned by this create operation may be rolled
+            // back. The proxy may already be attached: the
+            // disconnection comes first, because Docker refuses to
+            // remove a network with a live endpoint.
+            let _ = self
+                .docker
+                .disconnect_network(
+                    &created.id,
+                    bollard::models::NetworkDisconnectRequest {
+                        container: proxy_id.clone(),
+                        force: Some(false),
+                    },
+                )
+                .await;
+            let _ = self.remove_network_with_retry(&created.id).await;
         }
         result
+    }
+
+    /// Remove a network, retrying while Docker still holds an endpoint.
+    ///
+    /// The disconnection of the trusted proxy is asynchronous: the
+    /// removal that follows it can be refused because the endpoint is
+    /// not released yet. A network that survives would be a bridge left
+    /// on the host, so the removal is attempted a bounded number of
+    /// times before it is reported as a failure.
+    async fn remove_network_with_retry(&self, id: &str) -> Result<(), DockerError> {
+        let mut attempt = 0;
+        loop {
+            match self.docker.remove_network(id).await {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    attempt += 1;
+                    if attempt >= NETWORK_REMOVAL_ATTEMPTS {
+                        return Err(DockerError::op("remove dedicated sandbox network")(error));
+                    }
+                    tokio::time::sleep(NETWORK_REMOVAL_DELAY).await;
+                }
+            }
+        }
     }
 
     /// Remove only the network bearing this sandbox's ownership labels. Other
@@ -283,22 +319,36 @@ impl DockerAdapter {
             .as_ref()
             .is_some_and(|containers| containers.contains_key(proxy_id))
         {
-            self.docker
-                .disconnect_network(
-                    id,
-                    bollard::models::NetworkDisconnectRequest {
-                        container: proxy_id.to_string(),
-                        force: Some(false),
-                    },
-                )
-                .await
-                .map_err(DockerError::op("disconnect trusted proxy"))?;
+            self.disconnect_proxy(id, proxy_id).await?;
         }
-        self.docker
-            .remove_network(id)
-            .await
-            .map_err(DockerError::op("remove dedicated sandbox network"))?;
+        self.remove_network_with_retry(id).await?;
         Ok(true)
+    }
+
+    /// Disconnect the trusted proxy from a network that is going away.
+    ///
+    /// The disconnection is attempted without force first: Docker
+    /// refuses it while the container holds the network for something
+    /// else. When it does, the forced disconnection is the one that
+    /// unblocks the removal of the network, and the proxy keeps
+    /// running on the networks it still holds.
+    async fn disconnect_proxy(&self, network_id: &str, proxy_id: &str) -> Result<(), DockerError> {
+        let request = |force: bool| bollard::models::NetworkDisconnectRequest {
+            container: proxy_id.to_string(),
+            force: Some(force),
+        };
+        if let Err(error) = self
+            .docker
+            .disconnect_network(network_id, request(false))
+            .await
+        {
+            self.docker
+                .disconnect_network(network_id, request(true))
+                .await
+                .map_err(|forced| DockerError::op("disconnect trusted proxy")(forced))?;
+            tracing::debug!("the proxy needed a forced disconnection: {error}");
+        }
+        Ok(())
     }
 
     /// Extract execd + bootstrap.sh archives from the execd image, caching per
@@ -782,6 +832,16 @@ pub fn container_state_string(state: Option<&impl ToString>) -> String {
 const NETWORK_OWNER_LABEL: &str = "hodei.io/network-owner";
 const NETWORK_OWNER: &str = "lifecycle-server";
 const NETWORK_PROXY_ID_LABEL: &str = "hodei.io/network-proxy-id";
+/// How many times the removal of a network is attempted.
+///
+/// Docker releases the endpoint of a disconnected container
+/// asynchronously: the removal that follows the disconnection can be
+/// refused with "network has active endpoints". The attempt is bounded:
+/// a network that survives every try is a real failure, and the reaper
+/// of orphan networks will try again later.
+pub(crate) const NETWORK_REMOVAL_ATTEMPTS: usize = 5;
+/// The wait between two attempts of the removal of a network.
+pub(crate) const NETWORK_REMOVAL_DELAY: Duration = Duration::from_millis(250);
 /// The label of the helper container that reads the execd artifacts out
 /// of the image. It carries no network and is accounted for by the
 /// sweeper, so a crash does not leave it running.

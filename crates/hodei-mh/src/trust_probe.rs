@@ -1125,18 +1125,23 @@ async fn credential_ownership(
 /// Print the report and clean up. The exit code is 0 when the boundary
 /// holds.
 async fn finish(authorized: &ControlPlane, created: &[String], mut report: Report) -> i32 {
-    let cleaned = cleanup(authorized, created).await;
-    if cleaned == created.len() {
+    let cleanup = cleanup(authorized, created).await;
+    if cleanup.deleted == created.len() {
         report.pass(
             "P20",
             "the probe leaves no environment behind",
-            format!("{} environments were deleted", cleaned),
+            format!("{} environments were deleted", cleanup.deleted),
         );
     } else {
         report.fail(
             "P20",
             "the probe leaves no environment behind",
-            format!("{cleaned} of {} environments were deleted", created.len()),
+            format!(
+                "{} of {} environments were deleted: {}",
+                cleanup.deleted,
+                created.len(),
+                cleanup.failures.join("; ")
+            ),
         );
     }
     let verdict = report.verdict();
@@ -1144,17 +1149,46 @@ async fn finish(authorized: &ControlPlane, created: &[String], mut report: Repor
     if verdict == Verdict::Pass { 0 } else { 1 }
 }
 
+/// What the deletion of the environments the probe created achieved.
+struct Cleanup {
+    deleted: usize,
+    /// The reason of every environment that could not be deleted.
+    failures: Vec<String>,
+}
+
 /// Delete the environments the probe created, and report how many are
 /// really gone.
-async fn cleanup(authorized: &ControlPlane, created: &[String]) -> usize {
+///
+/// The reason of a failure is reported, never swallowed: an
+/// environment that is gone but whose delete failed means that
+/// something of its boundary survived, and the reader has to know
+/// which.
+async fn cleanup(authorized: &ControlPlane, created: &[String]) -> Cleanup {
     let mut deleted = 0;
+    let mut failures = Vec::new();
     for id in created {
-        let removed = authorized
+        let response = authorized
             .delete(&ControlPlane::sandbox_path(id))
             .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
+            .await;
+        let (removed, reason) = match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    (true, String::new())
+                } else {
+                    let body = response.text().await.unwrap_or_default();
+                    (
+                        false,
+                        format!("the delete answered {status}: {}", error_of(&body)),
+                    )
+                }
+            }
+            Err(error) => (
+                false,
+                format!("the delete did not reach the control plane: {error}"),
+            ),
+        };
         let gone = authorized
             .get(&ControlPlane::sandbox_path(id))
             .send()
@@ -1164,10 +1198,16 @@ async fn cleanup(authorized: &ControlPlane, created: &[String]) -> usize {
         if removed && gone {
             deleted += 1;
         } else {
-            eprintln!("the environment {id} could not be deleted");
+            let reason = if reason.is_empty() {
+                "the environment is still there".to_string()
+            } else {
+                reason
+            };
+            failures.push(format!("{id}: {reason}"));
+            eprintln!("the environment {id} could not be deleted: {reason}");
         }
     }
-    deleted
+    Cleanup { deleted, failures }
 }
 
 /// The number of environments the control plane reports.
