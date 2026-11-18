@@ -40,10 +40,20 @@ impl ServiceError {
 /// How long a network that no sandbox owns is left alone before it is
 /// removed.
 ///
-/// A creation in flight must never lose its network: the sandbox has a
-/// network before it has a container, and the sweeper runs every few
-/// seconds. The grace period is far longer than any creation takes.
+/// A creation in flight is protected by the record of the creations in
+/// flight, not by this grace: the age of the network says nothing
+/// about how long the creation takes. This margin is the last line for
+/// the networks that no creation owns, because the process that created
+/// them is gone.
 const ORPHAN_NETWORK_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// The creations that are in flight, by sandbox.
+///
+/// A sandbox has its network before it has a container, so a sweep that
+/// ignored the creations in flight could take the network of a creation
+/// that is still working. The record is what protects them: the age of
+/// the network is not a fact about the creation.
+type InFlight = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
 
 /// The network of a sandbox that is still being created.
 ///
@@ -56,16 +66,21 @@ const ORPHAN_NETWORK_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 struct CreationGuard {
     adapter: DockerAdapter,
     sandbox_id: String,
+    /// The creations in flight: the sweep leaves their networks alone
+    /// however long they take.
+    in_flight: InFlight,
     /// Whether the creation completed and the network now belongs to
     /// a sandbox that exists.
     completed: bool,
 }
 
 impl CreationGuard {
-    fn new(adapter: DockerAdapter, sandbox_id: &str) -> Self {
+    fn new(adapter: DockerAdapter, sandbox_id: &str, in_flight: InFlight) -> Self {
+        lock_in_flight(&in_flight).insert(sandbox_id.to_string());
         Self {
             adapter,
             sandbox_id: sandbox_id.to_string(),
+            in_flight,
             completed: false,
         }
     }
@@ -73,7 +88,21 @@ impl CreationGuard {
     /// The creation finished: the network belongs to the sandbox.
     fn complete(&mut self) {
         self.completed = true;
+        lock_in_flight(&self.in_flight).remove(&self.sandbox_id);
     }
+}
+
+/// The creations in flight.
+///
+/// The lock is held for a hash operation and never across an await: a
+/// poisoned lock is recovered, because the record it protects is a
+/// convenience and not a truth that a panic may destroy.
+fn lock_in_flight(
+    in_flight: &InFlight,
+) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+    in_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Drop for CreationGuard {
@@ -87,6 +116,7 @@ impl Drop for CreationGuard {
         // fails is reported: a bridge nobody owns has to be visible.
         let adapter = self.adapter.clone();
         let sandbox_id = self.sandbox_id.clone();
+        let in_flight = self.in_flight.clone();
         tokio::spawn(async move {
             match adapter.remove_sandbox_network(&sandbox_id).await {
                 Ok(true) => tracing::info!(
@@ -97,6 +127,9 @@ impl Drop for CreationGuard {
                     "the network of the sandbox {sandbox_id} could not be removed after a failed creation: {error}"
                 ),
             }
+            // The creation is over: the sweep may take the network from
+            // here on, and a removal that failed is its business.
+            lock_in_flight(&in_flight).remove(&sandbox_id);
         });
     }
 }
@@ -110,10 +143,17 @@ impl Drop for CreationGuard {
 fn is_reapable_orphan(
     id: &str,
     live: &[String],
+    in_flight: &[String],
     created: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
 ) -> bool {
     if live.iter().any(|owned| owned == id) {
+        return false;
+    }
+    // A creation in flight has its network before it has a container.
+    // Its age says nothing about how long the creation takes, so the
+    // record of the creations in flight is what protects it.
+    if in_flight.iter().any(|creating| creating == id) {
         return false;
     }
     match created {
@@ -203,6 +243,9 @@ pub struct LifecycleService {
     /// delivered. The copy lives in memory only: it is never written to
     /// a label, a log or a record.
     credentials: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The creations that are in flight: their networks exist before
+    /// their containers do, and the sweep must not take them away.
+    in_flight: InFlight,
 }
 
 impl LifecycleService {
@@ -212,6 +255,7 @@ impl LifecycleService {
             config,
             relays: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             credentials: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -334,8 +378,10 @@ impl LifecycleService {
             .create_sandbox_network(&self.config.trust.network, &sandbox_id, proxy)
             .await?;
         // From here on the network belongs to a creation that may not
-        // finish. The guard takes it away with the creation.
-        let mut guard = CreationGuard::new(self.adapter.clone(), &sandbox_id);
+        // finish. The guard takes it away with the creation, and the
+        // sweep leaves it alone while it works.
+        let mut guard =
+            CreationGuard::new(self.adapter.clone(), &sandbox_id, self.in_flight.clone());
         let mut host = build_host_spec(
             &self.config.hardening,
             Some(memory),
@@ -697,6 +743,7 @@ impl LifecycleService {
             .into_iter()
             .map(|sandbox| sandbox.id)
             .collect();
+        let in_flight: Vec<String> = lock_in_flight(&self.in_flight).iter().cloned().collect();
         let now = Utc::now();
         for (id, created) in self
             .adapter
@@ -705,11 +752,12 @@ impl LifecycleService {
             .unwrap_or_default()
         {
             // A network that is younger than the grace period is NEVER
-            // removed: a sandbox that is being created has its network
-            // before it has a container, and removing that network would
-            // make the creation fail for a reason that has nothing to
-            // do with the candidate.
-            if !is_reapable_orphan(&id, &live, created, now) {
+            // removed, and neither is the network of a creation that is
+            // still in flight: a sandbox that is being created has its
+            // network before it has a container, and removing that
+            // network would make the creation fail for a reason that has
+            // nothing to do with the candidate.
+            if !is_reapable_orphan(&id, &live, &in_flight, created, now) {
                 continue;
             }
             match self.adapter.remove_sandbox_network(&id).await {
@@ -894,6 +942,7 @@ mod tests {
         assert!(!is_reapable_orphan(
             "sbx-1",
             &["sbx-1".to_string()],
+            &[],
             Some(old),
             now
         ));
@@ -906,20 +955,36 @@ mod tests {
         // creation that is in flight and make it fail.
         let now = Utc::now();
         let fresh = now - chrono::Duration::seconds(30);
-        assert!(!is_reapable_orphan("sbx-2", &[], Some(fresh), now));
+        assert!(!is_reapable_orphan("sbx-2", &[], &[], Some(fresh), now));
+    }
+
+    #[test]
+    fn a_creation_in_flight_is_never_reaped_however_old_its_network_is() {
+        // The age of the network is not a fact about the creation: a
+        // creation that takes long (a slow host, a busy daemon) must not
+        // lose its network because the margin elapsed.
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        assert!(!is_reapable_orphan(
+            "sbx-5",
+            &[],
+            &["sbx-5".to_string()],
+            Some(old),
+            now
+        ));
     }
 
     #[test]
     fn an_old_network_without_a_sandbox_is_reaped() {
         let now = Utc::now();
         let old = now - chrono::Duration::hours(2);
-        assert!(is_reapable_orphan("sbx-3", &[], Some(old), now));
+        assert!(is_reapable_orphan("sbx-3", &[], &[], Some(old), now));
     }
 
     #[test]
     fn a_network_of_an_unknown_age_is_left_alone() {
         let now = Utc::now();
-        assert!(!is_reapable_orphan("sbx-4", &[], None, now));
+        assert!(!is_reapable_orphan("sbx-4", &[], &[], None, now));
     }
 
     #[tokio::test]
@@ -1095,7 +1160,9 @@ mod tests {
         );
         // The creation is abandoned: the guard goes away with it.
         {
-            let _guard = CreationGuard::new(adapter.clone(), &id);
+            let in_flight: InFlight =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+            let _guard = CreationGuard::new(adapter.clone(), &id, in_flight);
         }
         // The removal runs on its own task, so the assertion waits for
         // it instead of assuming it already happened.
