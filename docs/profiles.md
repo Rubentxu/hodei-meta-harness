@@ -59,6 +59,23 @@ the packaging command. `hodei-mh package` checks the architecture of the
 binaries it stages against that name and refuses a mismatch: a mislabeled
 artifact is worse than no artifact.
 
+The documentation the bundle ships comes from a TRUSTED source: the copy
+installed next to the running binary
+(`<prefix>/share/hodei-mh/docs/profiles.md`), or the copy of the workspace
+that owns the product. A file named `docs/profiles.md` that merely happens
+to sit in the working directory is NOT the product's documentation, and
+shipping it would put a foreign text inside the release; `hodei-mh package`
+refuses to build a bundle when neither trusted source exists, and the
+manifest states the origin and the SHA-256 of the document it shipped.
+
+The bundle also carries `SHA256SUMS`: the digests of every file it ships,
+read from the staged bytes. A consumer can verify the unpacked bundle
+offline, with no network and no repository:
+
+```bash
+LC_ALL=C sha256sum -c SHA256SUMS
+```
+
 Versions are pinned by the workspace (`Cargo.toml`): no floating
 dependencies are used at runtime.
 

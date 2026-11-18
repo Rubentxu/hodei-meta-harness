@@ -64,19 +64,27 @@ echo "d9c40b63ad41a5bced18739b4fb2729309a1e669d0f689c9cf38855542561c26  hodei-mh
 
 ### 3. Install outside the repository
 
-The bundle is self-contained: `bin/`, `docs/profiles.md`, `install.sh` and
-`INSTALL.md`, nothing else. Unpack it anywhere and run the installer with the
-prefix you want — the repository is not needed at runtime:
+The bundle is self-contained: `bin/`, `docs/profiles.md`, `install.sh`,
+`INSTALL.md` and `SHA256SUMS`, nothing else. Unpack it anywhere and run the
+installer with the prefix you want — the repository is not needed at runtime:
 
 ```bash
-tar xzf hodei-mh-v0.1.0-linux-x86_64.tar.gz
-sh install.sh                      # into ~/.local/bin
-sh install.sh /opt/hodei-mh        # or into any prefix you can write to
+mkdir hodei-mh && tar xzf hodei-mh-v0.1.0-linux-x86_64.tar.gz -C hodei-mh
+cd hodei-mh
+LC_ALL=C sha256sum -c SHA256SUMS    # the bundle's own digests, offline
+sh install.sh                        # into ~/.local/bin
+sh install.sh /opt/hodei-mh          # or into any prefix you can write to
 ```
 
 ```
 installed to /opt/hodei-mh/bin (hodei-mh, hodei-mh-lifecycle-server)
 ```
+
+Unpack the bundle into a directory of its own: it ships a `SHA256SUMS` of its
+own, and extracting it next to the downloaded manifest would replace the one
+that certifies the download. The bundle's manifest covers the bytes **inside**
+it, so the two checks together seal the whole path: the download against the
+published digest, and the unpacked files against the bundle's.
 
 The binaries land in `<prefix>/bin` and the documentation in
 `<prefix>/share/hodei-mh/docs`. Nothing else is required: no runtime, no shared

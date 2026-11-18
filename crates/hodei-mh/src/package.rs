@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::digest;
+use crate::docs;
 use crate::elf;
 
 fn flag(args: &[String], name: &str, default: &str) -> String {
@@ -23,6 +25,7 @@ cp bin/hodei-mh "$PREFIX/bin/"
 cp bin/hodei-mh-lifecycle-server "$PREFIX/bin/"
 cp docs/profiles.md "$PREFIX/share/hodei-mh/docs/"
 cp INSTALL.md "$PREFIX/share/hodei-mh/docs/"
+cp SHA256SUMS "$PREFIX/share/hodei-mh/"
 echo "installed to $PREFIX/bin (hodei-mh, hodei-mh-lifecycle-server)"
 echo "next: hodei-mh doctor --profile rust   (see $PREFIX/share/hodei-mh/docs/profiles.md)"
 "#;
@@ -31,9 +34,24 @@ const INSTALL_MD: &str = r#"# hodei-meta-harness — install & first run
 
 Contents: `bin/hodei-mh` (control plane client + TUI + profiles),
 `bin/hodei-mh-lifecycle-server` (OpenSandbox lifecycle over Docker),
-`docs/profiles.md` (pinned Rust/JVM profiles), `install.sh`.
+`docs/profiles.md` (pinned Rust/JVM profiles), `install.sh`,
+`SHA256SUMS`.
 
 Install: `sh install.sh` (bins go to `~/.local/bin`).
+
+## Verify the bundle, offline
+
+`SHA256SUMS` carries the SHA-256 of every file this bundle ships. Check
+them from the bundle root, with no network and no repository:
+
+    LC_ALL=C sha256sum -c SHA256SUMS
+
+One `OK` line per file means the bytes you unpacked are the bytes that
+were published. The same file is installed next to the documentation
+(`<prefix>/share/hodei-mh/SHA256SUMS`), so an installed tree can be
+checked again later.
+
+## The binaries
 
 The binaries are STANDALONE: statically linked, with no dynamic loader,
 so they need no glibc, no libgcc and no other system library from the
@@ -42,7 +60,7 @@ host. They run on any Linux x86_64 whose kernel is 3.2 or newer.
 Prerequisites: Docker, a networked host for image pulls, and the
 restricted-egress proxy for sandboxes (see docs/profiles.md).
 
-First run:
+## First run
 
     PORT=8081 hodei-mh-lifecycle-server &
     hodei-mh doctor --profile rust          # read-only checks + gate
@@ -137,12 +155,17 @@ fn target_platform() -> (&'static str, &'static str) {
 pub async fn run_package(args: &[String]) -> i32 {
     let version = env!("CARGO_PKG_VERSION");
     let out_dir = PathBuf::from(flag(args, "--out", "/tmp/hodei-mh-package"));
-    let repo =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    // The workspace is found by its MARKER, never by the working
+    // directory alone: `CARGO_MANIFEST_DIR` does not exist at runtime,
+    // and a "." that happens to hold a `docs/profiles.md` is not the
+    // product's tree.
+    let repo = exe
+        .as_deref()
+        .and_then(docs::workspace_root)
+        .or_else(|| cwd.as_deref().and_then(docs::workspace_root))
+        .unwrap_or_else(|| PathBuf::from("."));
     let release = resolve_release_dir(&repo);
 
     // A debug build is not a release artifact: the bundle ships the
@@ -230,12 +253,32 @@ pub async fn run_package(args: &[String]) -> i32 {
         return 1;
     }
 
+    // The bundle carries the documentation of the PRODUCT. The source
+    // is TRUSTED: the copy installed next to the running binary, or
+    // the copy of the workspace that owns the product. A file named
+    // `docs/profiles.md` that merely happens to sit in the working
+    // directory is not the product's documentation, and shipping it
+    // would put a foreign text inside the release.
+    let doc = match docs::choose(&docs::candidates(exe.as_deref(), cwd.as_deref())) {
+        Some(source) => source,
+        None => {
+            eprintln!(
+                "refusing to package without the product's documentation: no \
+                 <prefix>/share/hodei-mh/{} and no workspace {} found — the \
+                 bundle must carry the documentation of the product it ships",
+                docs::DOC_RELATIVE,
+                docs::DOC_RELATIVE
+            );
+            return 1;
+        }
+    };
+
     // Stage the bundle.
     let _ = std::fs::remove_dir_all(&out_dir);
     let staged = [
         ("bin/hodei-mh", bins[0].clone()),
         ("bin/hodei-mh-lifecycle-server", bins[1].clone()),
-        ("docs/profiles.md", repo.join("docs/profiles.md")),
+        (docs::DOC_RELATIVE, doc.path.clone()),
     ];
     for (relative, source) in &staged {
         let dest = out_dir.join(relative);
@@ -266,6 +309,32 @@ pub async fn run_package(args: &[String]) -> i32 {
         };
     if !wrote_installers {
         eprintln!("failed to write installer files");
+        return 1;
+    }
+
+    // The bundle carries the digests of what it ships: the consumer
+    // can verify the unpacked bytes offline, with no network and no
+    // repository. The digests are READ from the staged files, so they
+    // describe the bytes that travel, not the ones that were meant to
+    // travel.
+    let mut checksums = String::new();
+    let mut shipped: Vec<(String, String)> = Vec::new();
+    for (relative, _) in &staged {
+        let digest = digest::sha256_file(&out_dir.join(relative));
+        match digest {
+            Some(digest) => {
+                checksums.push_str(&digest::checksum_line(&digest, relative));
+                checksums.push('\n');
+                shipped.push((relative.to_string(), digest));
+            }
+            None => {
+                eprintln!("cannot read the staged {relative} to compute its digest");
+                return 1;
+            }
+        }
+    }
+    if std::fs::write(out_dir.join("SHA256SUMS"), checksums).is_err() {
+        eprintln!("failed to write the bundle's SHA256SUMS");
         return 1;
     }
 
@@ -307,40 +376,181 @@ pub async fn run_package(args: &[String]) -> i32 {
     // The manifest reports what was SCANNED, not what is asserted: the
     // undemonstrated dependencies are the ones really present in the
     // staged bundle beyond the two binaries and the docs.
-    let mut undemonstrated: Vec<String> = Vec::new();
-    for entry in &contents {
-        let normalised = entry.trim_start_matches("./");
-        let known = normalised == "bin/hodei-mh"
-            || normalised == "bin/hodei-mh-lifecycle-server"
-            || normalised == "docs/profiles.md"
-            || normalised == "docs/INSTALL.md"
-            || normalised == "INSTALL.md"
-            || normalised == "install.sh"
-            || normalised.is_empty()
-            || normalised.ends_with('/');
-        if !known {
-            undemonstrated.push(entry.clone());
+    let undemonstrated = undemonstrated_dependencies(&contents);
+    let manifest = build_manifest(ManifestFacts {
+        package: tar_path.to_string_lossy().into_owned(),
+        version: version.to_string(),
+        bytes: std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0),
+        contents,
+        documentation_origin: doc.origin.as_str(),
+        documentation_digest: shipped
+            .iter()
+            .find(|(name, _)| name == docs::DOC_RELATIVE)
+            .map(|(_, digest)| digest.clone())
+            .unwrap_or_default(),
+        checksums: shipped,
+        undemonstrated,
+        standalone,
+    });
+    println!("{}", manifest);
+    0
+}
+
+/// The facts the manifest reports. Everything here is a measurement.
+struct ManifestFacts {
+    package: String,
+    version: String,
+    bytes: u64,
+    contents: Vec<String>,
+    documentation_origin: &'static str,
+    documentation_digest: String,
+    checksums: Vec<(String, String)>,
+    undemonstrated: Vec<String>,
+    standalone: bool,
+}
+
+/// The entries of the bundle that are NOT part of the documented
+/// product: the manifest is a scan, not an assertion.
+fn undemonstrated_dependencies(contents: &[String]) -> Vec<String> {
+    contents
+        .iter()
+        .filter(|entry| {
+            let normalised = entry.trim_start_matches("./");
+            !(normalised == "bin/hodei-mh"
+                || normalised == "bin/hodei-mh-lifecycle-server"
+                || normalised == "docs/profiles.md"
+                || normalised == "docs/INSTALL.md"
+                || normalised == "INSTALL.md"
+                || normalised == "install.sh"
+                || normalised == "SHA256SUMS"
+                || normalised.is_empty()
+                || normalised.ends_with('/'))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The manifest of the bundle: what it contains, where the
+/// documentation came from, and the digests of what it ships.
+fn build_manifest(facts: ManifestFacts) -> serde_json::Value {
+    let documentation = serde_json::json!({
+        // Where the shipped documentation came from: an installation
+        // beside the running binary, or the workspace that owns the
+        // product. Never a file found by chance in the working
+        // directory.
+        "origin": facts.documentation_origin,
+        "document": docs::DOC_RELATIVE,
+        "sha256": facts.documentation_digest,
+    });
+    let mut checksums = serde_json::Map::new();
+    for (name, digest) in &facts.checksums {
+        checksums.insert(name.clone(), serde_json::Value::String(digest.clone()));
+    }
+    serde_json::json!({
+        "package": facts.package,
+        "version": facts.version,
+        "bytes": facts.bytes,
+        "contents": facts.contents,
+        "documentation": documentation,
+        // The digests of the shipped bytes, so the manifest and the
+        // bundle's own SHA256SUMS tell the same story.
+        "checksums": checksums,
+        "guarantees": {
+            // The bundle contains no native build fallback: the
+            // binaries are the only executables and the docs say
+            // what they need.
+            "yolo_fallback": false,
+            "undemonstrated_dependencies": facts.undemonstrated,
+            // MEASURED, not asserted: the binaries carry no
+            // dynamic loader, so the bundle needs no glibc, no
+            // libgcc and no other system library from the host.
+            "standalone_binaries": facts.standalone,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts() -> ManifestFacts {
+        ManifestFacts {
+            package: "/tmp/hodei-mh-v0.1.0-linux-x86_64.tar.gz".to_string(),
+            version: "0.1.0".to_string(),
+            bytes: 42,
+            contents: vec![
+                "./".to_string(),
+                "./bin/hodei-mh".to_string(),
+                "./SHA256SUMS".to_string(),
+                "./docs/profiles.md".to_string(),
+            ],
+            documentation_origin: "installed",
+            documentation_digest: "abc123".to_string(),
+            checksums: vec![
+                ("bin/hodei-mh".to_string(), "d1".to_string()),
+                ("docs/profiles.md".to_string(), "abc123".to_string()),
+            ],
+            undemonstrated: vec![],
+            standalone: true,
         }
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "package": tar_path.to_string_lossy(),
-            "version": version,
-            "bytes": std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0),
-            "contents": contents,
-            "guarantees": {
-                // The bundle contains no native build fallback: the
-                // binaries are the only executables and the docs say
-                // what they need.
-                "yolo_fallback": false,
-                "undemonstrated_dependencies": undemonstrated,
-                // MEASURED, not asserted: the binaries carry no
-                // dynamic loader, so the bundle needs no glibc, no
-                // libgcc and no other system library from the host.
-                "standalone_binaries": standalone,
-            },
-        })
-    );
-    0
+
+    #[test]
+    fn the_manifest_declares_where_the_documentation_came_from() {
+        let manifest = build_manifest(facts());
+        let documentation = &manifest["documentation"];
+        assert_eq!(documentation["origin"], "installed");
+        assert_eq!(documentation["document"], "docs/profiles.md");
+        assert_eq!(documentation["sha256"], "abc123");
+    }
+
+    #[test]
+    fn the_manifest_carries_the_digest_of_every_shipped_file() {
+        let manifest = build_manifest(facts());
+        assert_eq!(manifest["checksums"]["bin/hodei-mh"], "d1");
+        assert_eq!(manifest["checksums"]["docs/profiles.md"], "abc123");
+        // The documentation digest is the digest of the shipped file:
+        // the manifest and the bundle's SHA256SUMS tell one story.
+        assert_eq!(
+            manifest["documentation"]["sha256"],
+            manifest["checksums"]["docs/profiles.md"]
+        );
+    }
+
+    #[test]
+    fn the_manifest_reports_the_measured_guarantees() {
+        let manifest = build_manifest(facts());
+        assert_eq!(manifest["guarantees"]["standalone_binaries"], true);
+        assert_eq!(manifest["guarantees"]["yolo_fallback"], false);
+        assert_eq!(
+            manifest["guarantees"]["undemonstrated_dependencies"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn the_known_files_are_not_undemonstrated_dependencies() {
+        let contents = vec![
+            "./bin/hodei-mh".to_string(),
+            "./bin/hodei-mh-lifecycle-server".to_string(),
+            "./docs/profiles.md".to_string(),
+            "./INSTALL.md".to_string(),
+            "./install.sh".to_string(),
+            "./SHA256SUMS".to_string(),
+            "./docs/".to_string(),
+        ];
+        assert!(undemonstrated_dependencies(&contents).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_file_in_the_bundle_is_reported() {
+        let contents = vec![
+            "./bin/hodei-mh".to_string(),
+            "./bin/extra-plugin".to_string(),
+        ];
+        assert_eq!(
+            undemonstrated_dependencies(&contents),
+            vec!["./bin/extra-plugin".to_string()]
+        );
+    }
 }
