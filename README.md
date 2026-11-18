@@ -6,13 +6,13 @@ speak ACP v1, and promote verified Git results back to the host.
 
 ## Install
 
-The v0.1.0 release ships **standalone** binaries and an installable bundle:
+The v0.1.1 release ships **standalone** binaries and an installable bundle:
 
 | Asset | SHA-256 |
 |---|---|
-| `hodei-mh-v0.1.0-linux-x86_64` | `d1bcfb4e146fe9c1479184b8eda95b6c249bd64a62e499f09d0bfd0de68ca9b4` |
-| `hodei-mh-lifecycle-server-v0.1.0-linux-x86_64` | `9f7f699be012332699c73f8a263ee40693f75dd2a47675ff153b18104bee1a09` |
-| `hodei-mh-v0.1.0-linux-x86_64.tar.gz` | `d9c40b63ad41a5bced18739b4fb2729309a1e669d0f689c9cf38855542561c26` |
+| `hodei-mh-v0.1.1-linux-x86_64` | `9e07bd433984120ed022f116c67184746d814359c160b15ebb157b4466da1426` |
+| `hodei-mh-lifecycle-server-v0.1.1-linux-x86_64` | `d70dc5fb990592ecccfe183be5acd01a9d552179b665e6313b70abe3d20bcec7` |
+| `hodei-mh-v0.1.1-linux-x86_64.tar.gz` | `5980983671a9726e0ed89a1c8c421e9d50798053595c5a4a6bcabbd89267a486` |
 
 Requirements: Docker (the sandbox backend), a host that can pull the pinned images,
 and the restricted-egress proxy for sandboxes (see
@@ -22,17 +22,17 @@ and the restricted-egress proxy for sandboxes (see
 
 ```bash
 REPO=Rubentxu/hodei-meta-harness
-TAG=v0.1.0
+TAG=v0.1.1
 BASE=https://github.com/$REPO/releases/download/$TAG
 
 # the installable bundle plus the manifest of digests
-curl -L -O "$BASE/hodei-mh-v0.1.0-linux-x86_64.tar.gz"
+curl -L -O "$BASE/hodei-mh-v0.1.1-linux-x86_64.tar.gz"
 curl -L -O "$BASE/SHA256SUMS"
 
 # or the binaries on their own
-curl -L -O "$BASE/hodei-mh-v0.1.0-linux-x86_64"
-curl -L -O "$BASE/hodei-mh-lifecycle-server-v0.1.0-linux-x86_64"
-chmod +x hodei-mh-v0.1.0-linux-x86_64 hodei-mh-lifecycle-server-v0.1.0-linux-x86_64
+curl -L -O "$BASE/hodei-mh-v0.1.1-linux-x86_64"
+curl -L -O "$BASE/hodei-mh-lifecycle-server-v0.1.1-linux-x86_64"
+chmod +x hodei-mh-v0.1.1-linux-x86_64 hodei-mh-lifecycle-server-v0.1.1-linux-x86_64
 ```
 
 `curl` writes what the server sends, and the server sends no executable bit: the
@@ -50,16 +50,16 @@ LC_ALL=C sha256sum -c SHA256SUMS
 ```
 
 ```
-hodei-mh-v0.1.0-linux-x86_64: OK
-hodei-mh-lifecycle-server-v0.1.0-linux-x86_64: OK
-hodei-mh-v0.1.0-linux-x86_64.tar.gz: OK
+hodei-mh-v0.1.1-linux-x86_64: OK
+hodei-mh-lifecycle-server-v0.1.1-linux-x86_64: OK
+hodei-mh-v0.1.1-linux-x86_64.tar.gz: OK
 ```
 
 If you only took the bundle, check it against the digest published in the release
 notes:
 
 ```bash
-echo "d9c40b63ad41a5bced18739b4fb2729309a1e669d0f689c9cf38855542561c26  hodei-mh-v0.1.0-linux-x86_64.tar.gz" | sha256sum -c -
+echo "5980983671a9726e0ed89a1c8c421e9d50798053595c5a4a6bcabbd89267a486  hodei-mh-v0.1.1-linux-x86_64.tar.gz" | sha256sum -c -
 ```
 
 ### 3. Install outside the repository
@@ -69,7 +69,7 @@ The bundle is self-contained: `bin/`, `docs/profiles.md`, `install.sh`,
 installer with the prefix you want — the repository is not needed at runtime:
 
 ```bash
-mkdir hodei-mh && tar xzf hodei-mh-v0.1.0-linux-x86_64.tar.gz -C hodei-mh
+mkdir hodei-mh && tar xzf hodei-mh-v0.1.1-linux-x86_64.tar.gz -C hodei-mh
 cd hodei-mh
 LC_ALL=C sha256sum -c SHA256SUMS    # the bundle's own digests, offline
 sh install.sh                        # into ~/.local/bin
@@ -164,3 +164,9 @@ Everything above is demonstrated by the repository's E2E probes, not asserted.
 The task board lives in `backlog/` (Backlog.md is the single source of truth).
 `docs/profiles.md` documents the profiles, the doctor, the budget and the
 installation contract in detail.
+
+The audit of v0.1.0 became the v0.2 consolidation plan and lives on the same
+board: thirteen tasks with their acceptance criteria, their code references and
+their technical dependencies (TASK-24..TASK-36). The order is the one the
+dependencies allow — the guarantees first, and the autonomous execution on top
+of them.
