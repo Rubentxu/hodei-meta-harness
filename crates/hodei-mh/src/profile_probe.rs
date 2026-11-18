@@ -69,6 +69,33 @@ fn make_jvm_project(root: &std::path::Path) -> bool {
         .is_ok()
 }
 
+/// The ids of the sandboxes the lifecycle server currently lists. Used to
+/// OBSERVE that the doctor creates nothing.
+async fn list_sandbox_ids() -> Vec<String> {
+    let client = reqwest::Client::new();
+    let value: serde_json::Value = match client
+        .get("http://127.0.0.1:8081/v1/sandboxes")
+        .send()
+        .await
+    {
+        Ok(response) => response.json().await.unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    let mut ids: Vec<String> = value
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
 pub async fn run(_args: &[String]) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
@@ -98,6 +125,7 @@ pub async fn run(_args: &[String]) -> i32 {
     let refused_cleanly = refuse_code == 1
         && refuse_out.contains("REFUSE")
         && refuse_out.contains("\"yolo_fallback\": false")
+        && refuse_out.contains("\"build_executed_on_host\": false")
         && refuse_out.contains("missing");
     checks.push(Check {
         name: "unavailable-image-refuses-without-native-fallback",
@@ -107,8 +135,39 @@ pub async fn run(_args: &[String]) -> i32 {
         ),
     });
 
+    // ---- a USER image that IS present locally must be accepted ---------
+    // The user flow is documented; it must not be refused for a digest
+    // it never had.
+    let user_image = "rust:1-bookworm";
+    let (user_code, user_out, user_err) = run_capture(
+        &bin,
+        &[
+            "profile-run",
+            "--image",
+            user_image,
+            "--project",
+            rust_b.to_string_lossy().as_ref(),
+        ],
+    )
+    .await;
+    let user_refused_for_digest = user_out.contains("local image digest does not match");
+    let user_accepted = user_code == 0 && !user_refused_for_digest;
+    checks.push(Check {
+        name: "user-image-present-locally-is-accepted",
+        passed: user_accepted,
+        detail: format!(
+            "profile-run --image {user_image} (present locally, NOT pinned) exited {user_code}; refused for a digest mismatch: {user_refused_for_digest}; stderr: {}",
+            user_err.trim().chars().take(150).collect::<String>()
+        ),
+    });
+
     // ---- AC-1: doctor is non-destructive and reports pinned versions ----
+    // The sandbox list BEFORE and AFTER the doctor must be identical: the
+    // doctor claims to be read-only, so it is OBSERVED to be.
+    let sandboxes_before = list_sandbox_ids().await;
     let (doctor_code, doctor_out, _) = run_capture(&bin, &["doctor", "--profile", "rust"]).await;
+    let sandboxes_after = list_sandbox_ids().await;
+    let non_destructive = sandboxes_before == sandboxes_after;
     let doctor_honest = doctor_code == 0
         && doctor_out.contains("PROCEED")
         && doctor_out.contains("pinned-image-local")
@@ -117,9 +176,11 @@ pub async fn run(_args: &[String]) -> i32 {
         && doctor_out.contains("sha256:");
     checks.push(Check {
         name: "doctor-non-destructive-with-pinned-versions",
-        passed: doctor_honest,
+        passed: doctor_honest && non_destructive,
         detail: format!(
-            "doctor exit {doctor_code}: read-only checks (image digest match, egress reachability, lifecycle readiness, subscription note) and PROCEED with the pinned sha256",
+            "doctor exit {doctor_code}: read-only checks (image digest match, egress reachability, lifecycle readiness, subscription note) and PROCEED with the pinned sha256; the sandbox list is identical before ({}) and after ({}) the doctor",
+            sandboxes_before.len(),
+            sandboxes_after.len()
         ),
     });
 
@@ -216,14 +277,82 @@ pub async fn run(_args: &[String]) -> i32 {
     });
 
     // ---- AC-3: credentials never in commands nor records ----------------
-    let leak_in_records = rust_out.contains("sk-should-never-appear")
-        || jvm_out.contains("sk-should-never-appear")
-        || rust_out.contains("ANTHROPIC_AUTH_TOKEN=sk-");
-    let scrub_visible = rust_out.contains("[redacted]");
+    // A REAL, RANDOM token is injected into the process environment: a
+    // hardcoded fake would only prove that the fake is scrubbed.
+    let real_token = format!(
+        "sk-ant-probe-{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    );
+    let with_token = tokio::process::Command::new(&bin)
+        .args([
+            "profile-run",
+            "--profile",
+            "rust",
+            "--project",
+            rust_a.to_string_lossy().as_ref(),
+        ])
+        .env("ANTHROPIC_AUTH_TOKEN", &real_token)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("spawn hodei-mh");
+    let token_stdout = String::from_utf8_lossy(&with_token.stdout).to_string();
+    let token_stderr = String::from_utf8_lossy(&with_token.stderr).to_string();
+    let leak_in_records = token_stdout.contains(&real_token) || token_stderr.contains(&real_token);
+    let scrub_visible = token_stdout.contains("[redacted]");
     checks.push(Check {
         name: "credentials-excluded-from-commands-and-records",
         passed: !leak_in_records && scrub_visible,
-        detail: "build commands carry no secrets (builds need none; egress is the only network grant); the scrub sample shows placeholders; subscription limitation is part of the doctor report".to_string(),
+        detail: format!(
+            "a real random token was injected in the process env; it appears in neither stdout nor stderr (leaked: {leak_in_records}); the scrub sample shows placeholders"
+        ),
+    });
+
+    // ---- the sandbox's OWN egress is measured from inside ---------------
+    let egress: serde_json::Value = serde_json::from_str(&rust_out).unwrap_or_default();
+    let sandbox_egress = &egress["sandbox_egress"];
+    let measured_inside = sandbox_egress["measured_from"] == "inside the sandbox";
+    let proxy_seen = sandbox_egress["proxy_reachable"] == true;
+    let direct_reported = sandbox_egress["direct_internet_reachable"] == true
+        || sandbox_egress["direct_internet_blocked"] == true;
+    checks.push(Check {
+        name: "sandbox-egress-measured-from-inside",
+        passed: measured_inside && proxy_seen && direct_reported,
+        detail: format!(
+            "the record states the egress was measured from inside the sandbox (proxy reachable: {proxy_seen}); raw: {}",
+            sandbox_egress["raw"].as_str().unwrap_or("(none)")
+        ),
+    });
+
+    // ---- the observed image digest is the RESOLVED one ------------------
+    let requested = egress["image_sha_requested"].as_str().unwrap_or_default();
+    let observed = egress["image_digest_observed"].as_str().unwrap_or_default();
+    let digest_recorded = !observed.is_empty() && requested.contains(observed);
+    checks.push(Check {
+        name: "observed-image-digest-recorded",
+        passed: digest_recorded,
+        detail: format!(
+            "requested pin: {requested}; digest observed for the image that ran: {observed}"
+        ),
+    });
+
+    // ---- the release went through the IDLE GATE, with a durable export -
+    let cleanup = egress["cleanup"].as_str().unwrap_or_default();
+    let durable = &egress["durable_export"];
+    let released_by_gate = cleanup.starts_with("released")
+        && durable["exported"] == true
+        && durable["digest_confirmed"] == true
+        && !egress["sandbox_id"].as_str().unwrap_or_default().is_empty();
+    checks.push(Check {
+        name: "release-goes-through-the-idle-gate-with-a-durable-export",
+        passed: released_by_gate,
+        detail: format!(
+            "cleanup: {cleanup}; the candidate was exported to durable storage and READ BACK before the release was allowed (digest confirmed: {})",
+            durable["digest_confirmed"]
+        ),
     });
 
     // Cleanup fixtures.

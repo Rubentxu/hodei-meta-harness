@@ -147,6 +147,36 @@ pub async fn run() -> i32 {
         detail: format!("a second Start is refused with exit {second_code}: {second_out}",),
     });
 
+    // ---- a SECOND SUPERVISOR PROCESS on a LIVE socket is refused -------
+    // Starting another supervisor while the first one is alive would
+    // split the state (two cores, two truths). It must be refused.
+    let second_log = std::env::temp_dir().join(format!(
+        "hodei-supervisor-probe-2-{}.log",
+        std::process::id()
+    ));
+    let mut second_supervisor = spawn_supervisor(&bin, &socket, &second_log).spawn().ok();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (dup_code, dup_out, dup_err) =
+        run_capture(&bin, &["sup-status", "--socket", &socket]).await;
+    let second_refused = dup_code == 0;
+    let second_exited = second_supervisor
+        .as_mut()
+        .map(|child| matches!(child.try_wait(), Ok(Some(_))))
+        .unwrap_or(false);
+    let second_died = second_refused
+        && second_exited
+        && (dup_out.contains("project:") || dup_err.contains("already listening"));
+    checks.push(Check {
+        name: "a-second-supervisor-process-cannot-steal-a-live-socket",
+        passed: second_died,
+        detail: format!(
+            "a second supervisor process was launched on the LIVE socket; it exited instead of taking over (exited: {second_exited}); the original supervisor still answers (sup-status exit {dup_code})",
+        ),
+    });
+    if let Some(mut child) = second_supervisor.take() {
+        let _ = child.kill().await;
+    }
+
     // ---- DoD #1 (real session): the TUI renders the LIVE supervisor -----
     let (tui_code, tui_out, tui_err) =
         run_capture(&bin, &["tui", "--socket", &socket, "--frames", "2"]).await;
@@ -184,6 +214,8 @@ pub async fn run() -> i32 {
             &socket,
             "--exit-after-events",
             "1",
+            "--deadline-seconds",
+            "30",
         ],
     )
     .await;

@@ -53,6 +53,11 @@ async fn main() {
         server_env,
         execd_run_as_init: true,
         max_timeout_seconds: max_timeout,
+        // The global environment budget lives HERE, in the create path:
+        // a client-side ledger only bounds the clients that know about it.
+        max_concurrent_environments: std::env::var("MAX_CONCURRENT_ENVIRONMENTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok()),
     };
     let service = std::sync::Arc::new(LifecycleService::new(adapter, config));
 

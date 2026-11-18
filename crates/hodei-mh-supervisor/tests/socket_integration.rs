@@ -103,3 +103,79 @@ async fn binding_over_a_stale_socket_file_succeeds() {
     drop(listener);
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn a_second_supervisor_cannot_steal_a_live_socket() {
+    let path = temp_socket_path("live");
+    let listener = server::bind(&path).await.expect("bind");
+    let core: Arc<Mutex<engine::SupervisorCore>> =
+        Arc::new(Mutex::new(engine::default_core("gc-fixture")));
+    let server_task = tokio::spawn(server::serve(listener, core.clone()));
+
+    // A second supervisor on the SAME socket must be refused: two live
+    // cores would split the state (the clients would disagree).
+    match server::bind(&path).await {
+        Err(server::ServerError::AlreadyRunning { path: p }) => assert_eq!(p, path),
+        Err(other) => panic!("expected AlreadyRunning, got {other}"),
+        Ok(_) => panic!("a second supervisor must not take a live socket"),
+    }
+
+    // The original supervisor is still the one serving.
+    let mut client = client::connect(&path).await.expect("connect");
+    let snapshot = client.snapshot().await.expect("snapshot");
+    assert_eq!(snapshot.project, "gc-fixture");
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_supervisor_may_restart_after_the_previous_one_crashed() {
+    let path = temp_socket_path("restart");
+    // A crashed supervisor leaves a socket file with nobody listening.
+    let listener = server::bind(&path).await.expect("bind");
+    let core: Arc<Mutex<engine::SupervisorCore>> =
+        Arc::new(Mutex::new(engine::default_core("first")));
+    let server_task = tokio::spawn(server::serve(listener, core));
+    server_task.abort();
+    // The socket file is still there; the listener is gone.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // A new supervisor takes it over (the old one is not alive).
+    let listener = server::bind(&path).await.expect("restart binds");
+    let core: Arc<Mutex<engine::SupervisorCore>> =
+        Arc::new(Mutex::new(engine::default_core("second")));
+    let server_task = tokio::spawn(server::serve(listener, core));
+    let mut client = client::connect(&path).await.expect("connect");
+    let snapshot = client.snapshot().await.expect("snapshot");
+    assert_eq!(snapshot.project, "second");
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_supervisor_only_removes_the_socket_it_owns() {
+    let path = temp_socket_path("owned");
+    let listener = server::bind(&path).await.expect("bind");
+    let ours = server::identity_of(std::path::Path::new(&path)).expect("identity");
+
+    // Somebody else replaced the file at the same path (a successor
+    // supervisor that already took the socket over).
+    std::fs::remove_file(&path).expect("unlink");
+    std::fs::write(&path, b"not our socket").expect("replace");
+    assert!(
+        !server::unlink_if_owned(std::path::Path::new(&path), ours),
+        "a file that is not ours must not be removed"
+    );
+    assert!(std::path::Path::new(&path).exists());
+
+    // Our own socket file IS removed.
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"stale").expect("recreate");
+    let listener = server::bind(&path).await.expect("bind");
+    let ours = server::identity_of(std::path::Path::new(&path)).expect("identity");
+    drop(listener);
+    assert!(server::unlink_if_owned(std::path::Path::new(&path), ours));
+    assert!(!std::path::Path::new(&path).exists());
+}

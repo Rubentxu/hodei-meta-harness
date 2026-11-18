@@ -322,6 +322,23 @@ pub fn expired_sandboxes(
         .collect()
 }
 
+/// Admission decision (pure): whether a NEW environment may be created
+/// given the live environments and the global slot budget.
+///
+/// The budget is enforced in the CREATE PATH of the server, not in a
+/// client: a client-side ledger only bounds the clients that know
+/// about it. `None` means "no limit configured".
+pub fn admit_creation(live_environments: usize, slot_budget: Option<usize>) -> Result<(), String> {
+    match slot_budget {
+        None => Ok(()),
+        Some(budget) if live_environments < budget => Ok(()),
+        Some(budget) => Err(format!(
+            "global environment budget exhausted: {live_environments} of {budget} slots in use; \
+             no environment is created and the caller must WAIT (no silent admission)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +440,17 @@ mod tests {
             targets,
             vec!["due-past".to_string(), "due-exactly".to_string()]
         );
+    }
+
+    #[test]
+    fn the_slot_budget_is_enforced_before_the_environment_exists() {
+        assert!(admit_creation(0, Some(2)).is_ok());
+        assert!(admit_creation(1, Some(2)).is_ok());
+        let refused = admit_creation(2, Some(2)).expect_err("the budget is exhausted");
+        assert!(refused.contains("budget exhausted"), "{refused}");
+        assert!(refused.contains("WAIT"), "{refused}");
+        // No budget configured: every creation is admitted.
+        assert!(admit_creation(999, None).is_ok());
     }
 
     #[test]
