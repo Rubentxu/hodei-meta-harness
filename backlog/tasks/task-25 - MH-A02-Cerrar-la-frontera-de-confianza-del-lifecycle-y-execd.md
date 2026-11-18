@@ -1,11 +1,11 @@
 ---
 id: TASK-25
 title: '[MH-A02] Cerrar la frontera de confianza del lifecycle y execd'
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-18T11:49:00Z'
-updated_date: '2026-11-18T18:53:00Z'
+updated_date: '2026-11-18T21:38:00Z'
 labels:
   - audit-v0.2
   - security
@@ -31,10 +31,10 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Las peticiones no autorizadas no crean, enumeran, ejecutan ni eliminan entornos; puertos no expuestos a LAN por defecto.
-- [ ] #2 Desde un sandbox se bloquea acceso directo no autorizado (IPv4, IPv6 cuando disponible, DNS y host); proxy permitido funciona.
-- [ ] #3 Configuración insegura, política desconocida o límites obligatorios ausentes fallan antes de ejecutar el agente.
-- [ ] #4 Una prueba real negativa y positiva en backend soportado; no registrar credenciales.
+- [x] #1 Las peticiones no autorizadas no crean, enumeran, ejecutan ni eliminan entornos; puertos no expuestos a LAN por defecto.
+- [x] #2 Desde un sandbox se bloquea acceso directo no autorizado (IPv4, IPv6 cuando disponible, DNS y host); proxy permitido funciona.
+- [x] #3 Configuración insegura, política desconocida o límites obligatorios ausentes fallan antes de ejecutar el agente.
+- [x] #4 Una prueba real negativa y positiva en backend soportado; no registrar credenciales.
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -113,4 +113,28 @@ Defect found by the independent risk review and FIXED before closing: the enviro
 Verification: cargo test --workspace green (the Docker-only test also passes when run explicitly with -- --ignored), cargo fmt --check clean, cargo clippy --all-targets clean, 12/12 proxy tests, and the full lane (release, supervisor, profile, multiproject, verify, trust) PASS with sandboxes=0 containers=0 networks=0 on a clean host, run twice in a row. The boundary is documented in docs/profiles.md.
 
 LIMITES CONOCIDOS de la frontera entregada (documentados, no resueltos en esta tarea, con su destino): (1) el presupuesto global de entornos cuenta y reserva sin atomicidad: dos altas simultaneas pueden admitir mas de lo que el presupuesto permite — pertenece a TASK-27 (MH-A04); (2) la descarga de imagenes (docker pull) ocurre en el HOST, fuera del proxy restringido: el host es de confianza, pero es una ruta de egreso que conviene decidir; (3) el listener del plano de control no acota el tamano del cuerpo ni fija un timeout de lectura por peticion; (4) la validacion de direcciones globales del proxy tiene un borde con los prefijos NAT64; (5) el contrato de entorno del execd vive en la imagen opensandbox/execd:v1.1.0, que NO esta en el repositorio: no se puede probar que variables honra, asi que la reserva de los namespaces EXECD_/OPENSANDBOX_ cierra lo que el codigo ve y no lo que el execd haga con variables que nadie conoce.
+
+Frontier hardening in this cycle. The subnet Docker allocated is read back and verified against the pool the operator declares (SANDBOX_ADDRESS_POOL, default 172.16.0.0/12, the same range the trusted proxy accepts clients from): a subnet outside it is refused, and SANDBOX_NETWORK/SANDBOX_SUBNET are refused outright because the networks are per sandbox. The image is inspected and refused when it declares the EXECD_/OPENSANDBOX_ namespace, because the daemon merges the environment of the image with the one of the container; the names are compared over bytes, so a name that is not ASCII cannot stop the server (regression test). The credential read back from the container is compared with the one this server minted, and a foreign one is refused instead of delivered.
+
+The network of a creation is now OWNED by that creation: a guard removes it when the creation fails, is cancelled or is abandoned, which closes the leak of a bridge nobody owned (the lane had caught one). The rollback reports its failures instead of discarding them, every retry of a removal makes sure the trusted proxy is really detached (that endpoint is what the daemon refuses the removal for), the release of a sandbox is logged with what it removed, and the orphan sweep drops from ten minutes to two. Shortening that margin made an assumption load-bearing, so the creations in flight are now RECORDED and the sweep never takes the network of one of them: the age of a network says nothing about how long the creation takes. The relay bounds the life of a connection (2 hours) and reports its refusals by kind, never with the output of the daemon.
+
+The trust probe now measures the egress over UDP (P23), reports a check it could not measure as NOT_MEASURED (which FAILS the probe, because the absence of evidence is not evidence), verifies the credential against the REAL execd (401 for the token the caller chose, 2xx for the one the server minted) and the identity from inside the sandbox, and finds the environments it could not name by the marker it left in their metadata. The lane reports the residue as the difference it caused, not as the state of the host.
+
+Verification: cargo test --workspace green (64 lifecycle-server, 41 hodei-mh and the rest of the crates; the two Docker-only tests pass when run with -- --ignored), cargo fmt --all --check clean, cargo clippy --all-targets clean, scripts/fast-check.sh --all PASS, and the lane (scripts/probes.sh --rounds 2) PASS with sandboxes=0 containers=0 networks=0, repeated with the final code.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+The control plane and the execution plane are separated by a boundary that is enforced and MEASURED against real Docker (29.1.3).
+
+Each sandbox lives in its own internal bridge (internal=true, IPv6 off, gateway_mode_ipv4=isolated) whose subnet Docker allocates and the server verifies against the pool the operator declares (SANDBOX_ADDRESS_POOL, default 172.16.0.0/12). The only way out is the operator's restricted egress proxy, attached by immutable container id under the alias hodei-proxy. The execd listens on 0.0.0.0 of that bridge, so the topology is not the barrier: the barrier is the per-sandbox credential, minted by the server, injected in the container, read back by exact name, compared with the one minted and delivered only in the endpoint contract. A request may not write into the EXECD_/OPENSANDBOX_ namespaces, and neither may the image. Without a control token, with an unknown policy, a malformed pool or missing limits, the server does not start.
+
+The creation owns its network: a creation that fails, is cancelled or is abandoned takes its bridge with it, the creations in flight are recorded so the sweep never takes their bridge away, the rollback and every retry report what they could not remove, and the orphan sweep is down to two minutes. The relay bounds the life of a connection and reports its refusals by kind.
+
+hodei-mh trust-probe measures 23 properties from the host and from inside two real sandboxes: unauthorized list/create/inspect/resolve/delete are refused with no side effect, the endpoint is loopback-only and does not move with a foreign Host header, the execd refuses a missing, wrong or foreign credential even from inside the sandbox, and from inside there is no default route, no global IPv6, no external resolution, no route to the host, to the internet, to an IPv6 destination or to another sandbox, while the authorized proxy works and refuses plain HTTP. A check that could not be measured is reported NOT_MEASURED and FAILS the probe; the report carries no credential and the environments it creates are deleted, including the one whose identifier it never received.
+
+Verified: cargo test --workspace green (including both Docker-only tests), cargo fmt and clippy clean, fast-check --all PASS, and the probe lane PASS with sandboxes=0 containers=0 networks=0, repeated with the final code. The boundary is documented in docs/profiles.md.
+
+Open limits (documented, with their destination): the global environment budget is not atomic (TASK-27), the image pull happens on the host outside the restricted proxy, the control listener does not bound the body size nor a read timeout, and the execd's own environment contract lives in an image that is not in this repository.
+<!-- SECTION:FINAL_SUMMARY:END -->
