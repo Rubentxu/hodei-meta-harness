@@ -17,9 +17,11 @@
 #
 # PREREQUISITES. The lane states what it needs and refuses to run without
 # it, with the reason: the official Backlog.md CLI (the probes use the real
-# tracker), Docker, and a restricted egress proxy (the profiles' gate
-# refuses to build without one, and it does not fall back). A missing
-# prerequisite fails the lane; it never degrades it in silence.
+# tracker), Docker, a restricted egress proxy (the profiles' gate refuses
+# to build without one, and it does not fall back), and the images of the
+# profiles (the doctor is read-only and refuses an image that is not
+# already in the local daemon). A missing prerequisite fails the lane; it
+# never degrades it in silence.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +45,12 @@ PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 # the lane needs the CLI, not a particular build of it.
 BACKLOG_CLI_VERSION="${BACKLOG_CLI_VERSION:-1.55.3}"
 
+# The images the probes need in the local daemon. The doctor is read-only:
+# it never pulls, and it refuses an image that is not already there, so
+# the lane pulls what is missing before the probes and says what it did.
+# The pinned profiles are in docs/profiles.md.
+PROBE_IMAGES="${PROBE_IMAGES:-rust:1-bookworm opensandbox/code-interpreter:v1.1.0}"
+
 # Preflight only: check the prerequisites and report, without running a
 # probe and without starting the control plane.
 PREFLIGHT=0
@@ -53,7 +61,7 @@ while [ $# -gt 0 ]; do
     --probe) PROBES="${2:-}"; shift 2 ;;
     --port) PORT="${2:-8081}"; shift 2 ;;
     --preflight) PREFLIGHT=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -109,6 +117,24 @@ require_docker_gateway() {
   [ "$gateway" = "$PROXY_HOST" ] || die \
     "the docker bridge gateway is $gateway but the probes reach the proxy at $PROXY_HOST: the sandbox would not find the proxy"
   say "   docker bridge gateway: $gateway"
+}
+
+# The images the probes need: the doctor refuses an image that is not in
+# the local daemon, and it never pulls one itself.
+require_images() {
+  local image log
+  for image in $PROBE_IMAGES; do
+    if docker image inspect "$image" >/dev/null 2>&1; then
+      say "   image present: $image"
+      continue
+    fi
+    say "   pulling the image the probes need: $image"
+    log="$OUT/pull-$(printf '%s' "$image" | tr ':/' '--').log"
+    if ! docker pull "$image" > "$log" 2>&1; then
+      cat "$log" >&2
+      die "the image $image is not present locally and could not be pulled"
+    fi
+  done
 }
 
 # The restricted egress proxy. One already answering is reused; otherwise
@@ -178,6 +204,7 @@ trap cleanup EXIT
 say "── the probe prerequisites"
 require_backlog_cli
 require_docker_gateway
+require_images
 if tcp_reachable "$PROXY_HOST" "$PROXY_PORT"; then
   say "   restricted egress proxy reachable at $PROXY_URL"
 else
