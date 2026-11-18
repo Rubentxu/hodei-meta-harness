@@ -18,7 +18,9 @@ mod budget_probe;
 mod custom_goal_probe;
 mod goal_probe;
 mod interact_probe;
+mod multiproject_probe;
 mod oneshot_debug;
+mod package;
 mod probe_util;
 mod profile_probe;
 mod profile_run;
@@ -93,6 +95,14 @@ async fn main() {
         }
         Some("profile-run") => {
             let code = profile_run::run_profile(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("package") => {
+            let code = package::run_package(&args[1..]).await;
+            std::process::exit(code);
+        }
+        Some("multiproject-probe") => {
+            let code = multiproject_probe::run(&args[1..]).await;
             std::process::exit(code);
         }
         Some("profile-probe") => {
