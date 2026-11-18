@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::model::{CreateSandboxRequest, PlatformSpec, error_codes};
 
@@ -18,6 +20,16 @@ pub const LABEL_PLATFORM_ARCH: &str = "opensandbox.io/platform-arch";
 pub const LABEL_METADATA_KEYS: &str = "opensandbox.io/metadata-keys";
 pub const LABEL_EXECD_HOST_PORT: &str = "opensandbox.io/embedding-proxy-port";
 pub const LABEL_HTTP_HOST_PORT: &str = "opensandbox.io/http-port";
+
+/// The label that carries the creation key of an environment.
+///
+/// The key is the idempotency key of the creation: it is written where the
+/// daemon can be asked about it, so a server that restarts still knows
+/// which environments came from which intent.
+pub const LABEL_CREATION_KEY: &str = "hodei.io/creation-key";
+/// The label that carries the fingerprint of the body the creation key was
+/// used with: the same key with another body is a conflict, not a repeat.
+pub const LABEL_CREATION_FINGERPRINT: &str = "hodei.io/creation-fingerprint";
 
 /// Container-internal ports exposed by every sandbox (docker_service.py).
 pub const EXECD_CONTAINER_PORT: &str = "44772/tcp";
@@ -134,16 +146,28 @@ pub fn validate_create_request(
         ));
     }
     if let Some(timeout) = req.timeout {
-        if timeout < 0 {
+        if timeout <= 0 {
             return Err(validation_error(
                 error_codes::INVALID_PARAMETER,
-                format!("timeout must be a non-negative number of seconds, got {timeout}"),
+                format!(
+                    "timeout must be a positive number of seconds, got {timeout}; \
+                     omit it to create an environment without expiration"
+                ),
             ));
         }
         if timeout > max_timeout_seconds {
             return Err(validation_error(
                 error_codes::INVALID_PARAMETER,
                 format!("timeout {timeout}s exceeds the server maximum of {max_timeout_seconds}s"),
+            ));
+        }
+        // The expiry is computed with the timeout: a value that does not
+        // fit in a duration is refused HERE, not when the environment is
+        // already being created.
+        if chrono::Duration::try_seconds(timeout).is_none() {
+            return Err(validation_error(
+                error_codes::INVALID_PARAMETER,
+                format!("timeout {timeout}s is out of range"),
             ));
         }
     }
@@ -185,6 +209,17 @@ pub fn build_labels(
         LABEL_CREATED_AT.to_string(),
         created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
     );
+    // The creation key travels with the environment: the daemon is where
+    // a restarted server looks for the intents it already served.
+    // The key is the TRIMMED one: it is the key the registry of a running
+    // server uses, and the one a restarted server must find again.
+    if let Some(key) = request.creation_key.as_deref().map(str::trim) {
+        labels.insert(LABEL_CREATION_KEY.to_string(), key.to_string());
+        labels.insert(
+            LABEL_CREATION_FINGERPRINT.to_string(),
+            creation_fingerprint(request),
+        );
+    }
     if let Some(p) = platform {
         labels.insert(LABEL_PLATFORM_OS.to_string(), p.os.clone());
         labels.insert(LABEL_PLATFORM_ARCH.to_string(), p.arch.clone());
@@ -314,6 +349,10 @@ pub fn token_from_env(env: Vec<String>) -> Option<String> {
 }
 
 /// Parse a Docker-style memory limit ("2Gi", "512Mi", "262144000", plain bytes).
+///
+/// Only a FINITE, positive and representable limit is a limit: a value
+/// that overflows, that is not a number or that is not finite is refused
+/// instead of being clamped to a number nobody asked for.
 pub fn parse_memory_limit(raw: &str) -> Result<i64, ValidationError> {
     let s = raw.trim();
     if s.is_empty() {
@@ -330,11 +369,14 @@ pub fn parse_memory_limit(raw: &str) -> Result<i64, ValidationError> {
     for (suffix, mult) in units {
         if let Some(num) = s.strip_suffix(suffix) {
             let value: f64 = num.trim().parse().map_err(|_| bad_memory(raw))?;
-            let bytes = (value * mult as f64) as i64;
-            if bytes <= 0 {
+            if !value.is_finite() || value <= 0.0 {
                 return Err(bad_memory(raw));
             }
-            return Ok(bytes);
+            let bytes = value * mult as f64;
+            if !bytes.is_finite() || bytes < 1.0 || bytes > i64::MAX as f64 {
+                return Err(bad_memory(raw));
+            }
+            return Ok(bytes as i64);
         }
     }
     let bytes: i64 = s.parse().map_err(|_| bad_memory(raw))?;
@@ -435,25 +477,63 @@ pub fn expired_sandboxes(
         .collect()
 }
 
-/// Admission decision (pure): whether a NEW environment may be created
-/// given the live environments and the global slot budget.
+/// The intent of a creation: what the request asks for, WITHOUT the
+/// creation key.
 ///
-/// The budget is enforced in the CREATE PATH of the server, not in a
-/// client: a client-side ledger only bounds the clients that know
-/// about it. `None` means "no limit configured".
-///
-/// The rule itself (the free slots are `budget - live`) lives in
-/// `hodei-mh-budget`, so the server and the clients that predict its
-/// behaviour cannot drift apart.
-pub fn admit_creation(live_environments: usize, slot_budget: Option<usize>) -> Result<(), String> {
-    match slot_budget {
-        None => Ok(()),
-        Some(budget) if budget::ledger::admissible_creates(live_environments, budget) > 0 => Ok(()),
-        Some(budget) => Err(format!(
-            "global environment budget exhausted: {live_environments} of {budget} slots in use; \
-             no environment is created and the caller must WAIT (no silent admission)"
-        )),
+/// The key identifies the intent; the intent itself is what has to match
+/// for two requests to be the same creation. The credentials of the
+/// image are not part of it: a rotated credential is not another intent.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CreationIntent {
+    pub image: String,
+    pub entrypoint: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
+    pub timeout: Option<i64>,
+    pub memory: Option<String>,
+    pub cpu: Option<String>,
+    pub platform: Option<(String, String)>,
+}
+
+/// The intent a request expresses.
+pub fn creation_intent(req: &CreateSandboxRequest) -> CreationIntent {
+    CreationIntent {
+        image: req
+            .image
+            .as_ref()
+            .map(|image| image.uri.clone())
+            .unwrap_or_default(),
+        entrypoint: req.entrypoint.clone().unwrap_or_default(),
+        env: req.env.clone().unwrap_or_default(),
+        metadata: req.metadata.clone().unwrap_or_default(),
+        timeout: req.timeout,
+        memory: req
+            .resource_limits
+            .as_ref()
+            .and_then(|limits| limits.memory.clone()),
+        cpu: req
+            .resource_limits
+            .as_ref()
+            .and_then(|limits| limits.cpu.clone()),
+        platform: req
+            .platform
+            .as_ref()
+            .map(|platform| (platform.os.clone(), platform.arch.clone())),
     }
+}
+
+/// The fingerprint of a creation intent.
+///
+/// It is the digest of the CANONICAL form of the intent: the same intent
+/// always produces the same fingerprint, and two different intents never
+/// produce the same one. The digest is what the server keeps: the body
+/// itself never leaves the request.
+pub fn creation_fingerprint(req: &CreateSandboxRequest) -> String {
+    let canonical =
+        serde_json::to_vec(&creation_intent(req)).expect("an intent of owned data serializes");
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -557,17 +637,6 @@ mod tests {
             targets,
             vec!["due-past".to_string(), "due-exactly".to_string()]
         );
-    }
-
-    #[test]
-    fn the_slot_budget_is_enforced_before_the_environment_exists() {
-        assert!(admit_creation(0, Some(2)).is_ok());
-        assert!(admit_creation(1, Some(2)).is_ok());
-        let refused = admit_creation(2, Some(2)).expect_err("the budget is exhausted");
-        assert!(refused.contains("budget exhausted"), "{refused}");
-        assert!(refused.contains("WAIT"), "{refused}");
-        // No budget configured: every creation is admitted.
-        assert!(admit_creation(999, None).is_ok());
     }
 
     #[test]
@@ -794,6 +863,182 @@ mod tests {
         assert!(parse_cpu_nano_cpus("NaN").is_err());
         assert!(parse_cpu_nano_cpus("0.00000000001").is_err());
         assert!(parse_cpu_nano_cpus("inf").is_err());
+    }
+
+    #[test]
+    fn the_memory_parser_refuses_what_is_not_a_finite_representable_limit() {
+        for raw in [
+            "NaN",
+            "NaNMi",
+            "inf",
+            "infGi",
+            "-infMi",
+            "0",
+            "0Mi",
+            "0.0Gi",
+            "-1Gi",
+            "1e400Gi",
+            // Does not fit in an i64, plain or after the multiplication.
+            "9223372036854775808",
+            "99999999999999999999",
+            "9999999999Ti",
+            "1e30Mi",
+        ] {
+            assert!(
+                parse_memory_limit(raw).is_err(),
+                "{raw:?} must be refused, not clamped"
+            );
+        }
+        // The largest value that fits is still a value.
+        assert_eq!(parse_memory_limit("9223372036854775807").unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn the_cpu_parser_refuses_what_is_not_a_finite_representable_limit() {
+        for raw in [
+            "NaN",
+            "inf",
+            "-inf",
+            "-1",
+            "0",
+            "0.0",
+            "1e300",
+            "9300000000",
+            "0.0000000001",
+            "",
+            " ",
+        ] {
+            assert!(
+                parse_cpu_nano_cpus(raw).is_err(),
+                "{raw:?} must be refused, not clamped"
+            );
+        }
+        assert_eq!(parse_cpu_nano_cpus(" 2 ").unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn a_request_with_a_bad_limit_is_refused_before_it_is_resolved() {
+        let mut r = req();
+        r.resource_limits = Some(crate::model::ResourceLimits {
+            memory: Some("NaNGi".to_string()),
+            cpu: None,
+        });
+        assert_eq!(
+            resolve_resource_limits(&r).unwrap_err().code,
+            error_codes::INVALID_PARAMETER
+        );
+        r.resource_limits = Some(crate::model::ResourceLimits {
+            memory: None,
+            cpu: Some("inf".to_string()),
+        });
+        assert_eq!(
+            resolve_resource_limits(&r).unwrap_err().code,
+            error_codes::INVALID_PARAMETER
+        );
+    }
+
+    #[test]
+    fn a_timeout_of_zero_or_one_that_cannot_be_represented_is_refused() {
+        let mut r = req();
+        for timeout in [0, -1, i64::MIN, i64::MAX] {
+            r.timeout = Some(timeout);
+            let err = validate_create_request(&r, i64::MAX).unwrap_err();
+            assert_eq!(err.code, error_codes::INVALID_PARAMETER, "{timeout}");
+        }
+    }
+
+    #[test]
+    fn the_same_intent_has_the_same_fingerprint_whatever_the_key() {
+        let a = req();
+        let mut b = req();
+        b.creation_key = Some("another-key".to_string());
+        // The key identifies the intent; it is not part of it.
+        assert_eq!(creation_fingerprint(&a), creation_fingerprint(&b));
+        // The credentials of the image are not an intent either.
+        let mut c = req();
+        c.image.as_mut().unwrap().auth = Some(crate::model::ImageAuth {
+            username: "u".to_string(),
+            password: "rotated".to_string(),
+        });
+        assert_eq!(creation_fingerprint(&a), creation_fingerprint(&c));
+        assert_eq!(creation_fingerprint(&a).len(), 64);
+    }
+
+    #[test]
+    fn a_different_intent_has_a_different_fingerprint() {
+        let base = creation_fingerprint(&req());
+        let variants: Vec<(&str, CreateSandboxRequest)> = vec![
+            ("image", {
+                let mut r = req();
+                r.image.as_mut().unwrap().uri = "img:2".to_string();
+                r
+            }),
+            ("entrypoint", {
+                let mut r = req();
+                r.entrypoint = Some(vec!["sleep".to_string(), "1".to_string()]);
+                r
+            }),
+            ("env", {
+                let mut r = req();
+                r.env = Some(BTreeMap::from([("A".to_string(), "1".to_string())]));
+                r
+            }),
+            ("metadata", {
+                let mut r = req();
+                r.metadata = Some(BTreeMap::from([("team".to_string(), "x".to_string())]));
+                r
+            }),
+            ("timeout", {
+                let mut r = req();
+                r.timeout = Some(60);
+                r
+            }),
+            ("memory", {
+                let mut r = req();
+                r.resource_limits = Some(crate::model::ResourceLimits {
+                    memory: Some("1Gi".to_string()),
+                    cpu: None,
+                });
+                r
+            }),
+            ("cpu", {
+                let mut r = req();
+                r.resource_limits = Some(crate::model::ResourceLimits {
+                    memory: None,
+                    cpu: Some("2".to_string()),
+                });
+                r
+            }),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base]);
+        for (what, variant) in &variants {
+            assert!(
+                seen.insert(creation_fingerprint(variant)),
+                "a different {what} must be a different intent"
+            );
+        }
+    }
+
+    #[test]
+    fn the_labels_carry_the_creation_key_and_its_fingerprint() {
+        let mut r = req();
+        r.creation_key = Some("creation-7".to_string());
+        let created = Utc.with_ymd_and_hms(2026, 11, 17, 10, 0, 0).unwrap();
+        let labels = build_labels("sbx3", &r, created, None, None);
+        assert_eq!(labels[LABEL_CREATION_KEY], "creation-7");
+        assert_eq!(
+            labels[LABEL_CREATION_FINGERPRINT],
+            creation_fingerprint(&r),
+            "what survives a restart is what a retry is compared with"
+        );
+        // The label carries the key the registry uses, not the padding.
+        r.creation_key = Some("  creation-7 ".to_string());
+        let labels = build_labels("sbx3", &r, created, None, None);
+        assert_eq!(labels[LABEL_CREATION_KEY], "creation-7");
+        // Without a key the environment carries no intent.
+        let labels = build_labels("sbx4", &req(), created, None, None);
+        assert!(!labels.contains_key(LABEL_CREATION_KEY));
+        assert!(!labels.contains_key(LABEL_CREATION_FINGERPRINT));
     }
 
     #[test]

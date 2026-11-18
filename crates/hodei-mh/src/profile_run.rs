@@ -333,6 +333,9 @@ pub async fn run_profile(args: &[String]) -> i32 {
             "entrypoint": ["sleep", "infinity"],
             "timeout": 1200,
             "resourceLimits": {"cpu": requested_cpu, "memory": requested_memory},
+            // The request tag is the creation key: the server answers a
+            // repeat with the same sandbox instead of creating a second one.
+            "creationKey": request_tag,
             "metadata": metadata,
         }))
         .send()
@@ -395,6 +398,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
                     "entrypoint": ["sleep", "infinity"],
                     "timeout": 1200,
                     "resourceLimits": {"cpu": requested_cpu, "memory": requested_memory},
+                    "creationKey": request_tag,
                     "metadata": metadata,
                 }))
                 .send()

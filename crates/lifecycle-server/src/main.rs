@@ -49,6 +49,19 @@ fn limit_from_env(name: &str, default: i64) -> Result<i64, String> {
     }
 }
 
+/// Read an OPTIONAL limit from the environment: unset means "no limit".
+/// A malformed value is a refusal, not a default.
+fn optional_limit_from_env(name: &str) -> Result<Option<i64>, String> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("the limit {name}={raw:?} is not a number")),
+        Err(_) => Ok(None),
+    }
+}
+
 /// The trust boundary this server enforces, read from the environment.
 ///
 /// Every value that cannot be honoured stops the server BEFORE it
@@ -193,9 +206,38 @@ async fn main() {
         max_concurrent_environments: std::env::var("MAX_CONCURRENT_ENVIRONMENTS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok()),
-        trust,
+        // The aggregate budgets of the host: the memory and the CPU the
+        // environments may take, counted with the EFFECTIVE limits each
+        // one runs under.
+        max_total_memory_bytes: match optional_limit_from_env("SANDBOX_TOTAL_MEMORY_BYTES") {
+            Ok(limit) => limit,
+            Err(reason) => {
+                eprintln!("the lifecycle server refuses to start: {reason}");
+                std::process::exit(1);
+            }
+        },
+        max_total_nano_cpus: match optional_limit_from_env("SANDBOX_TOTAL_NANOCPUS") {
+            Ok(limit) => limit,
+            Err(reason) => {
+                eprintln!("the lifecycle server refuses to start: {reason}");
+                std::process::exit(1);
+            }
+        },
+        ..ServiceConfig::default()
     };
+    let config = ServiceConfig { trust, ..config };
     let service = std::sync::Arc::new(LifecycleService::new(adapter, config));
+
+    // The state of the host is RECONCILED before serving anything: the
+    // environments that already exist count against the budget, and a
+    // server that cannot read them does not serve.
+    if let Err(error) = service.reconcile().await {
+        eprintln!(
+            "the lifecycle server refuses to start: the environments of the host could not \
+             be read: {error}"
+        );
+        std::process::exit(1);
+    }
 
     // TTL reaper: the sweep interval bounds how long an expired sandbox can
     // outlive its contract (spec TASK-13: TTL is real, not decorative).

@@ -198,6 +198,106 @@ async fn count_sandboxes(server_url: &str) -> Option<usize> {
         .map(|items| items.len())
 }
 
+/// The body every create of the concurrent admission experiment sends.
+fn concurrent_body(key: &str) -> Value {
+    json!({
+        "image": {"uri": "rust:1-bookworm"},
+        "entrypoint": ["sleep", "infinity"],
+        "timeout": 300,
+        "creationKey": key,
+        "metadata": {"managed-by": "hodei-mh", "purpose": "concurrent-admission-probe"},
+    })
+}
+
+/// Fire `keys.len()` creates AT THE SAME TIME and return the status and the
+/// id (when there is one) each of them got.
+async fn create_concurrently(server_url: &str, keys: &[String]) -> Vec<(u16, Option<String>)> {
+    let attempts = keys.iter().map(|key| async move {
+        let client = ControlPlane::new(server_url);
+        match client
+            .post(ControlPlane::sandboxes_path())
+            .json(&concurrent_body(key))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body: Value = response.json().await.unwrap_or_default();
+                (status, body["id"].as_str().map(str::to_string))
+            }
+            Err(_) => (0, None),
+        }
+    });
+    futures_util::future::join_all(attempts).await
+}
+
+async fn delete_all(server_url: &str, ids: &[String]) {
+    let client = ControlPlane::new(server_url);
+    for id in ids {
+        let _ = client.delete(&ControlPlane::sandbox_path(id)).send().await;
+    }
+}
+
+/// The admission is ATOMIC against a real daemon: creates that arrive
+/// together are admitted up to the free slots and refused with 429 for the
+/// rest, and creates that carry the same key produce ONE sandbox.
+async fn concurrent_admission(server_url: &str) -> (bool, String) {
+    let Some(live) = count_sandboxes(server_url).await else {
+        return (
+            false,
+            "the number of environments alive could not be read: the free slots cannot be derived"
+                .into(),
+        );
+    };
+    let free = budget::ledger::admissible_creates(live, BUDGET_SLOTS);
+    if free == 0 {
+        return (
+            false,
+            format!("the host already carries {live} environment(s): no free slot to contend for"),
+        );
+    }
+    // Distinct keys, one more contender than there are slots, twice over.
+    let contenders = free + 3;
+    let keys: Vec<String> = (0..contenders)
+        .map(|n| format!("concurrent-admission-{}-{n}", std::process::id()))
+        .collect();
+    let outcomes = create_concurrently(server_url, &keys).await;
+    let admitted: Vec<String> = outcomes
+        .iter()
+        .filter(|(status, _)| (200..300).contains(status))
+        .filter_map(|(_, id)| id.clone())
+        .collect();
+    let refused = outcomes.iter().filter(|(status, _)| *status == 429).count();
+    let after_race = count_sandboxes(server_url).await;
+    delete_all(server_url, &admitted).await;
+
+    // One key, several simultaneous identical requests.
+    let key = format!("same-key-{}", std::process::id());
+    let same_outcomes = create_concurrently(server_url, &vec![key; 4]).await;
+    let same_ids: std::collections::BTreeSet<String> = same_outcomes
+        .iter()
+        .filter_map(|(_, id)| id.clone())
+        .collect();
+    let same_ok = same_outcomes
+        .iter()
+        .all(|(status, _)| (200..300).contains(status));
+    let after_same = count_sandboxes(server_url).await;
+    let same_list: Vec<String> = same_ids.iter().cloned().collect();
+    delete_all(server_url, &same_list).await;
+
+    let race_ok =
+        admitted.len() == free && refused == contenders - free && after_race == Some(live + free);
+    let key_ok = same_ok && same_ids.len() == 1 && after_same == Some(live + 1);
+    (
+        race_ok && key_ok,
+        format!(
+            "{contenders} creates fired together against {free} free slot(s): {} admitted, {refused} refused with 429, {after_race:?} environment(s) alive afterwards (started with {live}); 4 simultaneous creates with ONE key got {} distinct sandbox id(s) (all answered: {same_ok}) and {after_same:?} environment(s) alive",
+            admitted.len(),
+            same_ids.len(),
+        ),
+    )
+}
+
 async fn wait_supervisor(bin: &Path, socket: &str) -> bool {
     for _ in 0..20 {
         if supervisor_alive(bin, socket).await {
@@ -590,6 +690,11 @@ pub async fn run(args: &[String]) -> i32 {
             .send()
             .await;
     }
+    let concurrent = if budget_ready {
+        concurrent_admission(&budget_server).await
+    } else {
+        (false, "the budget server never became ready".into())
+    };
     if let Some(mut child) = budget_child.take() {
         let _ = child.kill().await;
     }
@@ -612,6 +717,11 @@ pub async fn run(args: &[String]) -> i32 {
         name: "the-global-budget-is-enforced-by-the-server-create-path",
         passed: budget_enforced,
         detail,
+    });
+    steps.push(Step {
+        name: "concurrent-creates-are-admitted-atomically-and-one-key-is-one-sandbox",
+        passed: concurrent.0,
+        detail: concurrent.1,
     });
 
     // ---- Supervisors: one socket per project ---------------------------
