@@ -108,6 +108,17 @@ Behavior:
   `build_executed_on_host: false` — there is no native execution path.
 - Creates a sandbox with the PINNED image and the REQUESTED limits, then
   reports the OBSERVED limits from inside (cgroups).
+- Waits (BOUNDED, 60 s) for the sandbox's `execd` to start answering
+  before running anything: a fresh sandbox publishes its port before the
+  server inside can answer, and the first attempts are REFUSED. Without
+  that wait a booting sandbox is recorded as a failed command. The wait
+  uses a harmless probe, so the real command runs EXACTLY ONCE — a
+  command that ran and failed is never repeated. A sandbox that never
+  becomes usable is a failure (exit 1), not an endless wait.
+- The output of every command is drained completely: the execd flushes
+  the PTY buffer AFTER the exit frame, so a short window is kept open
+  after it. Without that, a short command can lose its whole output and
+  the record would carry a measurement that never happened.
 - The create carries a `request-tag`. If the response is lost, the effect
   is RECONCILED by that tag before any retry: an existing sandbox is
   adopted, never duplicated. A failed tag search ABORTS the run (it never

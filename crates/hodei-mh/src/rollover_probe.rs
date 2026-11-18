@@ -194,6 +194,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
         Err(_) => String::new(),
     };
     let execd_base = format!("http://{ep}");
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    crate::probe_util::wait_for_execd(&execd_base).await;
     let encoded = base64::engine::general_purpose::STANDARD.encode(MOCK_AGENT_JS);
     let _ = crate::probe_util::run_command_session_with_output(
         &execd_base,

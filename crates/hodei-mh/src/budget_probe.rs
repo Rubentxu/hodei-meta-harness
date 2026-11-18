@@ -132,8 +132,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
         Err(_) => String::new(),
     };
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    crate::probe_util::wait_for_execd(&execd).await;
     // Effective limits as the WORKLOAD sees them (cgroup v2 values).
-    let limits = opensandbox::execd::oneshot::run(
+    let limits = crate::probe_util::run_in_sandbox(
         &execd,
         "echo cpu=$(cat /sys/fs/cgroup/cpu.max) mem=$(cat /sys/fs/cgroup/memory.max)",
         Duration::from_secs(30),
@@ -164,7 +167,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     // Measured workload under the limit, then CANCELLED (DoD).
-    let workload = opensandbox::execd::oneshot::run(
+    let workload = crate::probe_util::run_in_sandbox(
         &execd,
         "dd if=/dev/zero of=/dev/null bs=1M count=200000 & WPID=$!; sleep 1; cat /sys/fs/cgroup/cpu.stat | head -2; kill $WPID; echo workload-cancelled",
         Duration::from_secs(30),

@@ -39,7 +39,31 @@ use std::time::{Duration, Instant};
 
 use opensandbox::execd::api::{self, CreateSessionRequest};
 use opensandbox::execd::frames::ServerEvent;
+use opensandbox::execd::oneshot::OneshotOutcome;
 use opensandbox::execd::pipe::{self, AttachOptions};
+
+/// Bounded wait for a freshly created sandbox's execd to accept
+/// sessions. The port is published before the server inside answers.
+pub const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Run a command in a sandbox that may still be booting.
+///
+/// The readiness wait uses a harmless probe, so the command runs
+/// EXACTLY ONCE. Without it, the first attempts are refused by the
+/// execd and the command is recorded as if it had failed.
+pub async fn run_in_sandbox(execd_base: &str, command: &str, timeout: Duration) -> OneshotOutcome {
+    opensandbox::execd::oneshot::run_when_ready(execd_base, command, timeout, EXECD_READY_TIMEOUT)
+        .await
+}
+
+/// Wait (BOUNDED) until the execd of a freshly created sandbox answers.
+///
+/// The port is published before the server inside can accept sessions:
+/// without this wait, an upload or a session creation right after the
+/// create fails for a reason that has nothing to do with the work.
+pub async fn wait_for_execd(execd_base: &str) -> bool {
+    opensandbox::execd::oneshot::wait_until_ready(execd_base, EXECD_READY_TIMEOUT).await
+}
 
 /// execd endpoints resolve as `http://host:port`; the pipe WebSocket reuses
 /// the same authority under the `ws` scheme.

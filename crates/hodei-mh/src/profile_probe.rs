@@ -96,6 +96,21 @@ async fn list_sandbox_ids() -> Vec<String> {
     ids
 }
 
+/// The facts of a check, as they are: a failure must be DIAGNOSTICABLE
+/// from the report, never a static sentence that hides what failed.
+fn missing_facts(
+    conditions: &[(bool, &str)],
+    observed_limits: &serde_json::Value,
+    image_digest: &serde_json::Value,
+) -> String {
+    let missing: Vec<&str> = conditions
+        .iter()
+        .filter(|(ok, _)| !ok)
+        .map(|(_, label)| *label)
+        .collect();
+    format!("missing={missing:?}; observed_limits={observed_limits}; image_digest={image_digest}")
+}
+
 pub async fn run(_args: &[String]) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
@@ -213,7 +228,25 @@ pub async fn run(_args: &[String]) -> i32 {
         name: "rust-profile-real-build-with-limits-and-pin",
         passed: rust_ok,
         detail: format!(
-            "exit {rust_code}; registry dependency fetched through the restricted-egress proxy, cargo build+run succeeded, requested limits (cpu=1 memory=1Gi) observed as cpu.max=100000 100000 memory.max=1073741824; stderr: {}",
+            "exit {rust_code}; {}; stderr: {}",
+            missing_facts(
+                &[
+                    (rust_code == 0, "exit code"),
+                    (rust_record["all_succeeded"] == true, "all_succeeded"),
+                    (rust_out.contains("rust-build-ok"), "the build output"),
+                    (rust_out.contains("cpu=100000 100000"), "the observed cpu limits"),
+                    (rust_out.contains("mem=1073741824"), "the observed memory limit"),
+                    (
+                        rust_out.contains(
+                            "sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea"
+                        ),
+                        "the pinned digest",
+                    ),
+                    (rust_out.contains("cargo build"), "the build command"),
+                ],
+                &rust_record["observed_limits"],
+                &rust_record["image_digest_observed"],
+            ),
             rust_err.trim().chars().take(150).collect::<String>()
         ),
     });
@@ -245,7 +278,23 @@ pub async fn run(_args: &[String]) -> i32 {
         name: "jvm-profile-real-build-with-limits-and-pin",
         passed: jvm_ok,
         detail: format!(
-            "exit {jvm_code}; javac compiled Main+Util, java ran them, limits observed from inside; pin digest recorded; record tail: {}",
+            "exit {jvm_code}; {}; record tail: {}",
+            missing_facts(
+                &[
+                    (jvm_code == 0, "exit code"),
+                    (jvm_record["all_succeeded"] == true, "all_succeeded"),
+                    (jvm_out.contains("jvm-build-ok from-util"), "the build output"),
+                    (jvm_out.contains("javac"), "the compiler command"),
+                    (
+                        jvm_out.contains(
+                            "sha256:133a3c1720dd52291a019740c2987e7164ea6de79e23d8198798e58950ae2e6e"
+                        ),
+                        "the pinned digest",
+                    ),
+                ],
+                &jvm_record["observed_limits"],
+                &jvm_record["image_digest_observed"],
+            ),
             jvm_out.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>()
         ),
     });

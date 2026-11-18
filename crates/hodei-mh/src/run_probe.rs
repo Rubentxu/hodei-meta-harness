@@ -401,5 +401,9 @@ async fn resolve_execd(client: &reqwest::Client, server: &str, sid: &str) -> Opt
         .ok()?["endpoint"]
         .as_str()?
         .to_string();
-    Some(format!("http://{ep}"))
+    let execd = format!("http://{ep}");
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    crate::probe_util::wait_for_execd(&execd).await;
+    Some(execd)
 }
