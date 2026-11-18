@@ -115,6 +115,10 @@ Behavior:
   uses a harmless probe, so the real command runs EXACTLY ONCE — a
   command that ran and failed is never repeated. A sandbox that never
   becomes usable is a failure (exit 1), not an endless wait.
+- The output of every command is drained completely: the execd flushes
+  the PTY buffer AFTER the exit frame, so a short window is kept open
+  after it. Without that, a short command can lose its whole output and
+  the record would carry a measurement that never happened.
 - The create carries a `request-tag`. If the response is lost, the effect
   is RECONCILED by that tag before any retry: an existing sandbox is
   adopted, never duplicated. A failed tag search ABORTS the run (it never
