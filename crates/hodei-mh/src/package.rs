@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::elf;
+
 fn flag(args: &[String], name: &str, default: &str) -> String {
     args.iter()
         .position(|a| a == name)
@@ -32,6 +34,11 @@ Contents: `bin/hodei-mh` (control plane client + TUI + profiles),
 `docs/profiles.md` (pinned Rust/JVM profiles), `install.sh`.
 
 Install: `sh install.sh` (bins go to `~/.local/bin`).
+
+The binaries are STANDALONE: statically linked, with no dynamic loader,
+so they need no glibc, no libgcc and no other system library from the
+host. They run on any Linux x86_64 whose kernel is 3.2 or newer.
+
 Prerequisites: Docker, a networked host for image pulls, and the
 restricted-egress proxy for sandboxes (see docs/profiles.md).
 
@@ -59,20 +66,38 @@ fn stage(src: &Path, dest: &Path) -> bool {
 /// for them on the machine that compiled it: the path is resolved from
 /// the running executable, with the repository as an explicit fallback.
 fn resolve_release_dir(repo: &Path) -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        // Installed layout: <prefix>/bin/hodei-mh -> <prefix>/share/...
-        // Repo layout:   <repo>/target/debug/hodei-mh -> <repo>/target/release
-        if let Some(parent) = exe.parent() {
-            for candidate in [
-                parent.join("../lib/hodei-mh"),
-                parent.join("../target/release"),
-                parent.join("target/release"),
-            ] {
-                let resolved = candidate.canonicalize().unwrap_or(candidate.clone());
-                if resolved.join("hodei-mh").exists() {
-                    return resolved;
-                }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        // The binaries NEXT TO the running one are the pair it was
+        // built with — in the repo (target/<triple>/release) and in
+        // an installation (<prefix>/bin) alike. This is the rule
+        // that ships the SAME build that is running.
+        if parent.join("hodei-mh-lifecycle-server").exists() {
+            return parent.to_path_buf();
+        }
+        // Installed layout: <prefix>/bin/hodei-mh -> <prefix>/lib/hodei-mh
+        for candidate in [
+            parent.join("../lib/hodei-mh"),
+            parent.join("../target/x86_64-unknown-linux-gnu/release"),
+            parent.join("../target/release"),
+            parent.join("target/release"),
+        ] {
+            let resolved = candidate.canonicalize().unwrap_or(candidate.clone());
+            if resolved.join("hodei-mh").exists() {
+                return resolved;
             }
+        }
+    }
+    // Fallback for a checkout: the default build is explicitly
+    // targeted (see `.cargo/config.toml`), so the release binaries live
+    // under the triple directory.
+    for candidate in [
+        repo.join("target/x86_64-unknown-linux-gnu/release"),
+        repo.join("target/release"),
+    ] {
+        if candidate.join("hodei-mh-lifecycle-server").exists() {
+            return candidate;
         }
     }
     repo.join("target/release")
@@ -119,6 +144,23 @@ pub async fn run_package(args: &[String]) -> i32 {
                 return 1;
             }
         }
+    }
+
+    // The distribution must be STANDALONE: a binary that needs a
+    // dynamic loader also needs the host's glibc, libgcc and friends,
+    // which makes it unusable on a distro older than the build host.
+    // The linkage is READ from the binaries, never assumed.
+    let standalone = bins.iter().all(|bin| elf::linkage_of(bin).is_standalone());
+    if !standalone {
+        let linked: Vec<String> = bins
+            .iter()
+            .map(|bin| format!("{}: {:?}", bin.display(), elf::linkage_of(bin)))
+            .collect();
+        eprintln!(
+            "refusing to package non-standalone binaries: {} — build them statically (cargo build --release with -C target-feature=+crt-static) or the bundle would need the host's glibc",
+            linked.join(", ")
+        );
+        return 1;
     }
 
     // Stage the bundle.
@@ -221,6 +263,10 @@ pub async fn run_package(args: &[String]) -> i32 {
                 // what they need.
                 "yolo_fallback": false,
                 "undemonstrated_dependencies": undemonstrated,
+                // MEASURED, not asserted: the binaries carry no
+                // dynamic loader, so the bundle needs no glibc, no
+                // libgcc and no other system library from the host.
+                "standalone_binaries": standalone,
             },
         })
     );
