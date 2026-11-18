@@ -18,7 +18,6 @@ use interact::response::validate;
 use opensandbox::acp::{self, AcpAssembler};
 use opensandbox::execd::api::{self, CreateSessionRequest};
 use opensandbox::execd::frames::ServerEvent;
-use opensandbox::execd::oneshot;
 use opensandbox::execd::pipe::{self, AttachOptions};
 
 use crate::probe_util::{run_command_session_with_output, ws_url_for};
@@ -111,6 +110,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
         Err(_) => String::new(),
     };
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    crate::probe_util::wait_for_execd(&execd_base).await;
     checks.push(Check {
         name: "sandbox",
         passed: !execd_base.is_empty(),
@@ -149,14 +151,14 @@ pub async fn run(server: &str, image: &str) -> i32 {
     let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
     let uploaded = api::upload_file(&execd_base, None, bundle, "/tmp/ccacp.tgz").await;
     // The agent needs the staged adapter (same procedure as the TASK-1 leg).
-    let staged = oneshot::run(
+    let staged = crate::probe_util::run_in_sandbox(
         &execd_base,
         "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
         Duration::from_secs(120),
     )
     .await;
     // A read-only fixture for the ordinary-permission prompt.
-    let fixture = oneshot::run(
+    let fixture = crate::probe_util::run_in_sandbox(
         &execd_base,
         "printf 'hodei-read-fixture' > /workspace/readme-fixture.txt",
         Duration::from_secs(20),

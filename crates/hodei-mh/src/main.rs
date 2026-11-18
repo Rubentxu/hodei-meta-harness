@@ -317,6 +317,10 @@ async fn acp_probe(args: &[String]) -> i32 {
         }
     };
 
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    probe_util::wait_for_execd(&execd_base).await;
+
     // 3. Install the agent inside the sandbox (mock script or npm adapter).
     match mode.as_str() {
         "mock" => {
@@ -327,8 +331,7 @@ async fn acp_probe(args: &[String]) -> i32 {
                 "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js && test -s /workspace/mock-acp-agent.js"
             );
             let outcome =
-                opensandbox::execd::oneshot::run(&execd_base, &install, Duration::from_secs(20))
-                    .await;
+                probe_util::run_in_sandbox(&execd_base, &install, Duration::from_secs(20)).await;
             checks.push(ProbeCheck {
                 name: "agent-install",
                 passed: outcome.succeeded(),
@@ -380,13 +383,13 @@ async fn acp_probe(args: &[String]) -> i32 {
                 .unwrap_or(false);
             let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
             let uploaded = api::upload_file(&execd_base, None, bundle, "/tmp/ccacp.tgz").await;
-            let probe_fs = opensandbox::execd::oneshot::run(
+            let probe_fs = probe_util::run_in_sandbox(
                 &execd_base,
                 "ls -la /tmp/ccacp.tgz",
                 Duration::from_secs(15),
             )
             .await;
-            let staged_outcome = opensandbox::execd::oneshot::run(
+            let staged_outcome = probe_util::run_in_sandbox(
                 &execd_base,
                 "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp 2>&1 | tail -2 && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
                 Duration::from_secs(120),

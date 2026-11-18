@@ -226,7 +226,7 @@ async fn create_sandbox(server: &str, tag: &str) -> String {
 }
 
 async fn execd_for(server: &str, sid: &str) -> String {
-    match reqwest::Client::new()
+    let execd = match reqwest::Client::new()
         .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
         .send()
         .await
@@ -236,7 +236,11 @@ async fn execd_for(server: &str, sid: &str) -> String {
             format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
         }
         Err(_) => String::new(),
-    }
+    };
+    // The sandbox publishes its execd port before the server inside can
+    // answer: wait (bounded) before using it.
+    crate::probe_util::wait_for_execd(&execd).await;
+    execd
 }
 
 async fn delete_sandbox(server: &str, sid: &str) -> bool {
@@ -302,7 +306,7 @@ async fn stage_and_build(execd: &str, project: &Path, marker: &str) -> bool {
     if !uploaded {
         return false;
     }
-    let staged = opensandbox::execd::oneshot::run(
+    let staged = crate::probe_util::run_in_sandbox(
         execd,
         "mkdir -p /workspace/project && tar xzf /tmp/project.tgz -C /workspace/project && rm /tmp/project.tgz",
         Duration::from_secs(60),
@@ -311,7 +315,7 @@ async fn stage_and_build(execd: &str, project: &Path, marker: &str) -> bool {
     if !staged.succeeded() {
         return false;
     }
-    let build = opensandbox::execd::oneshot::run(
+    let build = crate::probe_util::run_in_sandbox(
         execd,
         "HTTPS_PROXY=http://172.17.0.1:8888 HTTP_PROXY=http://172.17.0.1:8888 CARGO_TARGET_DIR=/workspace/.cache/target cargo run --quiet --manifest-path /workspace/project/Cargo.toml",
         Duration::from_secs(240),

@@ -27,14 +27,29 @@ pub struct CreateSessionResponse {
     pub session_id: String,
 }
 
+/// Deadline of the regular execd calls.
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `POST /pty` — create a PTY/pipe session running `command` (shell syntax).
 pub async fn create_session(
     base_url: &str,
     access_token: Option<&str>,
     req: CreateSessionRequest<'_>,
 ) -> Result<CreateSessionResponse, ExecdApiError> {
+    create_session_with_timeout(base_url, access_token, req, DEFAULT_TIMEOUT).await
+}
+
+/// Same, with an explicit deadline. The readiness probe needs a SHORT
+/// one: it must fail fast while the sandbox is still booting, so the
+/// bounded wait can poll without spending the whole budget on one call.
+pub async fn create_session_with_timeout(
+    base_url: &str,
+    access_token: Option<&str>,
+    req: CreateSessionRequest<'_>,
+    timeout: std::time::Duration,
+) -> Result<CreateSessionResponse, ExecdApiError> {
     let url = format!("{base_url}/pty");
-    let mut builder = http_client()?.post(url).json(&req);
+    let mut builder = http_client(timeout)?.post(url).json(&req);
     if let Some(token) = access_token {
         builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
     }
@@ -45,6 +60,28 @@ pub async fn create_session(
         return Err(ExecdApiError::Status { status, body });
     }
     Ok(serde_json::from_str(&body)?)
+}
+
+/// Is the execd accepting sessions RIGHT NOW? A freshly created sandbox
+/// can have its execd still booting: the port is published before the
+/// server inside is able to answer. The probe runs a harmless command
+/// and deletes the session it opened.
+pub async fn session_accepted(
+    base_url: &str,
+    access_token: Option<&str>,
+    timeout: std::time::Duration,
+) -> bool {
+    let req = CreateSessionRequest {
+        cwd: None,
+        command: Some("true"),
+    };
+    match create_session_with_timeout(base_url, access_token, req, timeout).await {
+        Ok(session) => {
+            let _ = delete_session(base_url, access_token, &session.session_id).await;
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +98,7 @@ pub async fn session_status(
     session_id: &str,
 ) -> Result<SessionStatusResponse, ExecdApiError> {
     let url = format!("{base_url}/pty/{session_id}/status");
-    let mut builder = http_client()?.get(url);
+    let mut builder = http_client(DEFAULT_TIMEOUT)?.get(url);
     if let Some(token) = access_token {
         builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
     }
@@ -81,7 +118,7 @@ pub async fn delete_session(
     session_id: &str,
 ) -> Result<(), ExecdApiError> {
     let url = format!("{base_url}/pty/{session_id}");
-    let mut builder = http_client()?.delete(url);
+    let mut builder = http_client(DEFAULT_TIMEOUT)?.delete(url);
     if let Some(token) = access_token {
         builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
     }
@@ -115,7 +152,7 @@ pub async fn upload_file(
     let form = reqwest::multipart::Form::new()
         .part("metadata", metadata_part)
         .part("file", file_part);
-    let mut builder = http_client()?.post(url).multipart(form);
+    let mut builder = http_client(DEFAULT_TIMEOUT)?.post(url).multipart(form);
     if let Some(token) = access_token {
         builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
     }
@@ -135,7 +172,9 @@ pub async fn download_file(
     remote_path: &str,
 ) -> Result<Vec<u8>, ExecdApiError> {
     let url = format!("{base_url}/files/download");
-    let mut builder = http_client()?.get(url).query(&[("path", remote_path)]);
+    let mut builder = http_client(DEFAULT_TIMEOUT)?
+        .get(url)
+        .query(&[("path", remote_path)]);
     if let Some(token) = access_token {
         builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
     }
@@ -148,10 +187,8 @@ pub async fn download_file(
     Ok(response.bytes().await?.to_vec())
 }
 
-fn http_client() -> Result<reqwest::Client, ExecdApiError> {
-    Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?)
+fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, ExecdApiError> {
+    Ok(reqwest::Client::builder().timeout(timeout).build()?)
 }
 
 #[cfg(test)]

@@ -22,6 +22,10 @@ use serde_json::{Value, json};
 
 pub const DEFAULT_PROXY_URL: &str = "http://172.17.0.1:8888";
 
+/// Bounded wait for the sandbox's execd to start answering. A sandbox
+/// that never becomes usable is a FAILURE, not an infinite wait.
+const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn flag(args: &[String], name: &str, default: &str) -> String {
     args.iter()
         .position(|a| a == name)
@@ -387,6 +391,21 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
         Err(_) => String::new(),
     };
+
+    // The sandbox publishes its execd port BEFORE the server inside can
+    // answer: the first attempts are refused while the container is
+    // still booting. Waiting (bounded) for it turns a boot delay into a
+    // wait instead of a false "the command failed".
+    if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
+        let _ = client
+            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .send()
+            .await;
+        eprintln!(
+            "sandbox {sid} never became usable: its execd did not answer within {EXECD_READY_TIMEOUT:?}"
+        );
+        return 1;
+    }
 
     // 3. OBSERVED limits from inside the container (cgroups) AND the
     // sandbox's OWN network reachability (measured from inside, not from

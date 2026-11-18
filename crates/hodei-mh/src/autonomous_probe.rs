@@ -244,6 +244,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
             }
             Err(_) => String::new(),
         };
+        // The sandbox publishes its execd port before the server inside
+        // can answer: wait (bounded) before using it.
+        crate::probe_util::wait_for_execd(&execd).await;
         if execd.is_empty() {
             steps.push(Step {
                 name: "sandbox",
@@ -289,7 +292,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         let adapter = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
         let adapter_uploaded =
             opensandbox::execd::api::upload_file(&execd, None, adapter, "/tmp/ccacp.tgz").await;
-        let adapter_staged = opensandbox::execd::oneshot::run(
+        let adapter_staged = crate::probe_util::run_in_sandbox(
             &execd,
             "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
             Duration::from_secs(120),
@@ -334,7 +337,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 .await;
             break;
         }
-        let prepared = opensandbox::execd::oneshot::run(
+        let prepared = crate::probe_util::run_in_sandbox(
             &execd,
             "git init -q -b main /workspace/work && git -C /workspace/work fetch -q /tmp/candidate.bundle '+refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/work checkout -q -f -B main refs/remotes/bundle/hodei-mh/main",
             Duration::from_secs(60),
@@ -414,7 +417,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
 
         // Extract the candidate commit as a bundle from the sandbox.
-        let exported_ok = opensandbox::execd::oneshot::run(
+        let exported_ok = crate::probe_util::run_in_sandbox(
             &execd,
             "git -C /workspace/work bundle create /tmp/candidate-out.bundle --all",
             Duration::from_secs(60),
@@ -609,6 +612,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
             }
             Err(_) => String::new(),
         };
+        // The sandbox publishes its execd port before the server inside
+        // can answer: wait (bounded) before uploading.
+        crate::probe_util::wait_for_execd(&execd).await;
         let uploaded = opensandbox::execd::api::upload_file(
             &execd,
             None,
@@ -617,7 +623,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
         .await;
         let prepared = if uploaded.is_ok() {
-            opensandbox::execd::oneshot::run(
+            crate::probe_util::run_in_sandbox(
             &execd,
                 "git init -q -b main /workspace/work && git -C /workspace/work fetch -q /tmp/candidate.bundle '+refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/work checkout -q -f -B main refs/remotes/bundle/hodei-mh/main",
                 Duration::from_secs(60),
@@ -662,7 +668,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         // Even if the agent claims completion, verify decides: the criterion
         // (fraud.txt exists) cannot hold — the evidence is invalid, so the
         // promotion/closure path is never taken.
-        let exported = opensandbox::execd::oneshot::run(
+        let exported = crate::probe_util::run_in_sandbox(
             &execd,
             "git -C /workspace/work bundle create /tmp/candidate-out.bundle --all",
             Duration::from_secs(60),

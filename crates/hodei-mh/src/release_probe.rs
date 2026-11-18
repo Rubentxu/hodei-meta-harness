@@ -22,6 +22,31 @@ use verify::digest::CandidateDigest;
 const CANDIDATE_CONTENT: &str = "durable-candidate-payload-v1\n";
 const ORPHAN_THRESHOLD_SECS: u64 = 1_800;
 
+/// Bounded wait for a freshly created sandbox's execd to start
+/// answering. The port is published before the server inside is ready.
+const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The facts of a one-shot, as they are: a failure must be
+/// DIAGNOSTICABLE from the report, never a static sentence.
+fn oneshot_facts(label: &str, outcome: &opensandbox::execd::oneshot::OneshotOutcome) -> String {
+    let tail: String = outcome
+        .output
+        .chars()
+        .rev()
+        .take(200)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!(
+        "{label}: exit={:?} end={:?} ran={} output={:?}",
+        outcome.exit_code,
+        outcome.end,
+        !outcome.not_accepted(),
+        tail
+    )
+}
+
 struct Check {
     name: &'static str,
     passed: bool,
@@ -406,19 +431,27 @@ pub async fn run(server: &str, image: &str) -> i32 {
     if !candidate_id.is_empty() {
         created.push(candidate_id.clone());
     }
-    let (kept_while_pending, exported, released_after_confirm) = if candidate_id.is_empty() {
-        (false, false, false)
+    let (kept_while_pending, exported, released_after_confirm, candidate_facts) = if candidate_id
+        .is_empty()
+    {
+        (
+            false,
+            false,
+            false,
+            "the candidate sandbox was never created".to_string(),
+        )
     } else {
         let keep = release_on_idle(&IdleGate::WorkPending);
         let kept = matches!(keep, ReleaseDecision::Keep { .. })
             && sandbox_exists(&client, server, &candidate_id).await;
         let execd = execd_for(&client, server, &candidate_id).await;
-        let write = opensandbox::execd::oneshot::run(
-            &execd,
-            &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt && cat /workspace/candidate.txt"),
-            Duration::from_secs(30),
-        )
-        .await;
+        let write = opensandbox::execd::oneshot::run_when_ready(
+                &execd,
+                &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt && cat /workspace/candidate.txt"),
+                Duration::from_secs(30),
+                EXECD_READY_TIMEOUT,
+            )
+            .await;
         let digest = CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes());
         let exported = write.succeeded() && write.output.contains(CANDIDATE_CONTENT);
         let release = release_on_idle(&IdleGate::CandidateConfirmed {
@@ -431,7 +464,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
             }
             ReleaseDecision::Keep { .. } => false,
         };
-        (kept, exported, released)
+        let facts = format!(
+            "sandbox={candidate_id} keep={keep:?} write[{}] exported={exported} release={release:?} released={released}",
+            oneshot_facts("candidate write", &write)
+        );
+        (kept, exported, released, facts)
     };
     let (tracker_observed, tracker_diagnostic) = match make_tracker_fixture(&base) {
         Ok(root) => tracker_lists_task(&root),
@@ -441,7 +478,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         name: "idle-release-only-after-durable-confirmation-tracker-still-observed",
         passed: kept_while_pending && exported && released_after_confirm && tracker_observed,
         detail: format!(
-            "WorkPending kept the environment alive; after the candidate digest was confirmed the release DELETE returned 404 on GET; tracker still lists its task after release (observed, not inferred): {tracker_observed} [{tracker_diagnostic}]",
+            "WorkPending kept the environment alive; after the candidate digest was confirmed the release DELETE returned 404 on GET; tracker still lists its task after release (observed, not inferred): {tracker_observed} [{tracker_diagnostic}]; {candidate_facts}",
         ),
     });
 
@@ -461,14 +498,19 @@ pub async fn run(server: &str, image: &str) -> i32 {
     if !resume_id.is_empty() {
         created.push(resume_id.clone());
     }
-    let (resumed, digest_matches) = if resume_id.is_empty() {
-        (false, false)
+    let (resumed, digest_matches, resume_facts) = if resume_id.is_empty() {
+        (
+            false,
+            false,
+            "the sandbox to lose was never created".to_string(),
+        )
     } else {
         let execd = execd_for(&client, server, &resume_id).await;
-        let _ = opensandbox::execd::oneshot::run(
+        let seeded = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt"),
             Duration::from_secs(30),
+            EXECD_READY_TIMEOUT,
         )
         .await;
         // Durable export BEFORE the loss: bytes + digest survive the sandbox.
@@ -504,33 +546,53 @@ pub async fn run(server: &str, image: &str) -> i32 {
                     created.push(fresh.clone());
                 }
                 if fresh.is_empty() {
-                    (lost, false)
+                    (
+                        lost,
+                        false,
+                        format!(
+                            "sandbox={resume_id} seed[{}] lost={lost} the fresh session was never created",
+                            oneshot_facts("seed write", &seeded)
+                        ),
+                    )
                 } else {
                     let fresh_execd = execd_for(&client, server, &fresh).await;
                     let encoded = base64::engine::general_purpose::STANDARD
                         .encode(CANDIDATE_CONTENT.as_bytes());
-                    let restored = opensandbox::execd::oneshot::run(
+                    let restored = opensandbox::execd::oneshot::run_when_ready(
                         &fresh_execd,
                         &format!(
                             "echo {encoded} | base64 -d > /workspace/candidate.txt && cat /workspace/candidate.txt"
                         ),
                         Duration::from_secs(30),
+                        EXECD_READY_TIMEOUT,
                     )
                     .await;
                     let matches = restored.succeeded()
                         && restored.output.contains(CANDIDATE_CONTENT)
                         && CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes()) == digest;
-                    (lost, matches)
+                    (
+                        lost,
+                        matches,
+                        format!(
+                            "sandbox={resume_id} lost={lost} fresh={fresh} seed[{}] restore[{}]",
+                            oneshot_facts("seed write", &seeded),
+                            oneshot_facts("restore", &restored)
+                        ),
+                    )
                 }
             }
-            recovery::RecoveryPlan::PossibleDataLoss { .. } => (lost, false),
+            recovery::RecoveryPlan::PossibleDataLoss { .. } => (
+                lost,
+                false,
+                format!("sandbox={resume_id} lost={lost} the plan was not a resume"),
+            ),
         }
     };
     checks.push(Check {
         name: "loss-recovers-from-durable-candidate-in-a-fresh-session",
         passed: resumed && digest_matches,
         detail: format!(
-            "sandbox removed for real (404 after DELETE); recovery resumed from the durable candidate in a NEW session; digest of restored content matches the durable digest: {digest_matches}",
+            "sandbox removed for real (404 after DELETE); recovery resumed from the durable candidate in a NEW session; digest of restored content matches the durable digest: {digest_matches}; {resume_facts}",
         ),
     });
 
@@ -550,14 +612,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
     if !no_export_id.is_empty() {
         created.push(no_export_id.clone());
     }
-    let (marked, gone_forever) = if no_export_id.is_empty() {
-        (false, false)
+    let (marked, gone_forever, loss_facts) = if no_export_id.is_empty() {
+        (false, false, "the sandbox was never created".to_string())
     } else {
         let execd = execd_for(&client, server, &no_export_id).await;
-        let wrote = opensandbox::execd::oneshot::run(
+        let wrote = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             "echo in-progress > /workspace/half-edited.rs && echo scratch > /workspace/scratch.sh && ls /workspace",
             Duration::from_secs(30),
+            EXECD_READY_TIMEOUT,
         )
         .await;
         let files_present = wrote.output.contains("half-edited.rs");
@@ -567,18 +630,27 @@ pub async fn run(server: &str, image: &str) -> i32 {
             last_export: None,
             unexported: vec!["half-edited.rs".into(), "scratch.sh".into()],
         });
-        let marked = match plan {
+        let marked = match &plan {
             recovery::RecoveryPlan::PossibleDataLoss { files } => {
-                files == vec!["half-edited.rs".to_string(), "scratch.sh".to_string()]
+                files == &vec!["half-edited.rs".to_string(), "scratch.sh".to_string()]
             }
             recovery::RecoveryPlan::ResumeFromCandidate { .. } => false,
         };
-        (marked && files_present, lost)
+        (
+            marked && files_present,
+            lost,
+            format!(
+                "sandbox={no_export_id} files_present={files_present} lost={lost} plan={plan:?} write[{}]",
+                oneshot_facts("write", &wrote)
+            ),
+        )
     };
     checks.push(Check {
         name: "un-exported-work-marked-as-possible-data-loss",
         passed: marked && gone_forever,
-        detail: "files existed, environment removed (404), no export existed: plan = PossibleDataLoss(half-edited.rs, scratch.sh) — no snapshot was assumed".to_string(),
+        detail: format!(
+            "files existed, environment removed (404), no export existed: plan = PossibleDataLoss(half-edited.rs, scratch.sh) — no snapshot was assumed; {loss_facts}",
+        ),
     });
 
     // ---- DoD: REAL TTL expiration — the SERVER releases the sandbox, the

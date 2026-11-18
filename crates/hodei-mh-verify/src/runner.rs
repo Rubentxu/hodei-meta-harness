@@ -15,6 +15,10 @@ use crate::digest::CandidateDigest;
 use crate::evidence::{BoundResult, EvidenceSet};
 use crate::result::ExecutionRecord;
 
+/// Bounded wait for the sandbox's execd to accept sessions. A fresh
+/// sandbox publishes its port before the server inside can answer.
+const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One named verification command (e.g. check "AC-1" runs `cargo test`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
@@ -130,6 +134,15 @@ impl CleanRunner {
         let execd_base = format!("http://{host}");
         let environment = format!("{}::{}", self.image, sandbox_id);
 
+        // The sandbox publishes its execd port BEFORE the server inside
+        // can answer: wait (bounded) for it, so the upload does not fail
+        // for a reason that has nothing to do with the candidate.
+        if !opensandbox::execd::oneshot::wait_until_ready(&execd_base, EXECD_READY_TIMEOUT).await {
+            return Err(RunnerError(
+                "the sandbox execd never became usable".to_string(),
+            ));
+        }
+
         // The sandbox port mapping needs a moment to accept connections
         // right after creation; a short retry covers that window.
         let mut uploaded = Err(RunnerError("bundle upload not attempted".into()));
@@ -184,8 +197,18 @@ impl CleanRunner {
 /// Run one command to its terminal state or to the timeout (shared,
 /// attach-first oneshot), mapped into an ExecutionRecord: timeout and
 /// signal deaths produce absence — never a PASS (AC-1).
+///
+/// The sandbox may still be booting when the verification starts: the
+/// execd refuses the first attempts. The readiness wait runs a harmless
+/// probe, so the check command itself runs EXACTLY ONCE.
 async fn run_with_timeout(execd_base: &str, command: &str, timeout: Duration) -> ExecutionRecord {
-    let outcome = opensandbox::execd::oneshot::run(execd_base, command, timeout).await;
+    let outcome = opensandbox::execd::oneshot::run_when_ready(
+        execd_base,
+        command,
+        timeout,
+        EXECD_READY_TIMEOUT,
+    )
+    .await;
     match outcome.exit_code {
         Some(code) => ExecutionRecord::terminal(command, code, outcome.output),
         None => ExecutionRecord::absent(
