@@ -131,26 +131,39 @@ pub struct Collector {
     /// Bytes of the session output that were never received: a hole in
     /// the stream, measured against what the execd says it produced.
     pub missing_bytes: usize,
+    /// Whether a replay frame actually contributed bytes: the output
+    /// was completed from the execd's replay.
+    pub replayed: bool,
 }
 
 /// Apply a replay frame to the collection.
 ///
 /// The execd replays the output it kept, starting at `offset` in the
-/// session's output stream. Bytes already collected are not duplicated,
-/// and a hole (the replay starts beyond what we have) is counted, not
-/// silently swallowed: a truncated output is never announced as a
-/// complete one.
+/// session's output stream. The collection is kept as a PREFIX of that
+/// stream, so it always describes the output faithfully:
+///
+/// - bytes already collected are not duplicated;
+/// - a replay that starts BEYOND what arrived leaves a gap: those
+///   bytes belong at their own position in the stream, so appending
+///   them at the end would build a string that is not the session
+///   output. The gap is counted and stays visible.
+///
+/// A truncated output is never announced as a complete one.
 pub fn apply_replay(output: &mut Vec<u8>, collector: &mut Collector, offset: i64, data: &[u8]) {
     let start = offset.max(0) as usize;
     let have = output.len();
     if start > have {
+        // A GAP: the bytes between were never forwarded. The replayed
+        // bytes belong at `start`, not at the end of what we have.
         collector.missing_bytes += start - have;
+        return;
     }
     // The replay covers the stream positions [start, start + data.len()):
     // only the positions the collection does not have yet are new.
-    let from = have.saturating_sub(start);
+    let from = have - start;
     if from < data.len() {
         output.extend_from_slice(&data[from..]);
+        collector.replayed = true;
     }
 }
 
@@ -258,7 +271,6 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
     // and it says how many bytes it produced: a shorter collection is a
     // truncated output, never a complete one.
     let expected = api::session_output_offset(execd_base, None, &session.session_id).await;
-    let mut replayed = false;
     // Two ways to know the output is short: the execd says it produced
     // more bytes than arrived, or the execd says nothing and the
     // command ended with no output at all — the signature of a tail
@@ -267,10 +279,11 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
         Some(produced) => produced > output.len() as i64,
         None => collector.terminal_code.is_some() && output.is_empty(),
     };
+    let mut replay_error: Option<String> = None;
     if short {
         match pipe::attach(&ws_url, AttachOptions::default()).await {
             Ok(mut replay_pipe) => {
-                replayed = replay_missing(
+                replay_missing(
                     &mut replay_pipe,
                     &mut output,
                     &mut collector,
@@ -281,24 +294,34 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
                 let _ = replay_pipe.close().await;
             }
             Err(err) => {
-                if let Some(expected) = expected {
-                    collector.missing_bytes =
-                        (expected.max(0) as usize).saturating_sub(output.len());
-                }
-                let mut text = String::from_utf8_lossy(&output).to_string();
-                text.push_str(&format!("[replay attach failed: {err}]"));
-                output = text.into_bytes();
+                replay_error = Some(format!("[replay attach failed: {err}]"));
             }
         }
     }
     let _ = api::delete_session(execd_base, None, &session.session_id).await;
 
+    // The completeness of the output, measured against what the execd
+    // says it produced. The collection is a PREFIX of the session
+    // output, so the bytes that never arrived are the ones beyond it —
+    // and a gap in the middle is part of that count.
+    let expected_bytes = expected.map(|value| value.max(0) as usize);
+    let missing_bytes = match expected_bytes {
+        Some(expected) => expected.saturating_sub(output.len()),
+        // The execd never said how much it produced: the gaps the
+        // replay exposed are the only measure available.
+        None => collector.missing_bytes,
+    };
+    // The diagnostics travel with the text, never inside the collected
+    // bytes: the length of the output is what the completeness is
+    // measured against.
     let mut text = String::from_utf8_lossy(&output).to_string();
     if let Some(err) = attach_error {
         text.push_str(&format!("[attach failed: {err}]"));
     }
-    let expected_bytes = expected.map(|value| value.max(0) as usize);
-    let missing_bytes = collector.missing_bytes;
+    if let Some(err) = replay_error {
+        text.push_str(&err);
+    }
+    let replayed = collector.replayed;
     match collector.terminal_code {
         Some(code) if code >= 0 => OneshotOutcome {
             exit_code: Some(code),
@@ -325,15 +348,15 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
 ///
 /// The execd keeps what it produced and replays it on a new attach: the
 /// replay carries the offset it resumes from, so the bytes already
-/// collected are not duplicated and a hole is counted instead of being
-/// swallowed. Returns whether the output was completed.
+/// collected are not duplicated and a gap is counted instead of being
+/// swallowed.
 async fn replay_missing(
     pipe_session: &mut pipe::PipeSession,
     output: &mut Vec<u8>,
     collector: &mut Collector,
     expected: Option<usize>,
     timeout: Duration,
-) -> bool {
+) {
     let deadline = Instant::now() + timeout;
     while expected.is_none_or(|expected| output.len() < expected) {
         let now = Instant::now();
@@ -349,15 +372,6 @@ async fn replay_missing(
             Ok(None) => break,
             Err(_) => continue,
         }
-    }
-    match expected {
-        Some(expected) => {
-            collector.missing_bytes = expected.saturating_sub(output.len());
-            output.len() >= expected
-        }
-        // The execd never said how much it produced: whatever the
-        // replay carried is the best available answer.
-        None => true,
     }
 }
 
@@ -430,17 +444,50 @@ mod tests {
         apply_replay(&mut output, &mut collector, 0, b"first\nlast\n");
         assert_eq!(output, b"first\nlast\n".to_vec());
         assert_eq!(collector.missing_bytes, 0);
+        assert!(collector.replayed);
     }
 
     #[test]
     fn a_replay_that_starts_beyond_what_arrived_is_a_visible_hole() {
         // A gap in the output is counted, never swallowed: a truncated
-        // output is not announced as a complete one.
+        // output is not announced as a complete one. The replayed bytes
+        // belong at their own position in the stream, so they are NOT
+        // appended at the end of what arrived: the collection stays a
+        // faithful PREFIX of the session output.
         let mut output = b"first\n".to_vec();
         let mut collector = Collector::default();
         apply_replay(&mut output, &mut collector, 10, b"tail\n");
-        assert_eq!(output, b"first\ntail\n".to_vec());
+        assert_eq!(output, b"first\n".to_vec());
         assert_eq!(collector.missing_bytes, 4);
+        assert!(!collector.replayed);
+    }
+
+    #[test]
+    fn a_replay_that_continues_the_stream_completes_it() {
+        // The normal case: the live stream stopped at the offset the
+        // replay resumes from.
+        let mut output = b"first\n".to_vec();
+        let mut collector = Collector::default();
+        apply_replay(&mut output, &mut collector, 6, b"last\n");
+        assert_eq!(output, b"first\nlast\n".to_vec());
+        assert_eq!(collector.missing_bytes, 0);
+        assert!(collector.replayed);
+    }
+
+    #[test]
+    fn the_completeness_of_the_output_is_measured_against_the_prefix() {
+        // What the execd says it produced is the yardstick: the bytes
+        // beyond the collected prefix never arrived.
+        let expected = 10usize;
+        let output = b"first\n".to_vec();
+        assert_eq!(expected.saturating_sub(output.len()), 4);
+        // A gap in the middle is part of the same count: the collection
+        // stops at the gap, so the missing bytes include it.
+        let mut gapped = b"first\n".to_vec();
+        let mut collector = Collector::default();
+        apply_replay(&mut gapped, &mut collector, 8, b"tail\n");
+        assert_eq!(expected.saturating_sub(gapped.len()), 4);
+        assert_eq!(collector.missing_bytes, 2);
     }
 
     #[test]

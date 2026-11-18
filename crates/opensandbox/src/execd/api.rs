@@ -86,46 +86,75 @@ pub async fn session_accepted(
 
 /// The state of a session: whether it still runs and how much output it
 /// produced.
+///
+/// The fields are OPTIONAL: a daemon that answers a different shape
+/// does not make the caller crash, it makes the fact unknown.
 #[derive(Debug, Deserialize)]
 pub struct SessionStatusResponse {
     pub session_id: String,
-    pub running: bool,
-    pub output_offset: i64,
+    /// Whether the session still runs. `None` when the daemon does not
+    /// say: an unknown state is not a finished session.
+    #[serde(default)]
+    pub running: Option<bool>,
+    /// How many bytes the session produced. `None` when the daemon does
+    /// not say: the completeness of the output is then UNKNOWN, and
+    /// must not be claimed.
+    #[serde(default)]
+    pub output_offset: Option<i64>,
 }
 
 /// `GET /pty/{id}` — the session state and its output offset.
 ///
 /// The reference daemon answers the session state at `/pty/{id}`; some
 /// builds answer the same shape at `/pty/{id}/status`. Both are tried,
-/// in that order: a 404 on one of them says nothing about the session,
-/// and the output offset is what tells a truncated output from a
-/// complete one.
+/// in that order, and the search continues on ANY failure — a 404, a
+/// transport error or a body with another shape — because the output
+/// offset is what tells a truncated output from a complete one, and
+/// losing it would silently disable that distinction.
 pub async fn session_status(
     base_url: &str,
     access_token: Option<&str>,
     session_id: &str,
 ) -> Result<SessionStatusResponse, ExecdApiError> {
+    let client = http_client(DEFAULT_TIMEOUT)?;
     let mut last: Option<ExecdApiError> = None;
     for path in [
         format!("/pty/{session_id}"),
         format!("/pty/{session_id}/status"),
     ] {
         let url = format!("{base_url}{path}");
-        let mut builder = http_client(DEFAULT_TIMEOUT)?.get(url);
+        let mut builder = client.get(url);
         if let Some(token) = access_token {
             builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
         }
-        let response = builder.send().await?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            // A transport failure is not the end of the search.
+            Err(err) => {
+                last = Some(ExecdApiError::Http(err));
+                continue;
+            }
+        };
         let status = response.status().as_u16();
-        let body = response.text().await?;
-        if (200..300).contains(&status) {
-            return Ok(serde_json::from_str(&body)?);
+        let body = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            last = Some(ExecdApiError::Status { status, body });
+            continue;
         }
-        let error = ExecdApiError::Status { status, body };
-        if status != 404 {
-            return Err(error);
+        match serde_json::from_str::<SessionStatusResponse>(&body) {
+            Ok(parsed) => {
+                // A body without the facts we need is not an answer:
+                // the other endpoint may know them.
+                if parsed.running.is_some() || parsed.output_offset.is_some() {
+                    return Ok(parsed);
+                }
+                last = Some(ExecdApiError::Status {
+                    status,
+                    body: format!("session state without the expected fields: {body}"),
+                });
+            }
+            Err(err) => last = Some(ExecdApiError::InvalidJson(err)),
         }
-        last = Some(error);
     }
     Err(last.unwrap_or(ExecdApiError::Status {
         status: 404,
@@ -145,7 +174,7 @@ pub async fn session_output_offset(
     session_status(base_url, access_token, session_id)
         .await
         .ok()
-        .map(|status| status.output_offset)
+        .and_then(|status| status.output_offset)
 }
 
 /// `DELETE /pty/{id}` — terminate the session and its process group.

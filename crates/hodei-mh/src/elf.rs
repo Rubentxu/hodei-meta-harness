@@ -15,6 +15,15 @@ const PT_INTERP: u32 = 3;
 /// ELF class: 64-bit.
 const ELFCLASS64: u8 = 2;
 
+/// ELF data encoding: little endian, the only one the headers are read
+/// with. A big endian image is not parsed as if it were little endian:
+/// it is refused.
+const ELFDATA2LSB: u8 = 1;
+
+/// The machine types the release names in its artifacts.
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
 /// How the binary is linked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Linkage {
@@ -46,7 +55,11 @@ pub fn linkage(bytes: &[u8]) -> Linkage {
     const PHNUM_OFFSET: usize = 0x38;
     const PHENT_SIZE: usize = 56;
 
-    if bytes.len() < 0x3A || &bytes[0..4] != ELF_MAGIC || bytes[4] != ELFCLASS64 {
+    if bytes.len() < 0x3A
+        || &bytes[0..4] != ELF_MAGIC
+        || bytes[4] != ELFCLASS64
+        || bytes[5] != ELFDATA2LSB
+    {
         return Linkage::NeedsDynamicLoader;
     }
     let u16_at = |offset: usize| -> Option<u64> {
@@ -81,7 +94,12 @@ pub fn linkage(bytes: &[u8]) -> Linkage {
         let Some(base) = phoff.checked_add(offset) else {
             return Linkage::NeedsDynamicLoader;
         };
-        let Some(header) = bytes.get(base..base + 4) else {
+        // The header type is four bytes: a truncated or absurd offset
+        // is refused, never read past the end of the image.
+        let Some(end) = base.checked_add(4) else {
+            return Linkage::NeedsDynamicLoader;
+        };
+        let Some(header) = bytes.get(base..end) else {
             return Linkage::NeedsDynamicLoader;
         };
         let p_type = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
@@ -90,6 +108,35 @@ pub fn linkage(bytes: &[u8]) -> Linkage {
         }
     }
     Linkage::Standalone
+}
+
+/// The architecture the image was built for, read from its header.
+///
+/// `None` for anything that is not a readable little endian ELF64
+/// image: an unknown architecture is never named.
+pub fn architecture(bytes: &[u8]) -> Option<&'static str> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+    const MACHINE_OFFSET: usize = 0x12;
+    if bytes.len() < 0x3A || &bytes[0..4] != ELF_MAGIC || bytes[4] != ELFCLASS64 {
+        return None;
+    }
+    if bytes[5] != ELFDATA2LSB {
+        return None;
+    }
+    let slice = bytes.get(MACHINE_OFFSET..MACHINE_OFFSET.checked_add(2)?)?;
+    let machine = u16::from_le_bytes([slice[0], slice[1]]);
+    match machine {
+        EM_X86_64 => Some("x86_64"),
+        EM_AARCH64 => Some("aarch64"),
+        _ => None,
+    }
+}
+
+/// Read a file and report the architecture it was built for.
+pub fn architecture_of(path: &std::path::Path) -> Option<&'static str> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| architecture(&bytes))
 }
 
 /// Read a file and report how it is linked. A file that cannot be read
@@ -143,5 +190,38 @@ mod tests {
             Linkage::NeedsDynamicLoader
         );
         assert_eq!(linkage(&[0u8; 128]), Linkage::NeedsDynamicLoader);
+    }
+
+    #[test]
+    fn an_image_in_another_data_encoding_is_not_read_as_little_endian() {
+        // The headers are read little endian: a big endian image would
+        // be read as garbage, so it is refused instead.
+        let mut bytes = elf(2, false);
+        bytes[5] = 2; // big endian
+        assert_eq!(linkage(&bytes), Linkage::NeedsDynamicLoader);
+        assert_eq!(architecture(&bytes), None);
+    }
+
+    #[test]
+    fn the_architecture_is_read_from_the_header() {
+        let mut bytes = elf(2, false);
+        bytes[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+        assert_eq!(architecture(&bytes), Some("x86_64"));
+        bytes[0x12..0x14].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        assert_eq!(architecture(&bytes), Some("aarch64"));
+        bytes[0x12..0x14].copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(architecture(&bytes), None);
+    }
+
+    #[test]
+    fn an_absurd_program_header_offset_is_refused_and_never_panics() {
+        // The offset comes from the file: it can be anything. The
+        // inspection refuses instead of reading past the image (and
+        // without overflowing on the way).
+        let mut bytes = elf(2, false);
+        bytes[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(linkage(&bytes), Linkage::NeedsDynamicLoader);
+        bytes[0x20..0x28].copy_from_slice(&(usize::MAX as u64).to_le_bytes());
+        assert_eq!(linkage(&bytes), Linkage::NeedsDynamicLoader);
     }
 }
