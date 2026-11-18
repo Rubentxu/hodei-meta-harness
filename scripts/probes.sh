@@ -230,6 +230,19 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 say "   control plane ready (pid $SERVER_PID)"
 
+# The residue this lane leaves is the DIFFERENCE between what the host
+# had and what it has: a network that a previous, interrupted run left
+# behind is reported, but it is not this lane's fault and it must not
+# turn every later run red.
+BEFORE_NETWORKS="$OUT/networks-before.txt"
+AFTER_NETWORKS="$OUT/networks-after.txt"
+BEFORE_CONTAINERS="$OUT/containers-before.txt"
+AFTER_CONTAINERS="$OUT/containers-after.txt"
+docker network ls --filter 'label=hodei.io/network-owner=lifecycle-server' \
+  --format '{{.ID}}' 2>/dev/null | sort > "$BEFORE_NETWORKS" || : > "$BEFORE_NETWORKS"
+docker ps -a --filter "name=sandbox-" --format '{{.Names}}' 2>/dev/null \
+  | sort > "$BEFORE_CONTAINERS" || : > "$BEFORE_CONTAINERS"
+
 # The server attaches the configured proxy when it creates each sandbox.
 export HODEI_MH_PROXY_URL="$PROXY_URL"
 
@@ -247,6 +260,15 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 say "── residue left on the host"
+docker network ls --filter 'label=hodei.io/network-owner=lifecycle-server' \
+  --format '{{.ID}}' 2>/dev/null | sort > "$AFTER_NETWORKS" || : > "$AFTER_NETWORKS"
+# The networks this lane created and did not release.
+left=$(comm -13 "$BEFORE_NETWORKS" "$AFTER_NETWORKS" | wc -l | tr -d ' ')
+# The networks the host already had: they belong to a previous run.
+before=$(wc -l < "$BEFORE_NETWORKS" | tr -d ' ')
+if [ "$before" != "0" ]; then
+  say "   the host already carried $before network(s) from a previous run"
+fi
 sandboxes=$(python3 - "$PORT" <<'PY'
 import json
 import os
@@ -264,10 +286,14 @@ except (OSError, KeyError, ValueError):
     sys.exit(1)
 PY
 )
-containers=$(docker ps -a --filter "name=sandbox-" --format '{{.Names}}' 2>/dev/null | wc -l) || containers=unknown
-networks=$(docker network ls --filter 'label=hodei.io/network-owner=lifecycle-server' --format '{{.ID}}' 2>/dev/null | wc -l) || networks=unknown
-say "   sandboxes=${sandboxes:-unknown} containers=${containers} networks=${networks}"
-if [ "${sandboxes:-1}" != "0" ] || [ "$containers" != "0" ] || [ "$networks" != "0" ]; then
+containers=$(docker ps -a --filter "name=sandbox-" --format '{{.Names}}' 2>/dev/null \
+  | sort > "$AFTER_CONTAINERS")
+left_containers=$(comm -13 "$BEFORE_CONTAINERS" "$AFTER_CONTAINERS" | wc -l | tr -d ' ')
+total_containers=$(wc -l < "$AFTER_CONTAINERS" | tr -d ' ')
+networks=$(wc -l < "$AFTER_NETWORKS" | tr -d ' ')
+say "   sandboxes=${sandboxes:-unknown} containers=${total_containers} networks=${networks}"
+say "   this lane left ${left} network(s) and ${left_containers} container(s)"
+if [ "${sandboxes:-1}" != "0" ] || [ "$left_containers" != "0" ] || [ "$left" != "0" ]; then
   say "probes: the lane left residue on the host"
   status=1
 fi
