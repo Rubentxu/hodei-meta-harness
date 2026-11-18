@@ -668,7 +668,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hodei-mh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-budget"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-coordinator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-goal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hodei-mh-tracker",
  "hodei-mh-verify",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-interact"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-lifecycle-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bollard",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-opensandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-profiles"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-promote"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-release"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hodei-mh-verify",
  "serde",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-rollover"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-run"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-supervisor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "hodei-mh-run",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-tracker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-verify"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hodei-mh-opensandbox",
  "reqwest",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "hodei-mh-workspace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror",
 ]
