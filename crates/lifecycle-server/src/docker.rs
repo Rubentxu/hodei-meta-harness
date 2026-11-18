@@ -71,25 +71,17 @@ impl DockerAdapter {
         }
     }
 
+    /// Make sure the image is available and report the id the runtime
+    /// resolved for it: the id, not the tag, is what identifies the
+    /// environment a check actually ran in.
     pub async fn ensure_image_available(
         &self,
         image: &str,
         credentials: Option<DockerCredentials>,
         platform: Option<&str>,
-    ) -> Result<(), DockerError> {
-        let filters: HashMap<String, Vec<String>> =
-            HashMap::from([("reference".to_string(), vec![image.to_string()])]);
-        let options = ListImagesOptionsBuilder::new().filters(&filters).build();
-        let existing = self
-            .docker
-            .list_images(Some(options))
-            .await
-            .map_err(DockerError::op("list images"))?;
-        let present = existing
-            .iter()
-            .any(|i| i.repo_tags.iter().any(|t| t == image));
-        if present {
-            return Ok(());
+    ) -> Result<String, DockerError> {
+        if let Some(id) = self.find_image_id(image).await? {
+            return Ok(id);
         }
         let create = CreateImageOptionsBuilder::new()
             .from_image(image)
@@ -102,7 +94,28 @@ impl DockerAdapter {
                 source: e,
             })?;
         }
-        Ok(())
+        self.find_image_id(image)
+            .await?
+            .ok_or_else(|| DockerError::Contract {
+                code: error_codes::INVALID_PARAMETER,
+                message: format!("the image {image} is not available after pulling it"),
+            })
+    }
+
+    /// The id of the image as the runtime resolved it, if it is present.
+    async fn find_image_id(&self, image: &str) -> Result<Option<String>, DockerError> {
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("reference".to_string(), vec![image.to_string()])]);
+        let options = ListImagesOptionsBuilder::new().filters(&filters).build();
+        let existing = self
+            .docker
+            .list_images(Some(options))
+            .await
+            .map_err(DockerError::op("list images"))?;
+        Ok(existing
+            .iter()
+            .find(|summary| summary.repo_tags.iter().any(|tag| tag == image))
+            .map(|summary| summary.id.clone()))
     }
 
     /// Extract execd + bootstrap.sh archives from the execd image, caching per

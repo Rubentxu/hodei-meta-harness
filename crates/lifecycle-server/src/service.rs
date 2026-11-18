@@ -117,7 +117,10 @@ impl LifecycleService {
                 password: Some(a.password.clone()),
                 ..Default::default()
             });
-        self.adapter
+        // The id the runtime resolved for the image is reported back: the
+        // environment a check ran in is identified by the id, not the tag.
+        let image_id = self
+            .adapter
             .ensure_image_available(&image.uri, credentials, docker_platform.as_deref())
             .await?;
 
@@ -159,6 +162,7 @@ impl LifecycleService {
 
         Ok(CreateSandboxResponse {
             id: sandbox_id,
+            image_id: Some(image_id),
             status: SandboxStatus {
                 state: "Running".to_string(),
                 reason: Some("CONTAINER_RUNNING".to_string()),

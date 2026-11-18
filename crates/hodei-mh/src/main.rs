@@ -61,7 +61,7 @@ product:
   package                              build the installable bundle
 
 probes (evidence about this host):
-  release-probe | profile-probe | supervisor-probe | multiproject-probe
+  release-probe | profile-probe | supervisor-probe | multiproject-probe | verify-probe
 
 options:
   --version                            print the version and exit

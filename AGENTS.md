@@ -94,7 +94,7 @@ a check that cannot run is a failure, not a skip.
 |---|---|---|---|
 | **local** | `scripts/fast-check.sh`: `fmt`, `clippy` and the tests of the crate you touched **and the crates that depend on it** | seconds, no Docker | while you work, before every merge |
 | **workspace** | the CI `fast` job: `fmt`, `clippy -D warnings`, the whole test suite and the doctests | minutes, no Docker | on every push and pull request |
-| **integration** | `scripts/probes.sh`: the four probes (`release`, `supervisor`, `profile`, `multiproject`) against real Docker and the lifecycle server | minutes, starts sandboxes and runs real builds | on `main`, on demand, and locally before publishing |
+| **integration** | `scripts/probes.sh`: the probes (`release`, `supervisor`, `profile`, `multiproject`, `verify`) against real Docker and the lifecycle server | minutes, starts sandboxes and runs real builds | on `main`, on demand, and locally before publishing |
 
 ```bash
 scripts/fast-check.sh                                  # what changed vs the base
