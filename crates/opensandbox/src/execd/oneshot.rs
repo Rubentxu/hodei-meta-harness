@@ -34,6 +34,14 @@ pub struct OneshotOutcome {
     pub output: String,
     /// How the attempt ended when there is no terminal status.
     pub end: OneshotEnd,
+    /// Bytes the execd says the session produced: the yardstick for the
+    /// completeness of the output. `None` when the execd did not say.
+    pub expected_bytes: Option<usize>,
+    /// Bytes of the output that never arrived: a truncated output is
+    /// never announced as a complete one.
+    pub missing_bytes: usize,
+    /// Whether the output was completed from the execd's replay.
+    pub replayed: bool,
 }
 
 impl OneshotOutcome {
@@ -97,6 +105,9 @@ pub async fn run_when_ready(
             exit_code: None,
             output: format!("[execd did not accept a session within {ready_timeout:?}]"),
             end: OneshotEnd::NotAccepted,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
     }
     run(execd_base, command, timeout).await
@@ -117,6 +128,30 @@ pub struct Collector {
     /// Whether the exit frame was already seen: the execd may still be
     /// flushing the PTY buffer after it.
     pub draining: bool,
+    /// Bytes of the session output that were never received: a hole in
+    /// the stream, measured against what the execd says it produced.
+    pub missing_bytes: usize,
+}
+
+/// Apply a replay frame to the collection.
+///
+/// The execd replays the output it kept, starting at `offset` in the
+/// session's output stream. Bytes already collected are not duplicated,
+/// and a hole (the replay starts beyond what we have) is counted, not
+/// silently swallowed: a truncated output is never announced as a
+/// complete one.
+pub fn apply_replay(output: &mut Vec<u8>, collector: &mut Collector, offset: i64, data: &[u8]) {
+    let start = offset.max(0) as usize;
+    let have = output.len();
+    if start > have {
+        collector.missing_bytes += start - have;
+    }
+    // The replay covers the stream positions [start, start + data.len()):
+    // only the positions the collection does not have yet are new.
+    let from = have.saturating_sub(start);
+    if from < data.len() {
+        output.extend_from_slice(&data[from..]);
+    }
 }
 
 /// Apply one event to the collection.
@@ -127,9 +162,8 @@ pub struct Collector {
 /// command — a short command can lose its whole output.
 pub fn apply_event(output: &mut Vec<u8>, collector: &mut Collector, event: ServerEvent) {
     match event {
-        ServerEvent::Stdout(bytes) | ServerEvent::Replay { data: bytes, .. } => {
-            output.extend(bytes)
-        }
+        ServerEvent::Stdout(bytes) => output.extend(bytes),
+        ServerEvent::Replay { offset, data } => apply_replay(output, collector, offset, &data),
         ServerEvent::Stderr(bytes) => output.extend(bytes),
         ServerEvent::Exit { exit_code } => {
             collector.terminal_code = exit_code;
@@ -158,6 +192,9 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
                 exit_code: None,
                 output: format!("[create failed: {err}]"),
                 end: OneshotEnd::NotAccepted,
+                expected_bytes: None,
+                missing_bytes: 0,
+                replayed: false,
             };
         }
     };
@@ -213,17 +250,63 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
         }
         let _ = pipe_session.close().await;
     }
+
+    // COMPLETION FROM THE REPLAY. The live stream can lose the tail of
+    // the output: the execd forwards what it read from the PTY, and the
+    // bytes written just before the process ended can be left behind.
+    // The execd keeps what it produced and replays it on a new attach,
+    // and it says how many bytes it produced: a shorter collection is a
+    // truncated output, never a complete one.
+    let expected = api::session_output_offset(execd_base, None, &session.session_id).await;
+    let mut replayed = false;
+    // Two ways to know the output is short: the execd says it produced
+    // more bytes than arrived, or the execd says nothing and the
+    // command ended with no output at all — the signature of a tail
+    // that was never forwarded.
+    let short = match expected {
+        Some(produced) => produced > output.len() as i64,
+        None => collector.terminal_code.is_some() && output.is_empty(),
+    };
+    if short {
+        match pipe::attach(&ws_url, AttachOptions::default()).await {
+            Ok(mut replay_pipe) => {
+                replayed = replay_missing(
+                    &mut replay_pipe,
+                    &mut output,
+                    &mut collector,
+                    expected.map(|value| value.max(0) as usize),
+                    timeout,
+                )
+                .await;
+                let _ = replay_pipe.close().await;
+            }
+            Err(err) => {
+                if let Some(expected) = expected {
+                    collector.missing_bytes =
+                        (expected.max(0) as usize).saturating_sub(output.len());
+                }
+                let mut text = String::from_utf8_lossy(&output).to_string();
+                text.push_str(&format!("[replay attach failed: {err}]"));
+                output = text.into_bytes();
+            }
+        }
+    }
     let _ = api::delete_session(execd_base, None, &session.session_id).await;
 
     let mut text = String::from_utf8_lossy(&output).to_string();
     if let Some(err) = attach_error {
         text.push_str(&format!("[attach failed: {err}]"));
     }
+    let expected_bytes = expected.map(|value| value.max(0) as usize);
+    let missing_bytes = collector.missing_bytes;
     match collector.terminal_code {
         Some(code) if code >= 0 => OneshotOutcome {
             exit_code: Some(code),
             output: text,
             end: OneshotEnd::Completed,
+            expected_bytes,
+            missing_bytes,
+            replayed,
         },
         _ => OneshotOutcome {
             exit_code: None,
@@ -231,7 +314,50 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
             // The session EXISTED: the command may have started, so it is
             // NOT safe to run it again.
             end: OneshotEnd::TimedOut,
+            expected_bytes,
+            missing_bytes,
+            replayed,
         },
+    }
+}
+
+/// Read the replay of a finished session until the output is complete.
+///
+/// The execd keeps what it produced and replays it on a new attach: the
+/// replay carries the offset it resumes from, so the bytes already
+/// collected are not duplicated and a hole is counted instead of being
+/// swallowed. Returns whether the output was completed.
+async fn replay_missing(
+    pipe_session: &mut pipe::PipeSession,
+    output: &mut Vec<u8>,
+    collector: &mut Collector,
+    expected: Option<usize>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while expected.is_none_or(|expected| output.len() < expected) {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(500));
+        match tokio::time::timeout(wait, pipe_session.next_event()).await {
+            Ok(Some(event)) => apply_event(output, collector, event),
+            // The pipe closed: no more events will ever arrive.
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    match expected {
+        Some(expected) => {
+            collector.missing_bytes = expected.saturating_sub(output.len());
+            output.len() >= expected
+        }
+        // The execd never said how much it produced: whatever the
+        // replay carried is the best available answer.
+        None => true,
     }
 }
 
@@ -296,23 +422,54 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_resumes_at_its_offset_without_duplicating() {
+        // The execd replays what it kept, starting at an offset: the
+        // bytes already collected are not written twice.
+        let mut output = b"first\n".to_vec();
+        let mut collector = Collector::default();
+        apply_replay(&mut output, &mut collector, 0, b"first\nlast\n");
+        assert_eq!(output, b"first\nlast\n".to_vec());
+        assert_eq!(collector.missing_bytes, 0);
+    }
+
+    #[test]
+    fn a_replay_that_starts_beyond_what_arrived_is_a_visible_hole() {
+        // A gap in the output is counted, never swallowed: a truncated
+        // output is not announced as a complete one.
+        let mut output = b"first\n".to_vec();
+        let mut collector = Collector::default();
+        apply_replay(&mut output, &mut collector, 10, b"tail\n");
+        assert_eq!(output, b"first\ntail\n".to_vec());
+        assert_eq!(collector.missing_bytes, 4);
+    }
+
+    #[test]
     fn succeeded_requires_zero_exit() {
         let ok = OneshotOutcome {
             exit_code: Some(0),
             output: "ok".into(),
             end: OneshotEnd::Completed,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(ok.succeeded());
         let absent = OneshotOutcome {
             exit_code: None,
             output: String::new(),
             end: OneshotEnd::TimedOut,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(!absent.succeeded());
         let failed = OneshotOutcome {
             exit_code: Some(2),
             output: String::new(),
             end: OneshotEnd::Completed,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(!failed.succeeded());
     }
@@ -325,6 +482,9 @@ mod tests {
             exit_code: None,
             output: "[create failed: connection refused]".into(),
             end: OneshotEnd::NotAccepted,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(refused.not_accepted());
         assert!(!refused.succeeded());
@@ -335,6 +495,9 @@ mod tests {
             exit_code: Some(1),
             output: "boom".into(),
             end: OneshotEnd::Completed,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(!ran.not_accepted());
 
@@ -342,6 +505,9 @@ mod tests {
             exit_code: None,
             output: String::new(),
             end: OneshotEnd::TimedOut,
+            expected_bytes: None,
+            missing_bytes: 0,
+            replayed: false,
         };
         assert!(!silent.not_accepted());
     }

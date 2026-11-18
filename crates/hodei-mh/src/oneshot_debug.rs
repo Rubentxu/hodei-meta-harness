@@ -34,6 +34,11 @@ pub async fn run(args: &[String]) -> i32 {
             "exit_code": outcome.exit_code,
             "output": outcome.output,
             "succeeded": outcome.succeeded(),
+            // The completeness of the output, measured against what the
+            // execd says it produced.
+            "expected_bytes": outcome.expected_bytes,
+            "missing_bytes": outcome.missing_bytes,
+            "replayed": outcome.replayed,
         })
     );
     if outcome.succeeded() { 0 } else { 1 }
