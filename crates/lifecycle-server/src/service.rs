@@ -277,9 +277,9 @@ struct CreationEntry {
 }
 
 /// The claim of a creation key.
-enum CreationClaim {
+enum CreationClaim<'a> {
     /// The request owns the creation and has to perform it.
-    Owned(CreationTicket),
+    Owned(CreationTicket<'a>),
     /// The creation already happened: this is the environment it produced.
     Existing(String),
     /// The key was already used with another body.
@@ -289,18 +289,54 @@ enum CreationClaim {
 }
 
 /// What the claim of a creation key decided.
-enum CreationClaimResult {
+enum CreationClaimResult<'a> {
     /// The request creates the environment. The ticket is `None` when the
     /// request carries no creation key.
-    Create(Option<CreationTicket>),
+    Create(Option<CreationTicket<'a>>),
     /// The creation already happened: this is the environment it produced.
     Existing(String),
 }
 
 /// The ownership of a creation key.
-struct CreationTicket {
+///
+/// The ownership ends with the creation: when the owner finishes it
+/// publishes the outcome, and when the owner goes away WITHOUT finishing
+/// (the request was cancelled, the future was dropped) the ticket frees the
+/// key by itself. A key that stayed in flight forever would turn every
+/// retry into a wait that never ends.
+struct CreationTicket<'a> {
+    registry: &'a std::sync::Mutex<std::collections::HashMap<String, CreationEntry>>,
     key: String,
     outcome: tokio::sync::watch::Sender<CreationOutcome>,
+    finished: bool,
+}
+
+impl CreationTicket<'_> {
+    /// Publish the outcome of the creation.
+    ///
+    /// The publication and the removal of a failed key happen under the
+    /// SAME lock: a request that claims the key in between must not see an
+    /// entry that is about to disappear, and the owner must not remove the
+    /// entry of the one that claimed it after.
+    fn finish(&mut self, outcome: CreationOutcome) {
+        self.finished = true;
+        let failed = matches!(outcome, CreationOutcome::Failed);
+        let mut registry = lock_creations(self.registry);
+        self.outcome.send_replace(outcome);
+        if failed {
+            registry.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for CreationTicket<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // The creation did not finish: the key is free again and the
+            // ones that wait for it are released.
+            self.finish(CreationOutcome::Failed);
+        }
+    }
 }
 
 /// Wait for the outcome of a creation another request owns.
@@ -429,19 +465,18 @@ impl LifecycleService {
         match self.claim_creation(&req).await? {
             CreationClaimResult::Existing(sandbox_id) => self.describe_creation(&sandbox_id).await,
             CreationClaimResult::Create(ticket) => {
+                // The ticket frees the key by itself if this future is
+                // dropped before the creation finishes.
                 let created = self.create_environment(req).await;
                 match (created, ticket) {
-                    (Ok(created), Some(ticket)) => {
-                        self.finish_creation(
-                            &ticket,
-                            CreationOutcome::Succeeded(created.id.clone()),
-                        );
+                    (Ok(created), Some(mut ticket)) => {
+                        ticket.finish(CreationOutcome::Succeeded(created.id.clone()));
                         Ok(created)
                     }
-                    (Err(error), Some(ticket)) => {
+                    (Err(error), Some(mut ticket)) => {
                         // The creation did not happen: the key is free
                         // again and a retry may take it.
-                        self.finish_creation(&ticket, CreationOutcome::Failed);
+                        ticket.finish(CreationOutcome::Failed);
                         Err(error)
                     }
                     (created, None) => created,
@@ -458,7 +493,7 @@ impl LifecycleService {
     async fn claim_creation(
         &self,
         req: &CreateSandboxRequest,
-    ) -> Result<CreationClaimResult, ServiceError> {
+    ) -> Result<CreationClaimResult<'_>, ServiceError> {
         let Some(raw_key) = req.creation_key.as_deref() else {
             return Ok(CreationClaimResult::Create(None));
         };
@@ -514,7 +549,7 @@ impl LifecycleService {
     }
 
     /// Claim a creation key in the registry.
-    fn claim_creation_key(&self, key: &str, fingerprint: &str) -> CreationClaim {
+    fn claim_creation_key(&self, key: &str, fingerprint: &str) -> CreationClaim<'_> {
         let mut registry = lock_creations(&self.creations);
         let known = registry.get(key).map(|entry| {
             (
@@ -549,19 +584,11 @@ impl LifecycleService {
             },
         );
         CreationClaim::Owned(CreationTicket {
+            registry: &self.creations,
             key: key.to_string(),
             outcome,
+            finished: false,
         })
-    }
-
-    /// Publish the outcome of a creation the request owned.
-    fn finish_creation(&self, ticket: &CreationTicket, outcome: CreationOutcome) {
-        let failed = matches!(outcome, CreationOutcome::Failed);
-        ticket.outcome.send_replace(outcome);
-        if failed {
-            // The creation did not happen: the key is free again.
-            lock_creations(&self.creations).remove(&ticket.key);
-        }
     }
 
     /// The environment a creation key produced, read back from the daemon.
@@ -1756,3 +1783,6 @@ mod tests {
         assert_eq!(from_validation.code(), error_codes::INVALID_PARAMETER);
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

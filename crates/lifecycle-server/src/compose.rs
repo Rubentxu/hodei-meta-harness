@@ -211,7 +211,9 @@ pub fn build_labels(
     );
     // The creation key travels with the environment: the daemon is where
     // a restarted server looks for the intents it already served.
-    if let Some(key) = request.creation_key.as_deref() {
+    // The key is the TRIMMED one: it is the key the registry of a running
+    // server uses, and the one a restarted server must find again.
+    if let Some(key) = request.creation_key.as_deref().map(str::trim) {
         labels.insert(LABEL_CREATION_KEY.to_string(), key.to_string());
         labels.insert(
             LABEL_CREATION_FINGERPRINT.to_string(),
@@ -861,6 +863,182 @@ mod tests {
         assert!(parse_cpu_nano_cpus("NaN").is_err());
         assert!(parse_cpu_nano_cpus("0.00000000001").is_err());
         assert!(parse_cpu_nano_cpus("inf").is_err());
+    }
+
+    #[test]
+    fn the_memory_parser_refuses_what_is_not_a_finite_representable_limit() {
+        for raw in [
+            "NaN",
+            "NaNMi",
+            "inf",
+            "infGi",
+            "-infMi",
+            "0",
+            "0Mi",
+            "0.0Gi",
+            "-1Gi",
+            "1e400Gi",
+            // Does not fit in an i64, plain or after the multiplication.
+            "9223372036854775808",
+            "99999999999999999999",
+            "9999999999Ti",
+            "1e30Mi",
+        ] {
+            assert!(
+                parse_memory_limit(raw).is_err(),
+                "{raw:?} must be refused, not clamped"
+            );
+        }
+        // The largest value that fits is still a value.
+        assert_eq!(parse_memory_limit("9223372036854775807").unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn the_cpu_parser_refuses_what_is_not_a_finite_representable_limit() {
+        for raw in [
+            "NaN",
+            "inf",
+            "-inf",
+            "-1",
+            "0",
+            "0.0",
+            "1e300",
+            "9300000000",
+            "0.0000000001",
+            "",
+            " ",
+        ] {
+            assert!(
+                parse_cpu_nano_cpus(raw).is_err(),
+                "{raw:?} must be refused, not clamped"
+            );
+        }
+        assert_eq!(parse_cpu_nano_cpus(" 2 ").unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn a_request_with_a_bad_limit_is_refused_before_it_is_resolved() {
+        let mut r = req();
+        r.resource_limits = Some(crate::model::ResourceLimits {
+            memory: Some("NaNGi".to_string()),
+            cpu: None,
+        });
+        assert_eq!(
+            resolve_resource_limits(&r).unwrap_err().code,
+            error_codes::INVALID_PARAMETER
+        );
+        r.resource_limits = Some(crate::model::ResourceLimits {
+            memory: None,
+            cpu: Some("inf".to_string()),
+        });
+        assert_eq!(
+            resolve_resource_limits(&r).unwrap_err().code,
+            error_codes::INVALID_PARAMETER
+        );
+    }
+
+    #[test]
+    fn a_timeout_of_zero_or_one_that_cannot_be_represented_is_refused() {
+        let mut r = req();
+        for timeout in [0, -1, i64::MIN, i64::MAX] {
+            r.timeout = Some(timeout);
+            let err = validate_create_request(&r, i64::MAX).unwrap_err();
+            assert_eq!(err.code, error_codes::INVALID_PARAMETER, "{timeout}");
+        }
+    }
+
+    #[test]
+    fn the_same_intent_has_the_same_fingerprint_whatever_the_key() {
+        let a = req();
+        let mut b = req();
+        b.creation_key = Some("another-key".to_string());
+        // The key identifies the intent; it is not part of it.
+        assert_eq!(creation_fingerprint(&a), creation_fingerprint(&b));
+        // The credentials of the image are not an intent either.
+        let mut c = req();
+        c.image.as_mut().unwrap().auth = Some(crate::model::ImageAuth {
+            username: "u".to_string(),
+            password: "rotated".to_string(),
+        });
+        assert_eq!(creation_fingerprint(&a), creation_fingerprint(&c));
+        assert_eq!(creation_fingerprint(&a).len(), 64);
+    }
+
+    #[test]
+    fn a_different_intent_has_a_different_fingerprint() {
+        let base = creation_fingerprint(&req());
+        let variants: Vec<(&str, CreateSandboxRequest)> = vec![
+            ("image", {
+                let mut r = req();
+                r.image.as_mut().unwrap().uri = "img:2".to_string();
+                r
+            }),
+            ("entrypoint", {
+                let mut r = req();
+                r.entrypoint = Some(vec!["sleep".to_string(), "1".to_string()]);
+                r
+            }),
+            ("env", {
+                let mut r = req();
+                r.env = Some(BTreeMap::from([("A".to_string(), "1".to_string())]));
+                r
+            }),
+            ("metadata", {
+                let mut r = req();
+                r.metadata = Some(BTreeMap::from([("team".to_string(), "x".to_string())]));
+                r
+            }),
+            ("timeout", {
+                let mut r = req();
+                r.timeout = Some(60);
+                r
+            }),
+            ("memory", {
+                let mut r = req();
+                r.resource_limits = Some(crate::model::ResourceLimits {
+                    memory: Some("1Gi".to_string()),
+                    cpu: None,
+                });
+                r
+            }),
+            ("cpu", {
+                let mut r = req();
+                r.resource_limits = Some(crate::model::ResourceLimits {
+                    memory: None,
+                    cpu: Some("2".to_string()),
+                });
+                r
+            }),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base]);
+        for (what, variant) in &variants {
+            assert!(
+                seen.insert(creation_fingerprint(variant)),
+                "a different {what} must be a different intent"
+            );
+        }
+    }
+
+    #[test]
+    fn the_labels_carry_the_creation_key_and_its_fingerprint() {
+        let mut r = req();
+        r.creation_key = Some("creation-7".to_string());
+        let created = Utc.with_ymd_and_hms(2026, 11, 17, 10, 0, 0).unwrap();
+        let labels = build_labels("sbx3", &r, created, None, None);
+        assert_eq!(labels[LABEL_CREATION_KEY], "creation-7");
+        assert_eq!(
+            labels[LABEL_CREATION_FINGERPRINT],
+            creation_fingerprint(&r),
+            "what survives a restart is what a retry is compared with"
+        );
+        // The label carries the key the registry uses, not the padding.
+        r.creation_key = Some("  creation-7 ".to_string());
+        let labels = build_labels("sbx3", &r, created, None, None);
+        assert_eq!(labels[LABEL_CREATION_KEY], "creation-7");
+        // Without a key the environment carries no intent.
+        let labels = build_labels("sbx4", &req(), created, None, None);
+        assert!(!labels.contains_key(LABEL_CREATION_KEY));
+        assert!(!labels.contains_key(LABEL_CREATION_FINGERPRINT));
     }
 
     #[test]
