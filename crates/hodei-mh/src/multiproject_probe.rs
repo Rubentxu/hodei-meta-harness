@@ -7,6 +7,7 @@
 //! certification, and the installable package E2E (extract + doctor from
 //! the bundle).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use opensandbox::control::ControlPlane;
@@ -456,26 +457,35 @@ pub async fn run(args: &[String]) -> i32 {
     });
 
     // ---- AC-1: claims without duplicates -------------------------------
-    let mut coordinator = CoordinatorState::default();
+    // One coordinator state PER PROJECT: a ticket id is unique inside a
+    // project, so the SAME id in four projects is four different tickets.
+    let mut coordinators: BTreeMap<&str, CoordinatorState> = BTreeMap::new();
     let mut claim_summary = String::new();
     let mut no_duplicates = true;
     for (name, _, _) in &projects {
-        let ticket = format!("{name}-task-1");
-        match coordinator.try_claim(&ticket, "orchestrator") {
+        let coordinator = coordinators
+            .entry(name.as_str())
+            .or_insert_with(|| CoordinatorState::new(name.as_str()));
+        match coordinator.try_claim("task-1", "orchestrator") {
             ClaimResult::Granted(claim) => {
                 claim_summary.push_str(&format!(
-                    "{ticket}={}(epoch {}) ",
+                    "{name}/task-1={}(epoch {}) ",
                     claim.holder, claim.epoch
                 ));
             }
             ClaimResult::Denied { holder } => {
                 no_duplicates = false;
-                claim_summary.push_str(&format!("{ticket}=DENIED-from-{holder} "));
+                claim_summary.push_str(&format!("{name}/task-1=DENIED-from-{holder} "));
             }
         }
     }
-    // A second orchestrator trying to take the same ticket is denied.
-    let duplicate = match coordinator.try_claim("alpha-task-1", "runner-2") {
+    // A second orchestrator trying to take the same ticket of the SAME
+    // project is denied; the same id in the other projects was granted.
+    let duplicate = match coordinators
+        .get_mut("alpha")
+        .expect("the state of alpha")
+        .try_claim("task-1", "runner-2")
+    {
         ClaimResult::Denied { .. } => true,
         ClaimResult::Granted(_) => false,
     };
@@ -483,7 +493,7 @@ pub async fn run(args: &[String]) -> i32 {
         name: "task-claims-without-duplicates",
         passed: no_duplicates && duplicate,
         detail: format!(
-            "four first-tasks claimed by the orchestrator; a second claimant on alpha-task-1 was DENIED: {claim_summary}",
+            "the SAME ticket id was claimed in four different projects, one state each; a second claimant on the same id of the same project was DENIED: {claim_summary}",
         ),
     });
 
@@ -699,7 +709,10 @@ pub async fn run(args: &[String]) -> i32 {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let reclaimed = matches!(
-        coordinator.try_claim("alpha-task-new", "orchestrator-2"),
+        coordinators
+            .get_mut("alpha")
+            .expect("the state of alpha")
+            .try_claim("task-new", "orchestrator-2"),
         ClaimResult::Granted(_)
     );
     let _ = ledger.release(&SandboxId("alpha-0".into()));
