@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 use hodei_mh_workspace::git;
 use hodei_mh_workspace::plan::{WorkspacePlan, validate_candidate};
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 
 use crate::probe_util::run_command_session_with_output;
 
@@ -25,7 +27,7 @@ struct Check {
 
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let mut checks: Vec<Check> = Vec::new();
 
     let finish = |checks: &[Check], elapsed: Duration| -> i32 {
@@ -67,7 +69,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     // 1. Sandbox receives exactly the chosen base revision.
-    let sid = match create_sandbox(&client, server, image).await {
+    let sid = match create_sandbox(&client, image).await {
         Some(id) => id,
         None => {
             checks.push(Check {
@@ -78,7 +80,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             return finish(&checks, started.elapsed());
         }
     };
-    let Some(execd_base) = resolve_execd(&client, server, &sid).await else {
+    let Some(execd) = resolve_execd(&client, &sid).await else {
         checks.push(Check {
             name: "execd-endpoint",
             passed: false,
@@ -88,19 +90,18 @@ pub async fn run(server: &str, image: &str) -> i32 {
     };
 
     let bundle_bytes = std::fs::read(&host.base_bundle).unwrap_or_default();
-    let uploaded =
-        match api::upload_file(&execd_base, None, bundle_bytes, "/workspace/base.bundle").await {
-            Ok(()) => true,
-            Err(err) => {
-                eprintln!("upload error: {err}");
-                false
-            }
-        };
+    let uploaded = match api::upload_file(&execd, bundle_bytes, "/workspace/base.bundle").await {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("upload error: {err}");
+            false
+        }
+    };
     let clone_cmd = "mkdir -p /workspace/repo && git clone -q /workspace/base.bundle /workspace/repo && cd /workspace/repo && git config user.email probe@hodei && git config user.name probe && git checkout -q main";
-    let clone_output = run_command_session_with_output(&execd_base, clone_cmd).await;
+    let clone_output = run_command_session_with_output(&execd, clone_cmd).await;
     eprintln!("upload={uploaded} clone_output: {clone_output}");
     let head =
-        run_command_session_with_output(&execd_base, "git -C /workspace/repo rev-parse HEAD").await;
+        run_command_session_with_output(&execd, "git -C /workspace/repo rev-parse HEAD").await;
     let head_matches = head.trim_start().starts_with(&host.base);
     checks.push(Check {
         name: "sandbox-exact-base-revision",
@@ -114,15 +115,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
     // 2. Candidate commit in sandbox, exported as bundle, downloaded atomically.
     let candidate_cmd = "cd /workspace/repo && echo candidate-work > feature.txt && git add -A && git commit -qm 'candidate: feature' && git bundle create /workspace/candidate.bundle --all";
-    let _ = run_command_session_with_output(&execd_base, candidate_cmd).await;
+    let _ = run_command_session_with_output(&execd, candidate_cmd).await;
     let staging = stage_dir(&sid);
     let _ = std::fs::create_dir_all(&staging);
-    let exported = download_atomically(
-        &execd_base,
-        CANDIDATE_BUNDLE,
-        &staging.join("candidate.bundle"),
-    )
-    .await;
+    let exported =
+        download_atomically(&execd, CANDIDATE_BUNDLE, &staging.join("candidate.bundle")).await;
     checks.push(Check {
         name: "candidate-exported-atomically",
         passed: exported,
@@ -178,9 +175,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // 4. Private-path leg: an ordinary agent change must never promote
     //    backlog management state; export, download, and REJECT on host.
     let leak_cmd = "cd /workspace/repo && mkdir -p backlog && echo secrets > backlog/leak.md && git add -A && git commit -qm 'leak attempt' && git bundle create /workspace/leak.bundle --all";
-    let _ = run_command_session_with_output(&execd_base, leak_cmd).await;
+    let _ = run_command_session_with_output(&execd, leak_cmd).await;
     let leak_downloaded =
-        download_atomically(&execd_base, LEAK_BUNDLE, &staging.join("leak.bundle")).await;
+        download_atomically(&execd, LEAK_BUNDLE, &staging.join("leak.bundle")).await;
     let leak_dir = staging.join("inspect-leak");
     let _ = std::fs::create_dir_all(&leak_dir);
     let leak_rejected = leak_downloaded
@@ -199,7 +196,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // 5. Crash simulation: release the sandbox, then re-validate the staged
     //    candidate from the host staging dir alone.
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -261,9 +258,9 @@ fn build_base_fixture() -> Result<BaseFixture, String> {
     })
 }
 
-async fn create_sandbox(client: &reqwest::Client, server: &str, image: &str) -> Option<String> {
+async fn create_sandbox(client: &ControlPlane, image: &str) -> Option<String> {
     let response = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -277,17 +274,16 @@ async fn create_sandbox(client: &reqwest::Client, server: &str, image: &str) -> 
     value["id"].as_str().map(str::to_string)
 }
 
-async fn resolve_execd(client: &reqwest::Client, server: &str, sid: &str) -> Option<String> {
+async fn resolve_execd(client: &ControlPlane, sid: &str) -> Option<ExecdEndpoint> {
     let value = client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(sid, 44772))
         .send()
         .await
         .ok()?
         .json::<Value>()
         .await
         .ok()?;
-    let ep = value["endpoint"].as_str()?;
-    let execd = format!("http://{ep}");
+    let execd = ExecdEndpoint::from_contract(&value)?;
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
     crate::probe_util::wait_for_execd(&execd).await;
@@ -310,9 +306,9 @@ fn atomic_write(part: &Path, dest: &Path, bytes: &[u8]) -> bool {
     }
 }
 
-async fn download_atomically(execd_base: &str, remote: &str, dest: &Path) -> bool {
+async fn download_atomically(execd: &ExecdEndpoint, remote: &str, dest: &Path) -> bool {
     let part = dest.with_extension("part");
-    match api::download_file(execd_base, None, remote).await {
+    match api::download_file(execd, remote).await {
         Ok(bytes) if !bytes.is_empty() => atomic_write(&part, dest, &bytes),
         Ok(_) | Err(_) => {
             let _ = std::fs::remove_file(&part);

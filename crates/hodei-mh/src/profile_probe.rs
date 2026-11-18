@@ -7,6 +7,8 @@
 //! (never a YOLO native fallback) when the image is unavailable.
 
 use std::process::Stdio;
+
+use opensandbox::control::ControlPlane;
 use std::time::Instant;
 
 use tokio::process::Command;
@@ -72,12 +74,8 @@ fn make_jvm_project(root: &std::path::Path) -> bool {
 /// The ids of the sandboxes the lifecycle server currently lists. Used to
 /// OBSERVE that the doctor creates nothing.
 async fn list_sandbox_ids() -> Vec<String> {
-    let client = reqwest::Client::new();
-    let value: serde_json::Value = match client
-        .get("http://127.0.0.1:8081/v1/sandboxes")
-        .send()
-        .await
-    {
+    let client = ControlPlane::new("http://127.0.0.1:8081");
+    let value: serde_json::Value = match client.get(ControlPlane::sandboxes_path()).send().await {
         Ok(response) => response.json().await.unwrap_or_default(),
         Err(_) => return Vec::new(),
     };

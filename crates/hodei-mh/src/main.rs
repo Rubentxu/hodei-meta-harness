@@ -9,7 +9,9 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use opensandbox::acp::AcpAssembler;
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
@@ -40,7 +42,7 @@ mod verify_probe;
 mod workspace_probe;
 
 use acp_dialogue::{AcpAction, AcpDialogue};
-use probe_util::{MOCK_AGENT_JS, run_command_session_with_output, ws_url_for};
+use probe_util::{MOCK_AGENT_JS, run_command_session_with_output};
 
 const PROBE_FILE: &str = "/workspace/hodei-probe.txt";
 
@@ -251,7 +253,7 @@ async fn acp_probe(args: &[String]) -> i32 {
     let mut checks: Vec<ProbeCheck> = Vec::new();
     let mut sandbox_id: Option<String> = None;
 
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let report = |checks: &[ProbeCheck], sandbox: Option<String>, elapsed: Duration, exit: i32| {
         let summary = json!({
             "task": "TASK-1",
@@ -274,7 +276,7 @@ async fn acp_probe(args: &[String]) -> i32 {
 
     // 1. Create sandbox through the hodei-mh lifecycle server.
     let create = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -329,7 +331,7 @@ async fn acp_probe(args: &[String]) -> i32 {
             let sid = sid.clone();
             tokio::spawn(async move {
                 let _ = client
-                    .delete(format!("http://127.0.0.1:0/v1/sandboxes/{sid}"))
+                    .delete(&ControlPlane::sandbox_path(&sid))
                     .send()
                     .await;
             });
@@ -338,19 +340,19 @@ async fn acp_probe(args: &[String]) -> i32 {
 
     // 2. Resolve the execd endpoint.
     let endpoint = client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await;
-    let execd_base = match endpoint {
+    let execd = match endpoint {
         Ok(resp) if resp.status().is_success() => {
             let value = resp.json::<Value>().await.unwrap_or_default();
-            let ep = value["endpoint"].as_str().unwrap_or_default().to_string();
+            let endpoint = ExecdEndpoint::from_contract(&value).unwrap_or_default();
             checks.push(ProbeCheck {
                 name: "execd-endpoint",
-                passed: !ep.is_empty(),
-                detail: format!("execd at {ep}"),
+                passed: !endpoint.base_url().is_empty(),
+                detail: format!("execd at {}", endpoint.base_url()),
             });
-            format!("http://{ep}")
+            endpoint
         }
         other => {
             checks.push(ProbeCheck {
@@ -366,7 +368,7 @@ async fn acp_probe(args: &[String]) -> i32 {
 
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    probe_util::wait_for_execd(&execd_base).await;
+    probe_util::wait_for_execd(&execd).await;
 
     // 3. Install the agent inside the sandbox (mock script or npm adapter).
     match mode.as_str() {
@@ -378,7 +380,7 @@ async fn acp_probe(args: &[String]) -> i32 {
                 "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js && test -s /workspace/mock-acp-agent.js"
             );
             let outcome =
-                probe_util::run_in_sandbox(&execd_base, &install, Duration::from_secs(20)).await;
+                probe_util::run_in_sandbox(&execd, &install, Duration::from_secs(20)).await;
             checks.push(ProbeCheck {
                 name: "agent-install",
                 passed: outcome.succeeded(),
@@ -429,15 +431,15 @@ async fn acp_probe(args: &[String]) -> i32 {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
-            let uploaded = api::upload_file(&execd_base, None, bundle, "/tmp/ccacp.tgz").await;
+            let uploaded = api::upload_file(&execd, bundle, "/tmp/ccacp.tgz").await;
             let probe_fs = probe_util::run_in_sandbox(
-                &execd_base,
+                &execd,
                 "ls -la /tmp/ccacp.tgz",
                 Duration::from_secs(15),
             )
             .await;
             let staged_outcome = probe_util::run_in_sandbox(
-                &execd_base,
+                &execd,
                 "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp 2>&1 | tail -2 && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
                 Duration::from_secs(120),
             )
@@ -488,8 +490,7 @@ async fn acp_probe(args: &[String]) -> i32 {
         }
     };
     let session = api::create_session(
-        &execd_base,
-        None,
+        &execd,
         CreateSessionRequest {
             cwd: Some("/workspace"),
             command: Some(&agent_command),
@@ -506,7 +507,7 @@ async fn acp_probe(args: &[String]) -> i32 {
         report(&checks, sandbox_id, started.elapsed(), 1);
         unreachable!()
     };
-    let ws_url = ws_url_for(&execd_base, &session.session_id);
+    let ws_url = execd.ws_url(&session.session_id);
     let attached = pipe::attach(&ws_url, AttachOptions::default()).await;
     let mut session_pipe = match attached {
         Ok(p) => p,
@@ -528,11 +529,10 @@ async fn acp_probe(args: &[String]) -> i32 {
     // 5. Verify the file the agent wrote, through a fresh execd session.
     //    One short retry covers the rare case where the replay snapshot races
     //    with the command session teardown.
-    let mut content =
-        run_command_session_with_output(&execd_base, &format!("cat {PROBE_FILE}")).await;
+    let mut content = run_command_session_with_output(&execd, &format!("cat {PROBE_FILE}")).await;
     if !content.contains("written-by-mock-agent") {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        content = run_command_session_with_output(&execd_base, &format!("cat {PROBE_FILE}")).await;
+        content = run_command_session_with_output(&execd, &format!("cat {PROBE_FILE}")).await;
     }
     // Both modes must leave the SAME artifact: the agent (mock or real)
     // writing the requested content inside the sandbox.
@@ -543,9 +543,9 @@ async fn acp_probe(args: &[String]) -> i32 {
     });
 
     // 6. Release everything; no orphans.
-    let _ = api::delete_session(&execd_base, None, &session.session_id).await;
+    let _ = api::delete_session(&execd, &session.session_id).await;
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())

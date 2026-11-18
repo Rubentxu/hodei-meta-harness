@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::model::{CreateSandboxRequest, PlatformSpec, error_codes};
+use crate::policy::NetworkPolicy;
 
 // Exact label keys of the reference server (services/constants.py).
 pub const RESERVED_LABEL_PREFIX: &str = "opensandbox.io/";
@@ -27,10 +28,15 @@ pub const EXECED_INSTALL_PATH: &str = "/opt/opensandbox/execd";
 pub const BOOTSTRAP_PATH: &str = "/opt/opensandbox/bootstrap.sh";
 pub const OPENSANDBOX_DIR: &str = "/opt/opensandbox";
 
+/// The environment variable that carries the credential of the
+/// execution plane. The execd reads it from the environment of its own
+/// process: the credential never travels in a command, a label or a
+/// record.
+pub const EXECD_ACCESS_TOKEN_ENV: &str = "EXECD_ACCESS_TOKEN=";
+
 /// Hardening defaults mirroring the example `~/.sandbox.toml` (docker section).
 #[derive(Debug, Clone)]
 pub struct DockerHardening {
-    pub network_mode: String,
     pub no_new_privileges: bool,
     pub drop_capabilities: Vec<String>,
     pub pids_limit: Option<i64>,
@@ -39,7 +45,6 @@ pub struct DockerHardening {
 impl Default for DockerHardening {
     fn default() -> Self {
         Self {
-            network_mode: "bridge".into(),
             no_new_privileges: true,
             drop_capabilities: [
                 "AUDIT_WRITE",
@@ -64,7 +69,13 @@ impl Default for DockerHardening {
 /// mapped 1:1 to bollard types in the docker module.
 #[derive(Debug, Clone, Default)]
 pub struct HostSpec {
+    /// The network the container is attached to. It is the network the
+    /// policy names, never the default bridge.
     pub network_mode: String,
+    /// The address the published ports are bound to. The loopback by
+    /// default: a published port is reachable from the host, and from
+    /// nowhere else.
+    pub publish_address: String,
     pub security_opt: Vec<String>,
     pub cap_drop: Vec<String>,
     pub pids_limit: Option<i64>,
@@ -179,12 +190,17 @@ pub fn build_labels(
 }
 
 /// Environment list (reference `_build_labels_and_env`): config env merged
-/// under request env, then `EXECD_INIT=1` and `OPENSANDBOX_ID`.
+/// under request env, then the identity of the sandbox.
+///
+/// The identity comes LAST: a request may not choose the identity of the
+/// environment it asks for, and the credential of the execution plane
+/// belongs to the server.
 pub fn build_env(
     server_env: &BTreeMap<String, String>,
     request_env: Option<&BTreeMap<String, String>>,
     sandbox_id: &str,
     execd_run_as_init: bool,
+    execd_access_token: &str,
 ) -> Vec<String> {
     let mut merged: BTreeMap<&String, &String> = BTreeMap::new();
     for (k, v) in server_env {
@@ -203,6 +219,7 @@ pub fn build_env(
         env.push("EXECD_INIT=1".to_string());
     }
     env.push(format!("OPENSANDBOX_ID={sandbox_id}"));
+    env.push(format!("{EXECD_ACCESS_TOKEN_ENV}{execd_access_token}"));
     env
 }
 
@@ -288,13 +305,16 @@ pub fn build_host_spec(
     hardening: &DockerHardening,
     memory: Option<i64>,
     nano_cpus: Option<i64>,
+    network: &NetworkPolicy,
+    publish_address: &str,
 ) -> HostSpec {
     let mut security_opt = Vec::new();
     if hardening.no_new_privileges {
         security_opt.push("no-new-privileges=true".to_string());
     }
     HostSpec {
-        network_mode: hardening.network_mode.clone(),
+        network_mode: network.network_name().to_string(),
+        publish_address: publish_address.to_string(),
         security_opt,
         cap_drop: hardening.drop_capabilities.clone(),
         pids_limit: hardening.pids_limit,
@@ -464,10 +484,39 @@ mod tests {
             ("B".to_string(), "server".to_string()),
         ]);
         let request = BTreeMap::from([("B".to_string(), "req".to_string())]);
-        let env = build_env(&server, Some(&request), "sbx3", true);
+        let env = build_env(&server, Some(&request), "sbx3", true, "token-1");
         assert_eq!(
             env,
-            vec!["A=1", "B=req", "EXECD_INIT=1", "OPENSANDBOX_ID=sbx3"]
+            vec![
+                "A=1",
+                "B=req",
+                "EXECD_INIT=1",
+                "OPENSANDBOX_ID=sbx3",
+                "EXECD_ACCESS_TOKEN=token-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_identity_of_the_sandbox_cannot_be_chosen_by_the_request() {
+        // A request that asks for its own credential does not get it:
+        // the identity of the environment belongs to the server.
+        let request = BTreeMap::from([
+            ("OPENSANDBOX_ID".to_string(), "someone-else".to_string()),
+            (
+                "EXECD_ACCESS_TOKEN".to_string(),
+                "a-token-of-the-caller".to_string(),
+            ),
+        ]);
+        let env = build_env(&BTreeMap::new(), Some(&request), "sbx4", true, "token-2");
+        assert!(env.contains(&"OPENSANDBOX_ID=sbx4".to_string()), "{env:?}");
+        assert!(
+            env.contains(&"EXECD_ACCESS_TOKEN=token-2".to_string()),
+            "{env:?}"
+        );
+        assert!(
+            !env.contains(&"a-token-of-the-caller".to_string()),
+            "{env:?}"
         );
     }
 
@@ -494,8 +543,21 @@ mod tests {
     #[test]
     fn host_spec_applies_reference_hardening() {
         let hardening = DockerHardening::default();
-        let spec = build_host_spec(&hardening, Some(1024), Some(1_000_000_000));
-        assert_eq!(spec.network_mode, "bridge");
+        let network = NetworkPolicy::parse(
+            crate::policy::INTERNAL_EGRESS_PROXY,
+            crate::policy::DEFAULT_SANDBOX_NETWORK,
+            crate::policy::DEFAULT_SANDBOX_SUBNET,
+        )
+        .expect("the supported policy");
+        let spec = build_host_spec(
+            &hardening,
+            Some(1024),
+            Some(1_000_000_000),
+            &network,
+            "127.0.0.1",
+        );
+        assert_eq!(spec.network_mode, "hodei-mh-sandboxes");
+        assert_eq!(spec.publish_address, "127.0.0.1");
         assert!(
             spec.security_opt
                 .contains(&"no-new-privileges=true".to_string())

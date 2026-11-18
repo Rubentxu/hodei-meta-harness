@@ -12,11 +12,13 @@ use hodei_mh_coordinator::core::ClaimResult;
 use hodei_mh_run::grant::{EffectKind, Grant};
 use hodei_mh_run::run::{EventIdentity, RunPlan, TaggedEvent};
 use opensandbox::acp::{self, AcpAssembler};
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
-use crate::probe_util::{MOCK_AGENT_JS, ws_url_for};
+use crate::probe_util::MOCK_AGENT_JS;
 
 struct Check {
     name: &'static str,
@@ -26,7 +28,7 @@ struct Check {
 
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let mut checks: Vec<Check> = Vec::new();
     let finish = |checks: &[Check], elapsed: Duration| -> i32 {
         let summary = json!({
@@ -95,7 +97,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     // Sandbox + mock agent staged.
-    let sid = create_sandbox(&client, server, image).await;
+    let sid = create_sandbox(&client, image).await;
     let Some(sid) = sid else {
         checks.push(Check {
             name: "sandbox-create",
@@ -105,7 +107,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         let _ = actor.stop().await;
         return finish(&checks, started.elapsed());
     };
-    let Some(execd_base) = resolve_execd(&client, server, &sid).await else {
+    let Some(execd) = resolve_execd(&client, &sid).await else {
         checks.push(Check {
             name: "execd-endpoint",
             passed: false,
@@ -113,22 +115,21 @@ pub async fn run(server: &str, image: &str) -> i32 {
         });
         let _ = actor.stop().await;
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         return finish(&checks, started.elapsed());
     };
     let encoded = base64::engine::general_purpose::STANDARD.encode(MOCK_AGENT_JS);
     let _ = crate::probe_util::run_command_session_with_output(
-        &execd_base,
+        &execd,
         &format!(
             "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js"
         ),
     )
     .await;
     let agent_session = api::create_session(
-        &execd_base,
-        None,
+        &execd,
         CreateSessionRequest {
             cwd: Some("/workspace"),
             command: Some("node /workspace/mock-acp-agent.js"),
@@ -143,7 +144,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         });
         let _ = actor.stop().await;
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         return finish(&checks, started.elapsed());
@@ -167,7 +168,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         ),
     });
 
-    let ws_url = ws_url_for(&execd_base, &agent_session.session_id);
+    let ws_url = execd.ws_url(&agent_session.session_id);
     let mut pipe_session: PipeSession = match pipe::attach(&ws_url, AttachOptions::default()).await
     {
         Ok(session) => session,
@@ -179,7 +180,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             });
             let _ = actor.stop().await;
             let _ = client
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             return finish(&checks, started.elapsed());
@@ -350,9 +351,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     // Cleanup.
-    let _ = api::delete_session(&execd_base, None, &agent_session.session_id).await;
+    let _ = api::delete_session(&execd, &agent_session.session_id).await;
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -371,9 +372,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
     finish(&checks, started.elapsed())
 }
 
-async fn create_sandbox(client: &reqwest::Client, server: &str, image: &str) -> Option<String> {
+async fn create_sandbox(client: &ControlPlane, image: &str) -> Option<String> {
     client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -390,18 +391,16 @@ async fn create_sandbox(client: &reqwest::Client, server: &str, image: &str) -> 
         .map(str::to_string)
 }
 
-async fn resolve_execd(client: &reqwest::Client, server: &str, sid: &str) -> Option<String> {
-    let ep = client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+async fn resolve_execd(client: &ControlPlane, sid: &str) -> Option<ExecdEndpoint> {
+    let value = client
+        .get(&ControlPlane::endpoint_path(sid, 44772))
         .send()
         .await
         .ok()?
         .json::<Value>()
         .await
-        .ok()?["endpoint"]
-        .as_str()?
-        .to_string();
-    let execd = format!("http://{ep}");
+        .ok()?;
+    let execd = ExecdEndpoint::from_contract(&value)?;
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
     crate::probe_util::wait_for_execd(&execd).await;

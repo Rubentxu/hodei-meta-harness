@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use budget::ledger::{Admission, BudgetLedger, SandboxId, WaitReason};
 use budget::pressure::{PressureAction, PressureSignal, react};
 use budget::vector::{HostCapacity, ResourceVector};
+use opensandbox::control::ControlPlane;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use serde_json::{Value, json};
 
 struct Check {
@@ -38,7 +40,7 @@ fn host_measured_totals() -> ResourceVector {
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
 
     // AC-4: totals are MEASURED from this host; the reserve is configurable
     // and the published targets stay hypotheses.
@@ -94,7 +96,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // EFFECTIVE limits from inside via cgroups; run a measured workload,
     // then cancel it.
     let created = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -122,15 +124,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
         return finish(&checks, started.elapsed());
     }
     let execd = match client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await
     {
         Ok(r) => {
             let v: Value = r.json().await.unwrap_or_default();
-            format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
+            ExecdEndpoint::from_contract(&v).unwrap_or_default()
         }
-        Err(_) => String::new(),
+        Err(_) => ExecdEndpoint::default(),
     };
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
@@ -175,7 +177,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     .await;
     let workload_measured = workload.succeeded() && workload.output.contains("workload-cancelled");
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())

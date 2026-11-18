@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use super::api::{self, CreateSessionRequest};
+use super::endpoint::ExecdEndpoint;
 use super::frames::ServerEvent;
-use super::pipe::{self, AttachOptions};
+use super::pipe;
 
 /// How a one-shot ended when no terminal status was observed. The
 /// distinction matters: `NotAccepted` means the execd REFUSED the session,
@@ -70,14 +71,14 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// inside is able to answer: the first attempts are refused. Polling
 /// here is what turns that boot delay into a wait instead of a false
 /// "the command failed".
-pub async fn wait_until_ready(execd_base: &str, timeout: Duration) -> bool {
+pub async fn wait_until_ready(endpoint: &ExecdEndpoint, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if api::session_accepted(execd_base, None, READY_ATTEMPT_TIMEOUT).await {
+        if api::session_accepted(endpoint, READY_ATTEMPT_TIMEOUT).await {
             // Accepting a session is not enough: the pipe must attach
             // too. The probe command is harmless, so it can be repeated
             // as many times as needed.
-            let probe = run(execd_base, "true", Duration::from_secs(10)).await;
+            let probe = run(endpoint, "true", Duration::from_secs(10)).await;
             if probe.end == OneshotEnd::Completed {
                 return true;
             }
@@ -95,12 +96,12 @@ pub async fn wait_until_ready(execd_base: &str, timeout: Duration) -> bool {
 /// executed EXACTLY ONCE: a command that ran and failed is returned as
 /// it is, never repeated.
 pub async fn run_when_ready(
-    execd_base: &str,
+    endpoint: &ExecdEndpoint,
     command: &str,
     timeout: Duration,
     ready_timeout: Duration,
 ) -> OneshotOutcome {
-    if !wait_until_ready(execd_base, ready_timeout).await {
+    if !wait_until_ready(endpoint, ready_timeout).await {
         return OneshotOutcome {
             exit_code: None,
             output: format!("[execd did not accept a session within {ready_timeout:?}]"),
@@ -110,14 +111,7 @@ pub async fn run_when_ready(
             replayed: false,
         };
     }
-    run(execd_base, command, timeout).await
-}
-
-fn ws_url_for(execd_base: &str, session_id: &str) -> String {
-    let ws_base = execd_base
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1);
-    format!("{ws_base}/pty/{session_id}/ws?pty=0")
+    run(endpoint, command, timeout).await
 }
 
 /// The state of one-shot output collection.
@@ -188,10 +182,9 @@ pub fn apply_event(output: &mut Vec<u8>, collector: &mut Collector, event: Serve
 
 /// Run one command to its terminal state or to the timeout, whichever comes
 /// first. The pipe attaches IMMEDIATELY after session creation.
-pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotOutcome {
+pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> OneshotOutcome {
     let session = match api::create_session(
-        execd_base,
-        None,
+        endpoint,
         CreateSessionRequest {
             cwd: None,
             command: Some(command),
@@ -212,11 +205,11 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
         }
     };
 
-    let ws_url = ws_url_for(execd_base, &session.session_id);
+    let ws_url = endpoint.ws_url(&session.session_id);
     let mut output: Vec<u8> = Vec::new();
     let mut collector = Collector::default();
 
-    let attach_outcome = pipe::attach(&ws_url, AttachOptions::default()).await;
+    let attach_outcome = pipe::attach(&ws_url, endpoint.attach_options()).await;
     let attach_error = attach_outcome.as_ref().err().map(|e| e.to_string());
     if let Ok(mut pipe_session) = attach_outcome {
         let started = Instant::now();
@@ -270,7 +263,7 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
     // The execd keeps what it produced and replays it on a new attach,
     // and it says how many bytes it produced: a shorter collection is a
     // truncated output, never a complete one.
-    let expected = api::session_output_offset(execd_base, None, &session.session_id).await;
+    let expected = api::session_output_offset(endpoint, &session.session_id).await;
     // Two ways to know the output is short: the execd says it produced
     // more bytes than arrived, or the execd says nothing and the
     // command ended with no output at all — the signature of a tail
@@ -281,7 +274,7 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
     };
     let mut replay_error: Option<String> = None;
     if short {
-        match pipe::attach(&ws_url, AttachOptions::default()).await {
+        match pipe::attach(&ws_url, endpoint.attach_options()).await {
             Ok(mut replay_pipe) => {
                 replay_missing(
                     &mut replay_pipe,
@@ -298,7 +291,7 @@ pub async fn run(execd_base: &str, command: &str, timeout: Duration) -> OneshotO
             }
         }
     }
-    let _ = api::delete_session(execd_base, None, &session.session_id).await;
+    let _ = api::delete_session(endpoint, &session.session_id).await;
 
     // The completeness of the output, measured against what the execd
     // says it produced. The collection is a PREFIX of the session

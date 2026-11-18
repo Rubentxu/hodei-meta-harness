@@ -38,9 +38,10 @@ process.stdin.on('data', (chunk) => {
 use std::time::{Duration, Instant};
 
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::oneshot::OneshotOutcome;
-use opensandbox::execd::pipe::{self, AttachOptions};
+use opensandbox::execd::pipe;
 
 /// Bounded wait for a freshly created sandbox's execd to accept
 /// sessions. The port is published before the server inside answers.
@@ -51,9 +52,12 @@ pub const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The readiness wait uses a harmless probe, so the command runs
 /// EXACTLY ONCE. Without it, the first attempts are refused by the
 /// execd and the command is recorded as if it had failed.
-pub async fn run_in_sandbox(execd_base: &str, command: &str, timeout: Duration) -> OneshotOutcome {
-    opensandbox::execd::oneshot::run_when_ready(execd_base, command, timeout, EXECD_READY_TIMEOUT)
-        .await
+pub async fn run_in_sandbox(
+    execd: &ExecdEndpoint,
+    command: &str,
+    timeout: Duration,
+) -> OneshotOutcome {
+    opensandbox::execd::oneshot::run_when_ready(execd, command, timeout, EXECD_READY_TIMEOUT).await
 }
 
 /// Wait (BOUNDED) until the execd of a freshly created sandbox answers.
@@ -61,32 +65,16 @@ pub async fn run_in_sandbox(execd_base: &str, command: &str, timeout: Duration) 
 /// The port is published before the server inside can accept sessions:
 /// without this wait, an upload or a session creation right after the
 /// create fails for a reason that has nothing to do with the work.
-pub async fn wait_for_execd(execd_base: &str) -> bool {
-    opensandbox::execd::oneshot::wait_until_ready(execd_base, EXECD_READY_TIMEOUT).await
-}
-
-/// execd endpoints resolve as `http://host:port`; the pipe WebSocket reuses
-/// the same authority under the `ws` scheme.
-pub fn ws_url_for(execd_base: &str, session_id: &str) -> String {
-    let authority = execd_base
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .unwrap_or_else(|| {
-            execd_base
-                .strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-                .unwrap_or_else(|| execd_base.to_string())
-        });
-    format!("{authority}/pty/{session_id}/ws?pty=0")
+pub async fn wait_for_execd(execd: &ExecdEndpoint) -> bool {
+    opensandbox::execd::oneshot::wait_until_ready(execd, EXECD_READY_TIMEOUT).await
 }
 
 /// Same, returning captured output plus a trailing `EXIT:<code>` marker.
 /// One-shot commands may finish before the pipe attaches, so completion is
 /// tracked through the status endpoint and output is read via replay.
-pub async fn run_command_session_with_output(execd_base: &str, command: &str) -> String {
+pub async fn run_command_session_with_output(execd: &ExecdEndpoint, command: &str) -> String {
     let Ok(session) = api::create_session(
-        execd_base,
-        None,
+        execd,
         CreateSessionRequest {
             cwd: None,
             command: Some(command),
@@ -99,7 +87,7 @@ pub async fn run_command_session_with_output(execd_base: &str, command: &str) ->
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut running = true;
     while Instant::now() < deadline {
-        match api::session_status(execd_base, None, &session.session_id).await {
+        match api::session_status(execd, &session.session_id).await {
             Ok(status) => {
                 // A daemon that does not say whether the session runs
                 // is treated as a finished one: the reading below is
@@ -113,8 +101,8 @@ pub async fn run_command_session_with_output(execd_base: &str, command: &str) ->
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let ws_url = ws_url_for(execd_base, &session.session_id);
-    let Ok(mut pipe_session) = pipe::attach(&ws_url, AttachOptions::default()).await else {
+    let ws_url = execd.ws_url(&session.session_id);
+    let Ok(mut pipe_session) = pipe::attach(&ws_url, execd.attach_options()).await else {
         return String::new();
     };
     let mut output = Vec::new();
@@ -141,6 +129,6 @@ pub async fn run_command_session_with_output(execd_base: &str, command: &str) ->
     if !output.windows(5).any(|w| w == b"EXIT:") {
         output.extend(format!("\nEXIT:{}", if !running { 0 } else { -1 }).into_bytes());
     }
-    let _ = api::delete_session(execd_base, None, &session.session_id).await;
+    let _ = api::delete_session(execd, &session.session_id).await;
     String::from_utf8_lossy(&output).to_string()
 }

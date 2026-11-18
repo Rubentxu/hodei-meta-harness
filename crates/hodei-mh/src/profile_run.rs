@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use opensandbox::control::ControlPlane;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use profiles::build_plan::{self, BuildPlan};
 use profiles::credentials::{self, SubscriptionNote};
 use profiles::doctor::{self, DoctorCheck};
@@ -266,7 +268,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
     //
     // The create carries a REQUEST TAG: if the response is lost, the
     // effect is findable and is ADOPTED, never duplicated.
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let request_tag = format!(
         "profile-run-{}-{}",
         std::process::id(),
@@ -278,7 +280,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         "purpose": "hodei-profile-run",
     });
     let create_response = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": spec.image.full_reference()},
             "entrypoint": ["sleep", "infinity"],
@@ -305,7 +307,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
     };
     // Reconciliation: search by the request tag BEFORE any retry. A failed
     // search aborts — it never licenses a second sandbox.
-    let listed = match client.get(format!("{server}/v1/sandboxes")).send().await {
+    let listed = match client.get(ControlPlane::sandboxes_path()).send().await {
         Ok(response) => response.json::<Value>().await.ok(),
         Err(_) => None,
     };
@@ -340,7 +342,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
                 "sandbox create failed and no effect is on record (request-tag {request_tag}); retrying is safe"
             );
             match client
-                .post(format!("{server}/v1/sandboxes"))
+                .post(ControlPlane::sandboxes_path())
                 .json(&json!({
                     "image": {"uri": spec.image.full_reference()},
                     "entrypoint": ["sleep", "infinity"],
@@ -377,19 +379,16 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
     };
     let _ = search_failed;
-    let execd: String = match client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+    let execd: ExecdEndpoint = match client
+        .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await
     {
         Ok(response) => {
             let endpoint_value: Value = response.json().await.unwrap_or_default();
-            endpoint_value["endpoint"]
-                .as_str()
-                .map(|host| format!("http://{host}"))
-                .unwrap_or_default()
+            ExecdEndpoint::from_contract(&endpoint_value).unwrap_or_default()
         }
-        Err(_) => String::new(),
+        Err(_) => ExecdEndpoint::default(),
     };
 
     // The sandbox publishes its execd port BEFORE the server inside can
@@ -398,7 +397,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
     // wait instead of a false "the command failed".
     if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         eprintln!(
@@ -459,7 +458,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         let bytes = std::fs::read(&tgz_path).unwrap_or_default();
         let _ = std::fs::remove_file(&tgz_path);
         for _ in 0..3 {
-            if opensandbox::execd::api::upload_file(&execd, None, bytes.clone(), "/tmp/project.tgz")
+            if opensandbox::execd::api::upload_file(&execd, bytes.clone(), "/tmp/project.tgz")
                 .await
                 .is_ok()
             {
@@ -485,7 +484,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
     };
     if !packed || !uploaded || !staged_ok {
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         eprintln!(
@@ -570,7 +569,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
     let cleanup = match release {
         ReleaseDecision::Release { durable } => {
             match client
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await
             {

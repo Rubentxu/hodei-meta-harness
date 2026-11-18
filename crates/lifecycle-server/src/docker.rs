@@ -11,14 +11,16 @@ use bollard::body_full;
 use bollard::models::{ContainerCreateBody, PortBinding, PortMap};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder,
-    InspectContainerOptionsBuilder, ListContainersOptionsBuilder, ListImagesOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptionsBuilder, UploadToContainerOptionsBuilder,
+    InspectContainerOptionsBuilder, InspectNetworkOptionsBuilder, ListContainersOptionsBuilder,
+    ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
+    UploadToContainerOptionsBuilder,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
 
 use crate::compose::{self, HostSpec};
 use crate::model::error_codes;
+use crate::policy::NetworkPolicy;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
@@ -126,6 +128,88 @@ impl DockerAdapter {
             })
     }
 
+    /// The credential that authorizes the execution plane of a sandbox.
+    ///
+    /// It is read from the container, where the server injected it: the
+    /// server keeps no second copy of it, and it is never written to a
+    /// label, a log or a record.
+    pub async fn execd_access_token(&self, container: &str) -> Result<Option<String>, DockerError> {
+        let inspected = self.inspect(container).await?;
+        Ok(inspected
+            .config
+            .and_then(|config| config.env)
+            .and_then(|env| {
+                env.into_iter().find_map(|entry| {
+                    entry
+                        .strip_prefix(compose::EXECD_ACCESS_TOKEN_ENV)
+                        .map(|value| value.to_string())
+                })
+            })
+            .filter(|token| !token.is_empty()))
+    }
+
+    /// Make the sandbox network exist, and make sure it carries the
+    /// policy.
+    ///
+    /// A network that already exists is VERIFIED, not trusted: a
+    /// network without the internal property would hand the sandbox the
+    /// host's network, and a network with IPv6 would hand it a second
+    /// way out. Both stop the creation with the reason.
+    pub async fn ensure_network(&self, policy: &NetworkPolicy) -> Result<(), DockerError> {
+        let name = policy.network_name();
+        match self.inspect_network(name).await {
+            Ok(network) => {
+                if !network.internal.unwrap_or(false) {
+                    return Err(DockerError::Contract {
+                        code: error_codes::NETWORK_POLICY_VIOLATION,
+                        message: format!(
+                            "the network {name} exists and is NOT internal: the sandbox would \
+                             reach the host's network directly; remove it or point the policy \
+                             at another network"
+                        ),
+                    });
+                }
+                if network.enable_ipv6.unwrap_or(false) {
+                    return Err(DockerError::Contract {
+                        code: error_codes::NETWORK_POLICY_VIOLATION,
+                        message: format!(
+                            "the network {name} exists with IPv6 enabled: the sandbox would \
+                             have a second way out; remove it or point the policy at another \
+                             network"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Err(DockerError::Contract {
+                code: error_codes::SANDBOX_NOT_FOUND,
+                ..
+            }) => {
+                let request = bollard::models::NetworkCreateRequest {
+                    name: name.to_string(),
+                    driver: Some("bridge".to_string()),
+                    internal: Some(true),
+                    enable_ipv6: Some(false),
+                    ipam: Some(bollard::models::Ipam {
+                        driver: Some("default".to_string()),
+                        config: Some(vec![bollard::models::IpamConfig {
+                            subnet: Some(policy.subnet().to_string()),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                self.docker
+                    .create_network(request)
+                    .await
+                    .map_err(DockerError::op("create the sandbox network"))?;
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Extract execd + bootstrap.sh archives from the execd image, caching per
     /// platform key. Creates and removes a temporary `tail -f /dev/null`
     /// container exactly like the reference server does.
@@ -231,7 +315,12 @@ impl DockerAdapter {
                     (
                         port.to_string(),
                         Some(vec![PortBinding {
-                            host_ip: None,
+                            // The published port is bound to the
+                            // CONFIGURED address: the loopback by
+                            // default, so the sandbox is reachable from
+                            // the host and from the network the host
+                            // sits in, never.
+                            host_ip: Some(host.publish_address.clone()),
                             host_port: None,
                         }]),
                     )
@@ -250,6 +339,15 @@ impl DockerAdapter {
             port_bindings: Some(bindings),
             ..Default::default()
         };
+        // The container is attached to the network the policy names, and
+        // to no other: the default bridge would hand it the host's
+        // network.
+        let networking_config = bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                host.network_mode.clone(),
+                bollard::models::EndpointSettings::default(),
+            )])),
+        };
         let config: ContainerCreateBody = ContainerCreateBody {
             image: Some(image.to_string()),
             entrypoint: Some(vec![compose::BOOTSTRAP_PATH.to_string()]),
@@ -261,6 +359,7 @@ impl DockerAdapter {
                 compose::HTTP_CONTAINER_PORT.to_string(),
             ]),
             host_config: Some(host_config),
+            networking_config: Some(networking_config),
             ..Default::default()
         };
         let options = CreateContainerOptionsBuilder::new()
@@ -347,6 +446,23 @@ impl DockerAdapter {
                     status_code: 404, ..
                 } => DockerError::not_found(format!("sandbox container {container:?}")),
                 _ => DockerError::op("inspect container")(e),
+            })
+    }
+
+    /// Inspect a network by name.
+    pub async fn inspect_network(
+        &self,
+        network: &str,
+    ) -> Result<bollard::models::NetworkInspect, DockerError> {
+        let options = InspectNetworkOptionsBuilder::new().build();
+        self.docker
+            .inspect_network(network, Some(options))
+            .await
+            .map_err(|e| match &e {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => DockerError::not_found(format!("network {network:?}")),
+                _ => DockerError::op("inspect network")(e),
             })
     }
 

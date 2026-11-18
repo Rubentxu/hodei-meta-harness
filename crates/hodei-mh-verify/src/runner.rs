@@ -17,7 +17,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 
 use crate::evidence::{BoundResult, CheckBinding, EvidenceBinding, EvidenceSet};
 use crate::git::{GitRevision, GitTree, RevisionMatch, compare};
@@ -100,7 +102,7 @@ impl CleanRunner {
             )));
         }
 
-        let client = reqwest::Client::new();
+        let client = ControlPlane::new(&self.lifecycle_url);
         // Every sandbox of this run carries a unique token in its
         // metadata: a create that fails after the server created the
         // container is still findable, so no path leaves residue.
@@ -131,7 +133,7 @@ impl CleanRunner {
         }
         .await;
         let deleted = client
-            .delete(format!("{}/v1/sandboxes/{sandbox_id}", self.lifecycle_url))
+            .delete(&ControlPlane::sandbox_path(&sandbox_id))
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -171,11 +173,11 @@ impl CleanRunner {
     /// fails after the container exists still leaves a findable sandbox.
     async fn create_sandbox(
         &self,
-        client: &reqwest::Client,
+        client: &ControlPlane,
         marker: &str,
     ) -> Result<(String, serde_json::Value), RunnerError> {
         let response = client
-            .post(format!("{}/v1/sandboxes", self.lifecycle_url))
+            .post(ControlPlane::sandboxes_path())
             .json(&serde_json::json!({
                 "image": {"uri": self.image},
                 "entrypoint": ["sleep", "infinity"],
@@ -208,11 +210,8 @@ impl CleanRunner {
     /// Delete the sandboxes of this run whose response could not be read:
     /// the marker in their metadata identifies them. Returns what the
     /// cleanup did, for the error the caller reports.
-    async fn delete_marked(&self, client: &reqwest::Client, marker: &str) -> String {
-        let listed = client
-            .get(format!("{}/v1/sandboxes", self.lifecycle_url))
-            .send()
-            .await;
+    async fn delete_marked(&self, client: &ControlPlane, marker: &str) -> String {
+        let listed = client.get(ControlPlane::sandboxes_path()).send().await;
         let Ok(response) = listed else {
             return "the control plane could not be asked for the orphans".to_string();
         };
@@ -231,7 +230,7 @@ impl CleanRunner {
                 continue;
             };
             let deleted = client
-                .delete(format!("{}/v1/sandboxes/{id}", self.lifecycle_url))
+                .delete(&ControlPlane::sandbox_path(id))
                 .send()
                 .await
                 .map(|response| response.status().is_success())
@@ -247,7 +246,7 @@ impl CleanRunner {
 
     async fn run_checks_on(
         &self,
-        client: &reqwest::Client,
+        client: &ControlPlane,
         sandbox_id: &str,
         image_id: &str,
         transport: &TransportDigest,
@@ -255,10 +254,7 @@ impl CleanRunner {
         checks: &[Check],
     ) -> Result<(Vec<BoundResult>, ObservedCandidate), RunnerError> {
         let endpoint = client
-            .get(format!(
-                "{}/v1/sandboxes/{sandbox_id}/endpoints/44772",
-                self.lifecycle_url
-            ))
+            .get(&ControlPlane::endpoint_path(sandbox_id, 44772))
             .send()
             .await
             .map_err(|e| RunnerError(format!("endpoint resolve: {e}")))?;
@@ -266,16 +262,14 @@ impl CleanRunner {
             .json()
             .await
             .map_err(|e| RunnerError(e.to_string()))?;
-        let host = value["endpoint"]
-            .as_str()
+        let execd = ExecdEndpoint::from_contract(&value)
             .ok_or_else(|| RunnerError("no execd endpoint".into()))?;
-        let execd_base = format!("http://{host}");
         let environment = format!("{image_id}::{sandbox_id}");
 
         // The sandbox publishes its execd port BEFORE the server inside
         // can answer: wait (bounded) for it, so the upload does not fail
         // for a reason that has nothing to do with the candidate.
-        if !opensandbox::execd::oneshot::wait_until_ready(&execd_base, EXECD_READY_TIMEOUT).await {
+        if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
             return Err(RunnerError(
                 "the sandbox execd never became usable".to_string(),
             ));
@@ -285,14 +279,9 @@ impl CleanRunner {
         // right after creation; a short retry covers that window.
         let mut uploaded = Err(RunnerError("bundle upload not attempted".into()));
         for attempt in 0..5 {
-            uploaded = api::upload_file(
-                &execd_base,
-                None,
-                candidate.bundle.clone(),
-                "/tmp/candidate.bundle",
-            )
-            .await
-            .map_err(|e| RunnerError(format!("bundle upload: {e}")));
+            uploaded = api::upload_file(&execd, candidate.bundle.clone(), "/tmp/candidate.bundle")
+                .await
+                .map_err(|e| RunnerError(format!("bundle upload: {e}")));
             if uploaded.is_ok() {
                 break;
             }
@@ -305,7 +294,7 @@ impl CleanRunner {
         // fails here instead of producing bogus verdicts. The product flow
         // normalizes candidate repos to branch `main`.
         let prepared = run_with_timeout(
-            &execd_base,
+            &execd,
             "git init -q -b main /workspace/checkout && git -C /workspace/checkout fetch -q /tmp/candidate.bundle 'refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/checkout checkout -q -f -B main refs/remotes/bundle/main",
             Duration::from_secs(60),
         )
@@ -320,7 +309,7 @@ impl CleanRunner {
         // What was actually checked out must be what the candidate claims:
         // the head and the content it carries. Both are observed in the
         // sandbox, and both are compared BEFORE any check runs.
-        let observed_head = observe(&execd_base, "git rev-parse HEAD").await?;
+        let observed_head = observe(&execd, "git rev-parse HEAD").await?;
         let observed_revision = GitRevision::parse(&observed_head)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable head: {e}")))?;
         if let RevisionMatch::Differs { declared, observed } =
@@ -332,7 +321,7 @@ impl CleanRunner {
                 observed.as_str()
             )));
         }
-        let observed_tree = observe(&execd_base, "git rev-parse HEAD^{tree}").await?;
+        let observed_tree = observe(&execd, "git rev-parse HEAD^{tree}").await?;
         let observed_tree = GitTree::parse(&observed_tree)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable tree: {e}")))?;
         if observed_tree != candidate.tree {
@@ -346,7 +335,7 @@ impl CleanRunner {
         let mut bound = Vec::new();
         for check in checks {
             let command = format!("cd {CHECKOUT} && {}", check.command);
-            let record = run_with_timeout(&execd_base, &command, self.timeout).await;
+            let record = run_with_timeout(&execd, &command, self.timeout).await;
             bound.push(BoundResult {
                 check_id: check.id.clone(),
                 environment: environment.clone(),
@@ -409,9 +398,9 @@ fn observed_image_id(created: &serde_json::Value) -> Result<String, RunnerError>
 
 /// Run one command and read its output: a command that does not succeed is
 /// an observation failure, never an empty observation.
-async fn observe(execd_base: &str, command: &str) -> Result<String, RunnerError> {
+async fn observe(execd: &ExecdEndpoint, command: &str) -> Result<String, RunnerError> {
     let outcome = opensandbox::execd::oneshot::run_when_ready(
-        execd_base,
+        execd,
         &format!("cd {CHECKOUT} && {command}"),
         OBSERVE_TIMEOUT,
         EXECD_READY_TIMEOUT,
@@ -433,14 +422,14 @@ async fn observe(execd_base: &str, command: &str) -> Result<String, RunnerError>
 /// The sandbox may still be booting when the verification starts: the
 /// execd refuses the first attempts. The readiness wait runs a harmless
 /// probe, so the check command itself runs EXACTLY ONCE.
-async fn run_with_timeout(execd_base: &str, command: &str, timeout: Duration) -> ExecutionRecord {
-    let outcome = opensandbox::execd::oneshot::run_when_ready(
-        execd_base,
-        command,
-        timeout,
-        EXECD_READY_TIMEOUT,
-    )
-    .await;
+async fn run_with_timeout(
+    execd: &ExecdEndpoint,
+    command: &str,
+    timeout: Duration,
+) -> ExecutionRecord {
+    let outcome =
+        opensandbox::execd::oneshot::run_when_ready(execd, command, timeout, EXECD_READY_TIMEOUT)
+            .await;
     match outcome.exit_code {
         Some(code) => ExecutionRecord::terminal(command, code, outcome.output),
         None => ExecutionRecord::absent(

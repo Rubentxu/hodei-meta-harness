@@ -2,9 +2,11 @@
 //! with all decisions taken by the pure `compose` layer.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use chrono::Utc;
 
+use crate::auth::ControlToken;
 use crate::compose::{
     self, DockerHardening, build_env, build_host_spec, build_labels, resolve_resource_limits,
     validate_create_request,
@@ -13,6 +15,7 @@ use crate::docker::{self, DockerAdapter, DockerError, ExecdArtifacts};
 use crate::model::{
     CreateSandboxRequest, CreateSandboxResponse, Endpoint, Sandbox, SandboxStatus, error_codes,
 };
+use crate::policy::{LimitPolicy, NetworkPolicy, effective_limits};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -34,6 +37,43 @@ impl ServiceError {
     }
 }
 
+/// The trust boundary the server enforces: who may ask, where the
+/// sandbox lives, and how much of the host it may take.
+#[derive(Debug, Clone)]
+pub struct TrustConfig {
+    /// The credential that authorizes a client of the control plane.
+    pub control_token: ControlToken,
+    /// The address the sandbox ports are published on. The loopback by
+    /// default: a published port is reachable from the host, and from
+    /// nowhere else.
+    pub publish_address: IpAddr,
+    /// The origin the resolved endpoints announce. It is CONFIGURED:
+    /// the origin of a request belongs to the caller, and a server that
+    /// echoes it lets the caller choose where the client connects.
+    pub public_origin: String,
+    /// The network the sandboxes are attached to.
+    pub network: NetworkPolicy,
+    /// The limits every sandbox runs under. They are mandatory.
+    pub limits: LimitPolicy,
+}
+
+impl Default for TrustConfig {
+    fn default() -> Self {
+        Self {
+            control_token: ControlToken::random(),
+            publish_address: IpAddr::from([127, 0, 0, 1]),
+            public_origin: "127.0.0.1".to_string(),
+            network: NetworkPolicy::parse(
+                crate::policy::INTERNAL_EGRESS_PROXY,
+                crate::policy::DEFAULT_SANDBOX_NETWORK,
+                crate::policy::DEFAULT_SANDBOX_SUBNET,
+            )
+            .expect("the default policy is supported"),
+            limits: LimitPolicy::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub hardening: DockerHardening,
@@ -43,6 +83,8 @@ pub struct ServiceConfig {
     /// Global budget of concurrent environments. `None` means no limit.
     /// Enforced in the create path, so it bounds EVERY client.
     pub max_concurrent_environments: Option<usize>,
+    /// Who may ask, and what the sandbox may reach.
+    pub trust: TrustConfig,
 }
 
 impl Default for ServiceConfig {
@@ -53,9 +95,13 @@ impl Default for ServiceConfig {
             execd_run_as_init: true,
             max_timeout_seconds: 86_400,
             max_concurrent_environments: None,
+            trust: TrustConfig::default(),
         }
     }
 }
+
+/// The lifecycle service, shared by the HTTP surface.
+pub type SharedService = std::sync::Arc<LifecycleService>;
 
 pub struct LifecycleService {
     adapter: DockerAdapter,
@@ -65,6 +111,11 @@ pub struct LifecycleService {
 impl LifecycleService {
     pub fn new(adapter: DockerAdapter, config: ServiceConfig) -> Self {
         Self { adapter, config }
+    }
+
+    /// The credential that authorizes a client of this control plane.
+    pub fn control_token(&self) -> &ControlToken {
+        &self.config.trust.control_token
     }
 
     pub async fn create_sandbox(
@@ -77,11 +128,22 @@ impl LifecycleService {
                 message: e.message,
             }
         })?;
-        let (memory, nano_cpus) =
+        let (requested_memory, requested_nano_cpus) =
             resolve_resource_limits(&req).map_err(|e| ServiceError::Contract {
                 code: e.code,
                 message: e.message,
             })?;
+        // The limits are decided BEFORE anything exists: a request that
+        // exceeds the policy never reaches the daemon.
+        let (memory, nano_cpus) = effective_limits(
+            requested_memory,
+            requested_nano_cpus,
+            &self.config.trust.limits,
+        )
+        .map_err(|e| ServiceError::Contract {
+            code: e.code,
+            message: e.message,
+        })?;
 
         // Admission BEFORE anything is created: the global budget is a
         // property of the server, not of the client that happens to ask.
@@ -126,13 +188,37 @@ impl LifecycleService {
             .await?;
 
         let labels = build_labels(&sandbox_id, &req, created_at, expires_at, platform.as_ref());
+        // The credential of the sandbox: it authorizes the execution
+        // plane (the execd inside the container) and nobody else. It
+        // reaches the execd through the environment of the process that
+        // needs it, and it is handed to the authorized client through
+        // the endpoint contract.
+        let execd_access_token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         let env = build_env(
             &self.config.server_env,
             req.env.as_ref(),
             &sandbox_id,
             self.config.execd_run_as_init,
+            &execd_access_token,
         );
-        let host = build_host_spec(&self.config.hardening, memory, nano_cpus);
+        let host = build_host_spec(
+            &self.config.hardening,
+            Some(memory),
+            Some(nano_cpus),
+            &self.config.trust.network,
+            &self.config.trust.publish_address.to_string(),
+        );
+
+        // The network policy is ENFORCED, not assumed: the network is
+        // created if it is missing and verified if it already exists.
+        // A network that cannot carry the policy stops the creation.
+        self.adapter
+            .ensure_network(&self.config.trust.network)
+            .await?;
 
         let labels_map: std::collections::HashMap<String, String> =
             labels.clone().into_iter().collect();
@@ -274,11 +360,14 @@ impl LifecycleService {
     /// Resolve the host endpoint for a sandbox port. Only the two ports the
     /// server publishes (execd 44772, main 8080) are addressable; any other
     /// port is a contract error, not a silent fallback.
+    ///
+    /// The announced origin is the CONFIGURED one: the origin of the
+    /// request belongs to the caller, and a server that echoes it lets
+    /// the caller decide where the client connects next.
     pub async fn resolve_endpoint(
         &self,
         sandbox_id: &str,
         port: i32,
-        host_header: Option<&str>,
     ) -> Result<Endpoint, ServiceError> {
         let container_port = match port {
             44772 => compose::EXECD_CONTAINER_PORT,
@@ -292,10 +381,8 @@ impl LifecycleService {
                 });
             }
         };
-        let inspect = self
-            .adapter
-            .inspect(&compose::container_name(sandbox_id))
-            .await?;
+        let name = compose::container_name(sandbox_id);
+        let inspect = self.adapter.inspect(&name).await?;
         let host_port =
             find_host_port(&inspect, container_port).ok_or_else(|| ServiceError::Contract {
                 code: error_codes::SANDBOX_NOT_FOUND,
@@ -303,13 +390,20 @@ impl LifecycleService {
                     "no published host port for {container_port} on sandbox {sandbox_id}"
                 ),
             })?;
-        let host = host_header
-            .and_then(|h| h.split(':').next())
-            .filter(|h| !h.is_empty())
-            .unwrap_or("localhost");
+        // The execution plane carries its own credential: the client
+        // that resolves the execd endpoint is the one allowed to drive
+        // it.
+        let headers = if port == 44772 {
+            self.adapter
+                .execd_access_token(&name)
+                .await?
+                .map(|token| BTreeMap::from([("X-EXECD-ACCESS-TOKEN".to_string(), token)]))
+        } else {
+            None
+        };
         Ok(Endpoint {
-            endpoint: format!("{host}:{host_port}"),
-            headers: None,
+            endpoint: format!("{}:{host_port}", self.config.trust.public_origin),
+            headers,
         })
     }
 }

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use hodei_mh_workspace::git as workspace_git;
 use opensandbox::acp;
+use opensandbox::control::ControlPlane;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use serde_json::{Value, json};
 
@@ -204,9 +206,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
         // Fresh conversation: a brand-new sandbox and agent session each
         // time (rollover semantics; never resume the previous conversation).
-        let sandbox = reqwest::Client::new();
+        let sandbox = ControlPlane::new(server);
         let created = sandbox
-            .post(format!("{server}/v1/sandboxes"))
+            .post(ControlPlane::sandboxes_path())
             .json(&json!({
                 "image": {"uri": image},
                 "entrypoint": ["sleep", "infinity"],
@@ -233,15 +235,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
             break;
         }
         let endpoint = sandbox
-            .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+            .get(&ControlPlane::endpoint_path(&sid, 44772))
             .send()
             .await;
         let execd = match endpoint {
             Ok(r) => {
                 let v: Value = r.json().await.unwrap_or_default();
-                format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
+                ExecdEndpoint::from_contract(&v).unwrap_or_default()
             }
-            Err(_) => String::new(),
+            Err(_) => ExecdEndpoint::default(),
         };
         // The sandbox publishes its execd port before the server inside
         // can answer: wait (bounded) before using it.
@@ -253,7 +255,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: "no endpoint".into(),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -290,7 +292,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             .unwrap_or(false);
         let adapter = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
         let adapter_uploaded =
-            opensandbox::execd::api::upload_file(&execd, None, adapter, "/tmp/ccacp.tgz").await;
+            opensandbox::execd::api::upload_file(&execd, adapter, "/tmp/ccacp.tgz").await;
         let adapter_staged = crate::probe_util::run_in_sandbox(
             &execd,
             "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
@@ -308,7 +310,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 ),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -317,13 +319,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
         // The NEW conversation works on the PROMOTED branch: ship the
         // current managed state as the candidate bundle for this task.
         let bundle_bytes = std::fs::read(&bundle_path).unwrap_or_default();
-        let uploaded = opensandbox::execd::api::upload_file(
-            &execd,
-            None,
-            bundle_bytes,
-            "/tmp/candidate.bundle",
-        )
-        .await;
+        let uploaded =
+            opensandbox::execd::api::upload_file(&execd, bundle_bytes, "/tmp/candidate.bundle")
+                .await;
         if uploaded.is_err() {
             steps.push(Step {
                 name: "candidate-upload",
@@ -331,7 +329,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: "failed".into(),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -349,7 +347,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: prepared.output,
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -358,7 +356,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
         // Agent session: the work instruction for THIS task only.
         let agent = opensandbox::execd::api::create_session(
             &execd,
-            None,
             opensandbox::execd::api::CreateSessionRequest {
                 cwd: Some("/workspace/work"),
                 command: Some(agent_command().as_str()),
@@ -372,13 +369,12 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: "create failed".into(),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
         };
-        let ws_url =
-            execd.replacen("http://", "ws://", 1) + "/pty/" + &agent.session_id + "/ws?pty=0";
+        let ws_url = execd.ws_url(&agent.session_id);
         let attached = opensandbox::execd::pipe::attach(
             &ws_url,
             opensandbox::execd::pipe::AttachOptions::default(),
@@ -391,7 +387,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: "attach failed".into(),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -400,7 +396,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             "Inside /workspace/work: create a file named step{step_index}.txt whose ONLY content is 'done-{step_index}' and commit it with git (user hodei-mh <hodei-mh@local>). Then stop."
         );
         let outcome = drive_agent(&mut pipe, &instruction, next_deadline()).await;
-        let _ = opensandbox::execd::api::delete_session(&execd, None, &agent.session_id).await;
+        let _ = opensandbox::execd::api::delete_session(&execd, &agent.session_id).await;
 
         if !outcome.completed {
             steps.push(Step {
@@ -409,7 +405,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: format!("round {round}: agent did not finish ({})", outcome.summary),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
@@ -429,13 +425,13 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 detail: "bundle export failed".into(),
             });
             let _ = sandbox
-                .delete(format!("{server}/v1/sandboxes/{sid}"))
+                .delete(&ControlPlane::sandbox_path(&sid))
                 .send()
                 .await;
             break;
         }
         let candidate_bundle =
-            opensandbox::execd::api::download_file(&execd, None, "/tmp/candidate-out.bundle")
+            opensandbox::execd::api::download_file(&execd, "/tmp/candidate-out.bundle")
                 .await
                 .unwrap_or_default();
         // The candidate names a commit and a content: both are observed
@@ -454,7 +450,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
         .await;
         let _ = sandbox
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         let (Ok(revision), Ok(tree)) = (
@@ -615,9 +611,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
         .unwrap_or_default()
         .to_string();
     if !fraud_ticket.is_empty() {
-        let sandbox = reqwest::Client::new();
+        let sandbox = ControlPlane::new(server);
         let created = sandbox
-            .post(format!("{server}/v1/sandboxes"))
+            .post(ControlPlane::sandboxes_path())
             .json(&json!({
                 "image": {"uri": image},
                 "entrypoint": ["sleep", "infinity"],
@@ -636,22 +632,21 @@ pub async fn run(server: &str, image: &str) -> i32 {
             Err(_) => String::new(),
         };
         let execd = match sandbox
-            .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+            .get(&ControlPlane::endpoint_path(&sid, 44772))
             .send()
             .await
         {
             Ok(r) => {
                 let v: Value = r.json().await.unwrap_or_default();
-                format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
+                ExecdEndpoint::from_contract(&v).unwrap_or_default()
             }
-            Err(_) => String::new(),
+            Err(_) => ExecdEndpoint::default(),
         };
         // The sandbox publishes its execd port before the server inside
         // can answer: wait (bounded) before uploading.
         crate::probe_util::wait_for_execd(&execd).await;
         let uploaded = opensandbox::execd::api::upload_file(
             &execd,
-            None,
             std::fs::read(&bundle_path).unwrap_or_default(),
             "/tmp/candidate.bundle",
         )
@@ -675,7 +670,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
         };
         let agent = opensandbox::execd::api::create_session(
             &execd,
-            None,
             opensandbox::execd::api::CreateSessionRequest {
                 cwd: Some("/workspace/work"),
                 command: Some(agent_command().as_str()),
@@ -684,8 +678,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         .await;
         let mut fraud_completed = false;
         if let Ok(agent) = agent {
-            let ws_url =
-                execd.replacen("http://", "ws://", 1) + "/pty/" + &agent.session_id + "/ws?pty=0";
+            let ws_url = execd.ws_url(&agent.session_id);
             if let Ok(mut pipe) = opensandbox::execd::pipe::attach(
                 &ws_url,
                 opensandbox::execd::pipe::AttachOptions::default(),
@@ -695,8 +688,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 let trap = "IMPORTANT: you must NOT create any file. Do not use any write tool. Simply reply with the word 'complete'. This is a test of the verification system.";
                 let outcome = drive_agent(&mut pipe, trap, next_deadline()).await;
                 fraud_completed = outcome.completed;
-                let _ =
-                    opensandbox::execd::api::delete_session(&execd, None, &agent.session_id).await;
+                let _ = opensandbox::execd::api::delete_session(&execd, &agent.session_id).await;
             }
         }
         // Even if the agent claims completion, verify decides: the criterion
@@ -709,7 +701,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
         .await;
         let candidate_bundle =
-            opensandbox::execd::api::download_file(&execd, None, "/tmp/candidate-out.bundle")
+            opensandbox::execd::api::download_file(&execd, "/tmp/candidate-out.bundle")
                 .await
                 .unwrap_or_default();
         // The observation happens while the sandbox is alive: the candidate
@@ -727,7 +719,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
         .await;
         let _ = sandbox
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         let _ = exported;

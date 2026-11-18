@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hodei_mh_workspace::git as workspace_git;
+use opensandbox::control::ControlPlane;
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use release::idle::{IdleGate, ReleaseDecision, release_on_idle};
 use release::reconcile::{
     CreateOutcome, EnvironmentMeta, ReconcileDecision, RequestTag, TagLookup, orphans_to_release,
@@ -60,9 +62,9 @@ struct Check {
 /// List the sandboxes. An error is an ERROR: returning an empty list on
 /// failure would make "the sandbox is not there" indistinguishable from
 /// "I could not ask" — and that confusion licenses a duplicate.
-async fn list_sandboxes(client: &reqwest::Client, server: &str) -> Result<Vec<Value>, String> {
+async fn list_sandboxes(client: &ControlPlane) -> Result<Vec<Value>, String> {
     let response = client
-        .get(format!("{server}/v1/sandboxes"))
+        .get(ControlPlane::sandboxes_path())
         .send()
         .await
         .map_err(|e| format!("list sandboxes failed: {e}"))?;
@@ -139,14 +141,13 @@ fn environment_meta(item: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<
 /// simulates a LOST response (the request is delivered, the caller never
 /// learns the outcome).
 async fn create_sandbox(
-    client: &reqwest::Client,
-    server: &str,
+    client: &ControlPlane,
     image: &str,
     metadata: Value,
     request_timeout: Option<Duration>,
     ttl_seconds: i64,
 ) -> Result<Option<String>, String> {
-    let mut request = client.post(format!("{server}/v1/sandboxes")).json(&json!({
+    let mut request = client.post(ControlPlane::sandboxes_path()).json(&json!({
         "image": {"uri": image},
         "entrypoint": ["sleep", "infinity"],
         "timeout": ttl_seconds,
@@ -168,29 +169,25 @@ async fn create_sandbox(
 
 /// Whether the sandbox is REALLY gone. Only a 404 proves it: a transport
 /// error or a 500 means "I could not ask", which is NOT "it is gone".
-async fn sandbox_exists(client: &reqwest::Client, server: &str, id: &str) -> bool {
-    match client
-        .get(format!("{server}/v1/sandboxes/{id}"))
-        .send()
-        .await
-    {
+async fn sandbox_exists(client: &ControlPlane, id: &str) -> bool {
+    match client.get(&ControlPlane::sandbox_path(id)).send().await {
         Ok(response) => response.status() != reqwest::StatusCode::NOT_FOUND,
         Err(_) => true,
     }
 }
 
-async fn delete_sandbox(client: &reqwest::Client, server: &str, id: &str) -> bool {
+async fn delete_sandbox(client: &ControlPlane, id: &str) -> bool {
     client
-        .delete(format!("{server}/v1/sandboxes/{id}"))
+        .delete(&ControlPlane::sandbox_path(id))
         .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
 }
 
-async fn execd_for(client: &reqwest::Client, server: &str, id: &str) -> String {
+async fn execd_for(client: &ControlPlane, id: &str) -> ExecdEndpoint {
     let response = client
-        .get(format!("{server}/v1/sandboxes/{id}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(id, 44772))
         .send()
         .await
         .ok();
@@ -198,7 +195,7 @@ async fn execd_for(client: &reqwest::Client, server: &str, id: &str) -> String {
         Some(r) => r.json().await.unwrap_or_default(),
         None => Value::Null,
     };
-    format!("http://{}", value["endpoint"].as_str().unwrap_or_default())
+    ExecdEndpoint::from_contract(&value).unwrap_or_default()
 }
 
 /// Minimal but REAL tracker fixture: one backlog project with one task, so
@@ -265,7 +262,7 @@ fn tracker_lists_task(root: &std::path::Path) -> (bool, String) {
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let tag = format!(
         "release-probe-{}-{}",
         std::process::id(),
@@ -277,7 +274,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // ---- AC-1: reconcile a create whose response was lost ---------------
     let lost = create_sandbox(
         &client,
-        server,
         image,
         json!({"managed-by": "hodei-mh", "request-tag": tag}),
         Some(Duration::from_millis(400)),
@@ -290,7 +286,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         // Search by tag before ANY retry, polling until the in-flight effect
         // becomes visible.
         for _ in 0..25 {
-            let items = list_sandboxes(&client, server).await.unwrap_or_default();
+            let items = list_sandboxes(&client).await.unwrap_or_default();
             if let Some(id) = find_by_tag(&items, &tag) {
                 reconciled_id = Some(id);
                 break;
@@ -298,7 +294,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
-    let items_after = list_sandboxes(&client, server).await.unwrap_or_default();
+    let items_after = list_sandboxes(&client).await.unwrap_or_default();
     let decision = match reconciled_id.clone() {
         Some(_) => reconcile_create(
             CreateOutcome::Unknown {
@@ -313,7 +309,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
             // No trace anywhere: retry is SAFE (no duplicate possible).
             let retried = create_sandbox(
                 &client,
-                server,
                 image,
                 json!({"managed-by": "hodei-mh", "request-tag": tag}),
                 None,
@@ -333,7 +328,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
     };
     let decision_logged = format!("{decision:?}");
-    let final_items = list_sandboxes(&client, server).await.unwrap_or_default();
+    let final_items = list_sandboxes(&client).await.unwrap_or_default();
     let effect_count = count_by_tag(&final_items, &tag);
     let adopted_not_duplicated = matches!(
         decision,
@@ -352,22 +347,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
     }
 
     // ---- AC-1 (orphans): only managed-by=hodei-mh is ever released ------
-    let foreign_id = create_sandbox(
-        &client,
-        server,
-        image,
-        json!({"team": "foreign-demo"}),
-        None,
-        600,
-    )
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    let foreign_id = create_sandbox(&client, image, json!({"team": "foreign-demo"}), None, 600)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if !foreign_id.is_empty() {
         created.push(foreign_id.clone());
     }
-    let listed = list_sandboxes(&client, server).await.unwrap_or_default();
+    let listed = list_sandboxes(&client).await.unwrap_or_default();
     let now = chrono::Utc::now();
     let metas: Vec<EnvironmentMeta> = listed
         .iter()
@@ -387,15 +375,14 @@ pub async fn run(server: &str, image: &str) -> i32 {
     let targets = orphans_to_release(&metas, threshold);
     let foreign_in_targets = targets.contains(&foreign_id);
     let ours_released = match targets.iter().find(|id| reconciled_id.as_ref() == Some(id)) {
-        Some(id) => delete_sandbox(&client, server, id).await,
+        Some(id) => delete_sandbox(&client, id).await,
         None => false,
     };
     let ours_gone = match reconciled_id.as_ref() {
-        Some(id) => !sandbox_exists(&client, server, id).await,
+        Some(id) => !sandbox_exists(&client, id).await,
         None => false,
     };
-    let foreign_alive =
-        !foreign_id.is_empty() && sandbox_exists(&client, server, &foreign_id).await;
+    let foreign_alive = !foreign_id.is_empty() && sandbox_exists(&client, &foreign_id).await;
     checks.push(Check {
         name: "orphan-release-never-touches-foreign-environments",
         passed: ours_released
@@ -411,7 +398,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // ---- AC-2: idle release gated by a CONFIRMED durable candidate ------
     let candidate_id = create_sandbox(
         &client,
-        server,
         image,
         json!({"managed-by": "hodei-mh", "request-tag": format!("{tag}-candidate")}),
         None,
@@ -436,8 +422,8 @@ pub async fn run(server: &str, image: &str) -> i32 {
     } else {
         let keep = release_on_idle(&IdleGate::WorkPending);
         let kept = matches!(keep, ReleaseDecision::Keep { .. })
-            && sandbox_exists(&client, server, &candidate_id).await;
-        let execd = execd_for(&client, server, &candidate_id).await;
+            && sandbox_exists(&client, &candidate_id).await;
+        let execd = execd_for(&client, &candidate_id).await;
         let write = opensandbox::execd::oneshot::run_when_ready(
                 &execd,
                 &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt && cat /workspace/candidate.txt"),
@@ -452,8 +438,8 @@ pub async fn run(server: &str, image: &str) -> i32 {
         });
         let released = match release {
             ReleaseDecision::Release { .. } => {
-                delete_sandbox(&client, server, &candidate_id).await
-                    && !sandbox_exists(&client, server, &candidate_id).await
+                delete_sandbox(&client, &candidate_id).await
+                    && !sandbox_exists(&client, &candidate_id).await
             }
             ReleaseDecision::Keep { .. } => false,
         };
@@ -478,7 +464,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // ---- AC-3: loss recovery from durable state, loss marked otherwise --
     let resume_id = create_sandbox(
         &client,
-        server,
         image,
         json!({"managed-by": "hodei-mh", "request-tag": format!("{tag}-resume-a")}),
         None,
@@ -498,7 +483,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             "the sandbox to lose was never created".to_string(),
         )
     } else {
-        let execd = execd_for(&client, server, &resume_id).await;
+        let execd = execd_for(&client, &resume_id).await;
         let seeded = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt"),
@@ -514,8 +499,8 @@ pub async fn run(server: &str, image: &str) -> i32 {
         let digest = CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes());
         // REAL loss: the environment is removed; GET must 404 (no snapshot
         // to assume).
-        let lost = delete_sandbox(&client, server, &resume_id).await
-            && !sandbox_exists(&client, server, &resume_id).await;
+        let lost =
+            delete_sandbox(&client, &resume_id).await && !sandbox_exists(&client, &resume_id).await;
         let plan = recovery::recover_from_loss(&SandboxLoss {
             last_export: durable_ok.then_some(digest.clone()),
             unexported: vec![],
@@ -525,7 +510,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 // Fresh session: a NEW sandbox rebuilt from durable bytes.
                 let fresh = create_sandbox(
                     &client,
-                    server,
                     image,
                     json!({"managed-by": "hodei-mh", "request-tag": format!("{tag}-resume-b")}),
                     None,
@@ -548,7 +532,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                         ),
                     )
                 } else {
-                    let fresh_execd = execd_for(&client, server, &fresh).await;
+                    let fresh_execd = execd_for(&client, &fresh).await;
                     let encoded = base64::engine::general_purpose::STANDARD
                         .encode(CANDIDATE_CONTENT.as_bytes());
                     let restored = opensandbox::execd::oneshot::run_when_ready(
@@ -613,7 +597,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // Un-exported work: the loss must be MARKED, never assumed recoverable.
     let no_export_id = create_sandbox(
         &client,
-        server,
         image,
         json!({"managed-by": "hodei-mh", "request-tag": format!("{tag}-noexport")}),
         None,
@@ -629,7 +612,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     let (marked, gone_forever, loss_facts) = if no_export_id.is_empty() {
         (false, false, "the sandbox was never created".to_string())
     } else {
-        let execd = execd_for(&client, server, &no_export_id).await;
+        let execd = execd_for(&client, &no_export_id).await;
         let wrote = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             "echo in-progress > /workspace/half-edited.rs && echo scratch > /workspace/scratch.sh && ls /workspace",
@@ -638,8 +621,8 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
         .await;
         let files_present = wrote.output.contains("half-edited.rs");
-        let lost = delete_sandbox(&client, server, &no_export_id).await
-            && !sandbox_exists(&client, server, &no_export_id).await;
+        let lost = delete_sandbox(&client, &no_export_id).await
+            && !sandbox_exists(&client, &no_export_id).await;
         let plan = recovery::recover_from_loss(&SandboxLoss {
             last_export: None,
             unexported: vec!["half-edited.rs".into(), "scratch.sh".into()],
@@ -671,7 +654,6 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // probe never calls DELETE; the reaper sweep enforces the contract.
     let ttl_id = create_sandbox(
         &client,
-        server,
         image,
         json!({"managed-by": "hodei-mh", "request-tag": format!("{tag}-ttl")}),
         None,
@@ -682,14 +664,14 @@ pub async fn run(server: &str, image: &str) -> i32 {
         Some(id) => {
             // This create lives only 8s; wait for the server's reaper.
             let deadline = Instant::now() + Duration::from_secs(40);
-            let mut gone = !sandbox_exists(&client, server, &id).await;
+            let mut gone = !sandbox_exists(&client, &id).await;
             while !gone && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
-                gone = !sandbox_exists(&client, server, &id).await;
+                gone = !sandbox_exists(&client, &id).await;
             }
             if !gone {
                 // Only then the probe cleans up its own leftover.
-                let _ = delete_sandbox(&client, server, &id).await;
+                let _ = delete_sandbox(&client, &id).await;
             }
             (true, gone, started.elapsed().as_secs())
         }
@@ -718,7 +700,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // Cleanup: probe-owned leftovers only (the foreign sandbox too, but the
     // report above already proved the reconciler never selected it).
     for id in &created {
-        let _ = delete_sandbox(&client, server, id).await;
+        let _ = delete_sandbox(&client, id).await;
     }
     let _ = std::fs::remove_dir_all(&base);
 

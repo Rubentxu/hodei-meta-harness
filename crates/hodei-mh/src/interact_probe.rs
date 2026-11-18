@@ -16,11 +16,13 @@ use interact::resolver::{GrantSource, Resolution, resolve};
 use interact::response::validate;
 
 use opensandbox::acp::{self, AcpAssembler};
+use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions};
 
-use crate::probe_util::{run_command_session_with_output, ws_url_for};
+use crate::probe_util::run_command_session_with_output;
 
 fn agent_command() -> String {
     // Gateway credentials come from the host environment and reach the
@@ -69,11 +71,11 @@ fn typed_request(message: &Value) -> Option<InteractionRequest> {
 pub async fn run(server: &str, image: &str) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
-    let client = reqwest::Client::new();
+    let client = ControlPlane::new(server);
     let policy = InteractionPolicy::sandbox_first();
 
     let created = client
-        .post(format!("{server}/v1/sandboxes"))
+        .post(ControlPlane::sandboxes_path())
         .json(&json!({
             "image": {"uri": image},
             "entrypoint": ["sleep", "infinity"],
@@ -100,23 +102,23 @@ pub async fn run(server: &str, image: &str) -> i32 {
         return finish(&checks, started.elapsed());
     }
     let endpoint = client
-        .get(format!("{server}/v1/sandboxes/{sid}/endpoints/44772"))
+        .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await;
-    let execd_base = match endpoint {
+    let execd = match endpoint {
         Ok(resp) => {
             let v: Value = resp.json().await.unwrap_or_default();
-            format!("http://{}", v["endpoint"].as_str().unwrap_or_default())
+            ExecdEndpoint::from_contract(&v).unwrap_or_default()
         }
-        Err(_) => String::new(),
+        Err(_) => ExecdEndpoint::default(),
     };
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd_base).await;
+    crate::probe_util::wait_for_execd(&execd).await;
     checks.push(Check {
         name: "sandbox",
-        passed: !execd_base.is_empty(),
-        detail: format!("execd at {execd_base}"),
+        passed: !execd.is_empty(),
+        detail: format!("execd at {execd}"),
     });
 
     // The agent needs the staged adapter: pack host-side and upload (the
@@ -149,17 +151,17 @@ pub async fn run(server: &str, image: &str) -> i32 {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
-    let uploaded = api::upload_file(&execd_base, None, bundle, "/tmp/ccacp.tgz").await;
+    let uploaded = api::upload_file(&execd, bundle, "/tmp/ccacp.tgz").await;
     // The agent needs the staged adapter (same procedure as the TASK-1 leg).
     let staged = crate::probe_util::run_in_sandbox(
-        &execd_base,
+        &execd,
         "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
         Duration::from_secs(120),
     )
     .await;
     // A read-only fixture for the ordinary-permission prompt.
     let fixture = crate::probe_util::run_in_sandbox(
-        &execd_base,
+        &execd,
         "printf 'hodei-read-fixture' > /workspace/readme-fixture.txt",
         Duration::from_secs(20),
     )
@@ -186,8 +188,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     let Ok(agent) = api::create_session(
-        &execd_base,
-        None,
+        &execd,
         CreateSessionRequest {
             cwd: Some("/workspace"),
             command: Some(agent_command().as_str()),
@@ -201,12 +202,12 @@ pub async fn run(server: &str, image: &str) -> i32 {
             detail: "create failed".into(),
         });
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         return finish(&checks, started.elapsed());
     };
-    let ws_url = ws_url_for(&execd_base, &agent.session_id);
+    let ws_url = execd.ws_url(&agent.session_id);
     let Ok(mut pipe) = pipe::attach(&ws_url, AttachOptions::default()).await else {
         checks.push(Check {
             name: "agent-session",
@@ -214,7 +215,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             detail: "attach failed".into(),
         });
         let _ = client
-            .delete(format!("{server}/v1/sandboxes/{sid}"))
+            .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
         return finish(&checks, started.elapsed());
@@ -443,7 +444,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     // AC-3: the WRITE permission routed to the sandbox and the file exists
     // INSIDE the sandbox; the host never ran any tool.
     let content =
-        run_command_session_with_output(&execd_base, "cat /workspace/interact-write.txt").await;
+        run_command_session_with_output(&execd, "cat /workspace/interact-write.txt").await;
     checks.push(Check {
         name: "writes-route-to-sandbox-host-executes-nothing",
         passed: write_permission_routed && content.contains("sandbox-write-ok"),
@@ -473,7 +474,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     });
 
     let deleted = client
-        .delete(format!("{server}/v1/sandboxes/{sid}"))
+        .delete(&ControlPlane::sandbox_path(&sid))
         .send()
         .await
         .map(|r| r.status().is_success())

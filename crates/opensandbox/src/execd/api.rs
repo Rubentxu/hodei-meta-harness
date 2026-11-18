@@ -1,8 +1,14 @@
 //! Minimal execd HTTP API client (surface needed by the ACP probe):
 //! create/delete PTY sessions over the execd REST endpoint.
+//!
+//! Every call carries the credential of the endpoint: the execd is the
+//! execution plane of a sandbox, and whoever reaches it runs commands
+//! inside the environment.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::endpoint::{EXECD_ACCESS_TOKEN_HEADER, ExecdEndpoint};
 
 #[derive(Debug, Error)]
 pub enum ExecdApiError {
@@ -32,26 +38,24 @@ const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `POST /pty` — create a PTY/pipe session running `command` (shell syntax).
 pub async fn create_session(
-    base_url: &str,
-    access_token: Option<&str>,
+    endpoint: &ExecdEndpoint,
     req: CreateSessionRequest<'_>,
 ) -> Result<CreateSessionResponse, ExecdApiError> {
-    create_session_with_timeout(base_url, access_token, req, DEFAULT_TIMEOUT).await
+    create_session_with_timeout(endpoint, req, DEFAULT_TIMEOUT).await
 }
 
 /// Same, with an explicit deadline. The readiness probe needs a SHORT
 /// one: it must fail fast while the sandbox is still booting, so the
 /// bounded wait can poll without spending the whole budget on one call.
 pub async fn create_session_with_timeout(
-    base_url: &str,
-    access_token: Option<&str>,
+    endpoint: &ExecdEndpoint,
     req: CreateSessionRequest<'_>,
     timeout: std::time::Duration,
 ) -> Result<CreateSessionResponse, ExecdApiError> {
-    let url = format!("{base_url}/pty");
+    let url = format!("{}/pty", endpoint.base_url());
     let mut builder = http_client(timeout)?.post(url).json(&req);
-    if let Some(token) = access_token {
-        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    if let Some(token) = endpoint.access_token() {
+        builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
     let response = builder.send().await?;
     let status = response.status().as_u16();
@@ -66,18 +70,14 @@ pub async fn create_session_with_timeout(
 /// can have its execd still booting: the port is published before the
 /// server inside is able to answer. The probe runs a harmless command
 /// and deletes the session it opened.
-pub async fn session_accepted(
-    base_url: &str,
-    access_token: Option<&str>,
-    timeout: std::time::Duration,
-) -> bool {
+pub async fn session_accepted(endpoint: &ExecdEndpoint, timeout: std::time::Duration) -> bool {
     let req = CreateSessionRequest {
         cwd: None,
         command: Some("true"),
     };
-    match create_session_with_timeout(base_url, access_token, req, timeout).await {
+    match create_session_with_timeout(endpoint, req, timeout).await {
         Ok(session) => {
-            let _ = delete_session(base_url, access_token, &session.session_id).await;
+            let _ = delete_session(endpoint, &session.session_id).await;
             true
         }
         Err(_) => false,
@@ -96,9 +96,8 @@ pub struct SessionStatusResponse {
     /// say: an unknown state is not a finished session.
     #[serde(default)]
     pub running: Option<bool>,
-    /// How many bytes the session produced. `None` when the daemon does
-    /// not say: the completeness of the output is then UNKNOWN, and
-    /// must not be claimed.
+    /// How many bytes the session produced: the yardstick for the
+    /// completeness of the output. `None` when the daemon does not say.
     #[serde(default)]
     pub output_offset: Option<i64>,
 }
@@ -112,8 +111,7 @@ pub struct SessionStatusResponse {
 /// offset is what tells a truncated output from a complete one, and
 /// losing it would silently disable that distinction.
 pub async fn session_status(
-    base_url: &str,
-    access_token: Option<&str>,
+    endpoint: &ExecdEndpoint,
     session_id: &str,
 ) -> Result<SessionStatusResponse, ExecdApiError> {
     let client = http_client(DEFAULT_TIMEOUT)?;
@@ -122,10 +120,10 @@ pub async fn session_status(
         format!("/pty/{session_id}"),
         format!("/pty/{session_id}/status"),
     ] {
-        let url = format!("{base_url}{path}");
+        let url = format!("{}{path}", endpoint.base_url());
         let mut builder = client.get(url);
-        if let Some(token) = access_token {
-            builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+        if let Some(token) = endpoint.access_token() {
+            builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
         }
         let response = match builder.send().await {
             Ok(response) => response,
@@ -163,15 +161,8 @@ pub async fn session_status(
 }
 
 /// How many output bytes the execd says the session produced.
-///
-/// `None` when the execd does not answer: the caller then knows nothing
-/// about the completeness of the output, and must not claim it.
-pub async fn session_output_offset(
-    base_url: &str,
-    access_token: Option<&str>,
-    session_id: &str,
-) -> Option<i64> {
-    session_status(base_url, access_token, session_id)
+pub async fn session_output_offset(endpoint: &ExecdEndpoint, session_id: &str) -> Option<i64> {
+    session_status(endpoint, session_id)
         .await
         .ok()
         .and_then(|status| status.output_offset)
@@ -179,34 +170,33 @@ pub async fn session_output_offset(
 
 /// `DELETE /pty/{id}` — terminate the session and its process group.
 pub async fn delete_session(
-    base_url: &str,
-    access_token: Option<&str>,
+    endpoint: &ExecdEndpoint,
     session_id: &str,
 ) -> Result<(), ExecdApiError> {
-    let url = format!("{base_url}/pty/{session_id}");
+    let url = format!("{}/pty/{session_id}", endpoint.base_url());
     let mut builder = http_client(DEFAULT_TIMEOUT)?.delete(url);
-    if let Some(token) = access_token {
-        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    if let Some(token) = endpoint.access_token() {
+        builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
     let response = builder.send().await?;
     let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
-        let body = response.text().await.unwrap_or_default();
         return Err(ExecdApiError::Status { status, body });
     }
     Ok(())
 }
 
 /// `POST /files/upload` — multipart upload of a file into the sandbox.
-/// Contract: one metadata part (JSON `{"path":..., "mode":...}`) followed by
-/// the binary `file` part, in that order.
+///
+/// Contract: one metadata part (JSON `{"path":...,"mode":...}`) followed
+/// by the binary `file` part, in that order.
 pub async fn upload_file(
-    base_url: &str,
-    access_token: Option<&str>,
-    content: Vec<u8>,
+    endpoint: &ExecdEndpoint,
+    bytes: Vec<u8>,
     remote_path: &str,
 ) -> Result<(), ExecdApiError> {
-    let url = format!("{base_url}/files/upload");
+    let url = format!("{}/files/upload", endpoint.base_url());
     let metadata = serde_json::json!({
         "path": remote_path,
     })
@@ -214,35 +204,33 @@ pub async fn upload_file(
     let metadata_part = reqwest::multipart::Part::text(metadata)
         .file_name("metadata.json")
         .mime_str("application/json")?;
-    let file_part = reqwest::multipart::Part::bytes(content).file_name("payload");
+    let file_part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("payload")
+        .mime_str("application/json")?;
     let form = reqwest::multipart::Form::new()
         .part("metadata", metadata_part)
         .part("file", file_part);
     let mut builder = http_client(DEFAULT_TIMEOUT)?.post(url).multipart(form);
-    if let Some(token) = access_token {
-        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+    if let Some(token) = endpoint.access_token() {
+        builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
     let response = builder.send().await?;
     let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
-        let body = response.text().await.unwrap_or_default();
         return Err(ExecdApiError::Status { status, body });
     }
     Ok(())
 }
 
 /// `GET /files/download?path=...` — stream a sandbox file back to the host.
-pub async fn download_file(
-    base_url: &str,
-    access_token: Option<&str>,
-    remote_path: &str,
-) -> Result<Vec<u8>, ExecdApiError> {
-    let url = format!("{base_url}/files/download");
+pub async fn download_file(endpoint: &ExecdEndpoint, path: &str) -> Result<Vec<u8>, ExecdApiError> {
+    let url = format!("{}/files/download", endpoint.base_url());
     let mut builder = http_client(DEFAULT_TIMEOUT)?
         .get(url)
-        .query(&[("path", remote_path)]);
-    if let Some(token) = access_token {
-        builder = builder.header("X-EXECD-ACCESS-TOKEN", token);
+        .query(&[("path", path)]);
+    if let Some(token) = endpoint.access_token() {
+        builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
     let response = builder.send().await?;
     let status = response.status().as_u16();
@@ -301,8 +289,7 @@ mod tests {
             let _ = writer.write_all(response.as_bytes()).await;
         });
         let response = create_session(
-            &format!("http://{addr}"),
-            None,
+            &ExecdEndpoint::new(format!("http://{addr}")),
             CreateSessionRequest {
                 cwd: None,
                 command: Some("sh"),
@@ -311,5 +298,56 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.session_id, "pty-123");
+    }
+
+    #[tokio::test]
+    async fn the_credential_travels_in_the_header_the_daemon_expects() {
+        // The daemon answers 401 without the credential: the refusal is
+        // observable without any infrastructure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = tokio::io::split(socket);
+            let mut buf = vec![0u8; 4096];
+            let read = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let token = request
+                .lines()
+                .find_map(|line| line.strip_prefix("x-execd-access-token: "))
+                .map(|value| value.trim().to_string());
+            *recorded.lock().unwrap() = token;
+            let body = b"unauthorized";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(response.as_bytes()).await;
+            let _ = writer.write_all(body).await;
+        });
+        let endpoint = ExecdEndpoint::with_token(
+            format!("http://{addr}"),
+            Some("token-of-the-client".to_string()),
+        );
+        let error = create_session(
+            &endpoint,
+            CreateSessionRequest {
+                cwd: None,
+                command: Some("sh"),
+            },
+        )
+        .await
+        .expect_err("the responder refuses");
+        assert!(matches!(error, ExecdApiError::Status { status: 401, .. }));
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("token-of-the-client"),
+            "the credential travels in the header"
+        );
     }
 }
