@@ -43,7 +43,63 @@ impl ServiceError {
 /// A creation in flight must never lose its network: the sandbox has a
 /// network before it has a container, and the sweeper runs every few
 /// seconds. The grace period is far longer than any creation takes.
-const ORPHAN_NETWORK_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+const ORPHAN_NETWORK_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// The network of a sandbox that is still being created.
+///
+/// The network is created BEFORE the container, so a creation that
+/// fails — or that is abandoned because its client gave up — would
+/// leave a bridge on the host that no sandbox owns. This guard owns
+/// that network until the creation finishes: while it lives, the
+/// network goes away with it, whatever the reason the creation did
+/// not complete.
+struct CreationGuard {
+    adapter: DockerAdapter,
+    sandbox_id: String,
+    /// Whether the creation completed and the network now belongs to
+    /// a sandbox that exists.
+    completed: bool,
+}
+
+impl CreationGuard {
+    fn new(adapter: DockerAdapter, sandbox_id: &str) -> Self {
+        Self {
+            adapter,
+            sandbox_id: sandbox_id.to_string(),
+            completed: false,
+        }
+    }
+
+    /// The creation finished: the network belongs to the sandbox.
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // The creation did not finish. The removal runs on its own
+        // task: a guard is dropped inside a future that is going away,
+        // and there is no place to await it there. A removal that
+        // fails is reported: a bridge nobody owns has to be visible.
+        let adapter = self.adapter.clone();
+        let sandbox_id = self.sandbox_id.clone();
+        tokio::spawn(async move {
+            match adapter.remove_sandbox_network(&sandbox_id).await {
+                Ok(true) => tracing::info!(
+                    "the network of the sandbox {sandbox_id} was removed: the creation did not finish"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::error!(
+                    "the network of the sandbox {sandbox_id} could not be removed after a failed creation: {error}"
+                ),
+            }
+        });
+    }
+}
 
 /// Whether a network that no sandbox owns may be removed.
 ///
@@ -96,8 +152,7 @@ impl Default for TrustConfig {
             public_origin: "127.0.0.1".to_string(),
             network: NetworkPolicy::parse(
                 crate::policy::INTERNAL_EGRESS_PROXY,
-                crate::policy::DEFAULT_SANDBOX_NETWORK,
-                crate::policy::DEFAULT_SANDBOX_SUBNET,
+                crate::policy::DEFAULT_SANDBOX_ADDRESS_POOL,
             )
             .expect("the default policy is supported"),
             proxy_container: None,
@@ -139,6 +194,15 @@ pub struct LifecycleService {
     adapter: DockerAdapter,
     config: ServiceConfig,
     relays: tokio::sync::Mutex<std::collections::HashMap<String, crate::relay::RelayHandle>>,
+    /// The credentials this process minted, by sandbox.
+    ///
+    /// The credential is read back from the container, and the value
+    /// that comes back is the one that is handed to the client. A
+    /// credential that is NOT the one this server minted is a
+    /// credential somebody else chose, and it is refused rather than
+    /// delivered. The copy lives in memory only: it is never written to
+    /// a label, a log or a record.
+    credentials: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl LifecycleService {
@@ -147,6 +211,7 @@ impl LifecycleService {
             adapter,
             config,
             relays: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            credentials: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -233,6 +298,14 @@ impl LifecycleService {
         self.adapter
             .ensure_image_available(&image.uri, credentials, docker_platform.as_deref())
             .await?;
+        // The request chooses the image, and the daemon merges the
+        // environment of the image with the one of the container: an
+        // image that declares the namespace of the execution plane
+        // would write into it by a door the composition does not
+        // cover.
+        self.adapter
+            .assert_image_leaves_the_execution_plane_alone(&image.uri)
+            .await?;
 
         let labels = build_labels(&sandbox_id, &req, created_at, expires_at, platform.as_ref());
         // The credential of the sandbox: it authorizes the execution
@@ -252,20 +325,25 @@ impl LifecycleService {
             self.config.execd_run_as_init,
             &execd_access_token,
         );
-        let mut host = build_host_spec(
-            &self.config.hardening,
-            Some(memory),
-            Some(nano_cpus),
-            &self.config.trust.network,
-            &self.config.trust.publish_address.to_string(),
-        );
-        host.pids_limit = Some(self.config.trust.limits.pids_limit);
-
+        // The network of THIS sandbox is created first, and the host
+        // specification names it: there is no shared network any more,
+        // and a container that is not attached to its own bridge never
+        // gets created.
         let network_name = self
             .adapter
             .create_sandbox_network(&self.config.trust.network, &sandbox_id, proxy)
             .await?;
-        host.network_mode = network_name.clone();
+        // From here on the network belongs to a creation that may not
+        // finish. The guard takes it away with the creation.
+        let mut guard = CreationGuard::new(self.adapter.clone(), &sandbox_id);
+        let mut host = build_host_spec(
+            &self.config.hardening,
+            Some(memory),
+            Some(nano_cpus),
+            &network_name,
+            &self.config.trust.publish_address.to_string(),
+        );
+        host.pids_limit = Some(self.config.trust.limits.pids_limit);
 
         let labels_map: std::collections::HashMap<String, String> =
             labels.clone().into_iter().collect();
@@ -284,9 +362,8 @@ impl LifecycleService {
         {
             Ok(id) => id,
             Err(e) => {
-                if let Err(cleanup) = self.adapter.remove_sandbox_network(&sandbox_id).await {
-                    tracing::error!("sandbox network cleanup failed: {cleanup}");
-                }
+                // The network of this creation goes away with the
+                // guard: the creation did not finish.
                 return Err(e.into());
             }
         };
@@ -357,6 +434,14 @@ impl LifecycleService {
             }
         };
 
+        // The credential this server minted is remembered so that the
+        // value read back from the container can be checked against it.
+        self.remember_credential(&sandbox_id, &execd_access_token)
+            .await;
+
+        // The sandbox exists: its network belongs to it now.
+        guard.complete();
+
         Ok(CreateSandboxResponse {
             id: sandbox_id,
             image_id: Some(image_id),
@@ -370,6 +455,40 @@ impl LifecycleService {
             created_at,
             entrypoint: Some(entrypoint),
         })
+    }
+
+    /// Remember the credential this server minted for a sandbox.
+    ///
+    /// The copy is the one that lets the server tell its own credential
+    /// from a foreign one when it reads the container back.
+    async fn remember_credential(&self, sandbox_id: &str, token: &str) {
+        self.credentials
+            .lock()
+            .await
+            .insert(sandbox_id.to_string(), token.to_string());
+    }
+
+    /// Forget the credential of a sandbox that is gone.
+    async fn forget_credential(&self, sandbox_id: &str) {
+        self.credentials.lock().await.remove(sandbox_id);
+    }
+
+    /// Whether the credential read back from the container is the one
+    /// this server minted for that sandbox.
+    ///
+    /// A sandbox this process did not create has no record to compare
+    /// against: the shape of the credential is then the only thing that
+    /// can be checked, and a credential that does not have it is
+    /// refused anyway.
+    async fn credential_is_ours(&self, sandbox_id: &str, token: &str) -> bool {
+        if !token.chars().all(|c| c.is_ascii_hexdigit()) || token.len() != 64 {
+            return false;
+        }
+        let minted = self.credentials.lock().await.get(sandbox_id).cloned();
+        match minted {
+            Some(minted) => minted == token,
+            None => true,
+        }
     }
 
     /// The state the daemon reports for a container, once it has
@@ -392,13 +511,12 @@ impl LifecycleService {
         })
     }
 
-    async fn cleanup_failed_creation(&self, container: &str, id: &str) {
+    async fn cleanup_failed_creation(&self, container: &str, _id: &str) {
         if let Err(error) = self.adapter.remove_container(container).await {
             tracing::error!("sandbox container cleanup failed: {error}");
         }
-        if let Err(error) = self.adapter.remove_sandbox_network(id).await {
-            tracing::error!("sandbox network cleanup failed: {error}");
-        }
+        // The network is not removed here: the creation guard owns it
+        // until the creation completes, and it goes away with it.
     }
 
     /// Inject execd + bootstrap.sh into the created (stopped) container.
@@ -516,6 +634,13 @@ impl LifecycleService {
             Err(error) => return Err(error.into()),
         };
         let had_network = self.adapter.remove_sandbox_network(sandbox_id).await?;
+        // The release is visible: a sandbox that is gone and a network
+        // that is gone are facts the operator can check.
+        tracing::info!(
+            "the sandbox {sandbox_id} was released: container={had_container} network={had_network}"
+        );
+        // The credential of a sandbox that is gone is forgotten with it.
+        self.forget_credential(sandbox_id).await;
         if !had_container && !had_network {
             return Err(DockerError::not_found(format!("sandbox {sandbox_id} not found")).into());
         }
@@ -637,6 +762,17 @@ impl LifecycleService {
                 code: error_codes::EXECD_START_FAILED,
                 message: "sandbox execd credential is missing".to_string(),
             })?;
+        // The credential that is read back has to be the one this
+        // server minted for THIS sandbox. A credential somebody else
+        // chose is refused: handing it over would give that somebody
+        // the authorization of the execution plane.
+        if !self.credential_is_ours(sandbox_id, &token).await {
+            return Err(ServiceError::Contract {
+                code: error_codes::EXECD_START_FAILED,
+                message: "the credential of the sandbox is not the one this server minted"
+                    .to_string(),
+            });
+        }
         let relay = match reusable {
             Some(relay) => relay,
             None => {
@@ -657,11 +793,21 @@ impl LifecycleService {
                 })?
             }
         };
-        let host_port = relay.local_addr().port();
-        self.relays
-            .lock()
-            .await
-            .insert(sandbox_id.to_string(), relay);
+        let host_port = {
+            // The relay that stays in the registry is the one the
+            // client is sent to. Two concurrent resolutions can both
+            // start a listener, and the one that loses the registry
+            // would be dropped: its port would answer nobody.
+            let mut relays = self.relays.lock().await;
+            match relays.get(sandbox_id) {
+                Some(existing) if existing.is_running() => existing.local_addr().port(),
+                _ => {
+                    let port = relay.local_addr().port();
+                    relays.insert(sandbox_id.to_string(), relay);
+                    port
+                }
+            }
+        };
         let headers = Some(BTreeMap::from([(
             "X-EXECD-ACCESS-TOKEN".to_string(),
             token,
@@ -884,6 +1030,90 @@ mod tests {
         assert_eq!(
             service.delete_sandbox(&id).await.unwrap_err().code(),
             error_codes::SANDBOX_NOT_FOUND
+        );
+    }
+
+    /// Regression: a creation that does not finish must not leave its
+    /// network on the host. The network is created BEFORE the
+    /// container, so a creation that fails — or that is abandoned
+    /// because the client gave up — used to leave a bridge nobody
+    /// owned, invisible to the operator until the reaper removed it.
+    #[tokio::test]
+    #[ignore = "needs Docker"]
+    async fn an_abandoned_creation_leaves_no_network() {
+        struct Cleanup {
+            proxy: String,
+            network: String,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", &self.proxy])
+                    .output();
+                let _ = std::process::Command::new("docker")
+                    .args(["network", "rm", &self.network])
+                    .output();
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let proxy = format!("hodei-guard-test-{id}");
+        let network = format!("hodei-sandbox-{id}");
+        let _cleanup = Cleanup {
+            proxy: proxy.clone(),
+            network: network.clone(),
+        };
+        let run = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--network",
+                "bridge",
+                "--name",
+                &proxy,
+                "opensandbox/execd:v1.1.0",
+                "tail",
+                "-f",
+                "/dev/null",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let docker = bollard::Docker::connect_with_unix_defaults().unwrap();
+        let adapter = DockerAdapter::connect(docker, "opensandbox/execd:v1.1.0");
+        let config = ServiceConfig::default();
+        adapter
+            .create_sandbox_network(&config.trust.network, &id, &proxy)
+            .await
+            .unwrap();
+        assert!(
+            adapter.inspect_network(&network).await.is_ok(),
+            "the network of the creation must exist before the abandonment"
+        );
+        // The creation is abandoned: the guard goes away with it.
+        {
+            let _guard = CreationGuard::new(adapter.clone(), &id);
+        }
+        // The removal runs on its own task, so the assertion waits for
+        // it instead of assuming it already happened.
+        let mut removed = false;
+        for _ in 0..100 {
+            if adapter.inspect_network(&network).await.is_err() {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            removed,
+            "the network of the abandoned creation is still on the host"
+        );
+        assert!(
+            adapter.inspect(&proxy).await.is_ok(),
+            "the trusted proxy must survive the cleanup of the creation"
         );
     }
 

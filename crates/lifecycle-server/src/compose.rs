@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::model::{CreateSandboxRequest, PlatformSpec, error_codes};
-use crate::policy::NetworkPolicy;
 
 // Exact label keys of the reference server (services/constants.py).
 pub const RESERVED_LABEL_PREFIX: &str = "opensandbox.io/";
@@ -196,11 +195,10 @@ pub fn build_labels(
 /// The prefixes of the environment entries the server owns.
 ///
 /// The credential and the identity of the sandbox are read back from
-/// the container by prefix. A key like `EXECD_ACCESS_TOKEN=x` would
-/// produce the entry `EXECD_ACCESS_TOKEN=x=...`, which carries the
-/// same prefix and would be read back INSTEAD of the credential the
-/// server minted: the whole prefix is reserved, not only its exact
-/// name.
+/// the container by EXACT name. A key like `EXECD_ACCESS_TOKEN=x`
+/// would produce the entry `EXECD_ACCESS_TOKEN=x=...`, which is
+/// another variable and must never be taken for the credential: the
+/// whole prefix is reserved, not only its exact name.
 const RESERVED_ENV_PREFIXES: [&str; 3] = [EXECD_ACCESS_TOKEN_ENV, "OPENSANDBOX_ID=", "EXECD_INIT="];
 
 /// The namespaces the execution plane reads its own configuration from.
@@ -216,14 +214,31 @@ fn shadows_a_reserved_entry(key: &str) -> bool {
     let entry = format!("{key}=");
     RESERVED_ENV_PREFIXES
         .iter()
-        .any(|prefix| entry.starts_with(prefix))
+        .any(|prefix| starts_with_ignore_case(&entry, prefix))
 }
 
 /// True when the key belongs to the namespace of the execution plane.
-fn belongs_to_the_execution_plane(key: &str) -> bool {
+///
+/// The comparison ignores the case and the surrounding spaces: a name
+/// that the execd would still read as its own must not slip in
+/// through a spelling the filter does not recognise.
+pub fn belongs_to_the_execution_plane(key: &str) -> bool {
+    let key = key.trim();
     EXECUTION_PLANE_PREFIXES
         .iter()
-        .any(|prefix| key.starts_with(prefix))
+        .any(|prefix| starts_with_ignore_case(key, prefix))
+}
+
+/// Whether `entry` starts with `prefix`, ignoring the case of the
+/// ASCII letters.
+///
+/// The comparison is made over BYTES: a key that is not ASCII can cut
+/// a string in the middle of a character, and a request must never be
+/// able to stop the server with a name.
+fn starts_with_ignore_case(entry: &str, prefix: &str) -> bool {
+    let entry = entry.as_bytes();
+    let prefix = prefix.as_bytes();
+    entry.len() >= prefix.len() && entry[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// Environment list (reference `_build_labels_and_env`): request env merged
@@ -375,11 +390,15 @@ pub fn resolve_resource_limits(
 }
 
 /// Base HostConfig spec. The isolated relay does not publish sandbox ports.
+///
+/// `network_mode` is the network of THIS sandbox, the one the server
+/// created and verified for it: the container is attached to that
+/// bridge alone.
 pub fn build_host_spec(
     hardening: &DockerHardening,
     memory: Option<i64>,
     nano_cpus: Option<i64>,
-    network: &NetworkPolicy,
+    network_mode: &str,
     publish_address: &str,
 ) -> HostSpec {
     let mut security_opt = Vec::new();
@@ -387,7 +406,7 @@ pub fn build_host_spec(
         security_opt.push("no-new-privileges=true".to_string());
     }
     HostSpec {
-        network_mode: network.network_name().to_string(),
+        network_mode: network_mode.to_string(),
         publish_address: publish_address.to_string(),
         security_opt,
         cap_drop: hardening.drop_capabilities.clone(),
@@ -700,6 +719,32 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_is_not_ascii_cannot_stop_the_server() {
+        // The reserved prefixes are compared over bytes: a name that
+        // carries a multi-byte character would cut the string in the
+        // middle of that character, and a request must never be able
+        // to stop the server with a name.
+        let request = BTreeMap::from([
+            ("EXECD_INITÁ".to_string(), "1".to_string()),
+            ("OPENSANDBOX_É".to_string(), "2".to_string()),
+            ("EXECD_🚀".to_string(), "3".to_string()),
+        ]);
+        let env = build_env(&BTreeMap::new(), Some(&request), "sbx8", true, "token-6");
+        assert!(env.contains(&"EXECD_INIT=1".to_string()), "{env:?}");
+        assert!(
+            env.contains(&"EXECD_ACCESS_TOKEN=token-6".to_string()),
+            "{env:?}"
+        );
+        // The names of the request are in the namespace of the
+        // execution plane, so they are dropped, not merged.
+        for entry in &env {
+            assert!(!entry.contains('Á'), "{env:?}");
+            assert!(!entry.contains('É'), "{env:?}");
+            assert!(!entry.contains('🚀'), "{env:?}");
+        }
+    }
+
+    #[test]
     fn the_credential_is_read_back_by_exact_name() {
         // A prefixed entry belongs to another variable, and an
         // ambiguous credential is no credential at all.
@@ -754,20 +799,14 @@ mod tests {
     #[test]
     fn host_spec_applies_reference_hardening() {
         let hardening = DockerHardening::default();
-        let network = NetworkPolicy::parse(
-            crate::policy::INTERNAL_EGRESS_PROXY,
-            crate::policy::DEFAULT_SANDBOX_NETWORK,
-            crate::policy::DEFAULT_SANDBOX_SUBNET,
-        )
-        .expect("the supported policy");
         let spec = build_host_spec(
             &hardening,
             Some(1024),
             Some(1_000_000_000),
-            &network,
+            "hodei-sandbox-sbx-1",
             "127.0.0.1",
         );
-        assert_eq!(spec.network_mode, "hodei-mh-sandboxes");
+        assert_eq!(spec.network_mode, "hodei-sandbox-sbx-1");
         assert_eq!(spec.publish_address, "127.0.0.1");
         assert!(
             spec.security_opt

@@ -15,11 +15,14 @@ use crate::model::error_codes;
 /// authorized egress proxy, never directly.
 pub const INTERNAL_EGRESS_PROXY: &str = "internal-egress-proxy";
 
-/// The network the sandboxes share.
-pub const DEFAULT_SANDBOX_NETWORK: &str = "hodei-mh-sandboxes";
-
-/// The subnet of the isolated network.
-pub const DEFAULT_SANDBOX_SUBNET: &str = "172.30.0.0/16";
+/// The range Docker may allocate the per-sandbox subnets from.
+///
+/// Docker allocates the subnet of every sandbox network from its own
+/// address pool. The operator declares the expected range here, and
+/// the server refuses a sandbox whose allocated subnet falls outside
+/// it: an allocation the operator did not ask for is a boundary the
+/// operator cannot reason about.
+pub const DEFAULT_SANDBOX_ADDRESS_POOL: &str = "172.16.0.0/12";
 
 /// The address the published sandbox ports are bound to. The loopback:
 /// a published port is reachable from the host, and from nowhere else.
@@ -28,12 +31,10 @@ pub const DEFAULT_PUBLISH_ADDRESS: &str = "127.0.0.1";
 /// The network policy a sandbox runs under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
-    /// An isolated internal Docker network with IPv6 disabled. An egress
-    /// proxy, when configured, must be attached separately.
-    InternalEgressProxy {
-        network_name: String,
-        subnet: String,
-    },
+    /// An isolated internal Docker network with IPv6 disabled, created
+    /// for EACH sandbox. An egress proxy, when configured, must be
+    /// attached separately.
+    InternalEgressProxy { address_pool: String },
 }
 
 impl NetworkPolicy {
@@ -43,13 +44,12 @@ impl NetworkPolicy {
     /// policy it was not asked for, and it never falls back to the
     /// default bridge, which would hand the sandbox the whole host's
     /// network.
-    pub fn parse(policy: &str, network_name: &str, subnet: &str) -> Result<Self, ValidationError> {
+    pub fn parse(policy: &str, address_pool: &str) -> Result<Self, ValidationError> {
         match policy {
             INTERNAL_EGRESS_PROXY => {
-                gateway_of(subnet)?;
+                parse_cidr(address_pool)?;
                 Ok(Self::InternalEgressProxy {
-                    network_name: network_name.to_string(),
-                    subnet: subnet.to_string(),
+                    address_pool: address_pool.to_string(),
                 })
             }
             other => Err(validation_error(
@@ -61,37 +61,62 @@ impl NetworkPolicy {
         }
     }
 
-    pub fn network_name(&self) -> &str {
+    /// The range the per-sandbox subnets must come from.
+    pub fn address_pool(&self) -> &str {
         match self {
-            Self::InternalEgressProxy { network_name, .. } => network_name,
-        }
-    }
-
-    pub fn subnet(&self) -> &str {
-        match self {
-            Self::InternalEgressProxy { subnet, .. } => subnet,
+            Self::InternalEgressProxy { address_pool } => address_pool,
         }
     }
 }
 
 /// The first usable address of an IPv4 subnet.
 pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
-    let (address, prefix) = subnet.split_once('/').ok_or_else(|| {
+    let (network, _) = parse_cidr(subnet)?;
+    let gateway = network + 1;
+    let bytes = gateway.to_be_bytes();
+    Ok(format!(
+        "{}.{}.{}.{}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    ))
+}
+
+/// Whether `candidate` lies inside `pool`.
+///
+/// Both are IPv4 CIDR blocks with the host bits already cleared. A
+/// candidate that cannot be parsed, or that falls outside the pool, is
+/// NOT a match: an allocation outside the range the operator declared
+/// is a boundary the operator did not authorise.
+pub fn cidr_within(pool: &str, candidate: &str) -> bool {
+    let (Ok((pool_network, pool_prefix)), Ok((candidate_network, candidate_prefix))) =
+        (parse_cidr(pool), parse_cidr(candidate))
+    else {
+        return false;
+    };
+    if candidate_prefix < pool_prefix {
+        return false;
+    }
+    let mask = u32::MAX.checked_shl(32 - pool_prefix).unwrap_or(0);
+    candidate_network & mask == pool_network
+}
+
+/// An IPv4 CIDR block as its network address and its prefix length.
+fn parse_cidr(cidr: &str) -> Result<(u32, u32), ValidationError> {
+    let (address, prefix) = cidr.split_once('/').ok_or_else(|| {
         validation_error(
             error_codes::INVALID_PARAMETER,
-            format!("the network subnet {subnet:?} is not a CIDR block"),
+            format!("the network subnet {cidr:?} is not a CIDR block"),
         )
     })?;
     let prefix: u32 = prefix.parse().map_err(|_| {
         validation_error(
             error_codes::INVALID_PARAMETER,
-            format!("the network subnet {subnet:?} has a malformed prefix"),
+            format!("the network subnet {cidr:?} has a malformed prefix"),
         )
     })?;
     if prefix > 30 {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
-            format!("the network subnet {subnet:?} has an impossible prefix"),
+            format!("the network subnet {cidr:?} has an impossible prefix"),
         ));
     }
     let octets: Vec<u8> = address
@@ -100,7 +125,7 @@ pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
             octet.parse::<u8>().map_err(|_| {
                 validation_error(
                     error_codes::INVALID_PARAMETER,
-                    format!("the network subnet {subnet:?} has a malformed address"),
+                    format!("the network subnet {cidr:?} has a malformed address"),
                 )
             })
         })
@@ -108,7 +133,7 @@ pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
     if octets.len() != 4 {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
-            format!("the network subnet {subnet:?} is not an IPv4 block"),
+            format!("the network subnet {cidr:?} is not an IPv4 block"),
         ));
     }
     let network = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
@@ -116,15 +141,10 @@ pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
     if network & !mask != 0 {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
-            format!("the network subnet {subnet:?} has host bits set"),
+            format!("the network subnet {cidr:?} has host bits set"),
         ));
     }
-    let gateway = network + 1;
-    let bytes = gateway.to_be_bytes();
-    Ok(format!(
-        "{}.{}.{}.{}",
-        bytes[0], bytes[1], bytes[2], bytes[3]
-    ))
+    Ok((network, prefix))
 }
 
 /// The limits every sandbox runs under. They are MANDATORY: an
@@ -239,25 +259,43 @@ mod tests {
 
     #[test]
     fn the_only_supported_policy_is_the_internal_egress_proxy() {
-        let policy = NetworkPolicy::parse(
-            INTERNAL_EGRESS_PROXY,
-            DEFAULT_SANDBOX_NETWORK,
-            DEFAULT_SANDBOX_SUBNET,
-        )
-        .expect("the supported policy");
-        assert_eq!(policy.network_name(), "hodei-mh-sandboxes");
-        assert_eq!(policy.subnet(), "172.30.0.0/16");
+        let policy = NetworkPolicy::parse(INTERNAL_EGRESS_PROXY, DEFAULT_SANDBOX_ADDRESS_POOL)
+            .expect("the supported policy");
+        assert_eq!(policy.address_pool(), "172.16.0.0/12");
     }
 
     #[test]
     fn an_unknown_policy_is_refused_instead_of_falling_back() {
-        let error = NetworkPolicy::parse("bridge", DEFAULT_SANDBOX_NETWORK, DEFAULT_SANDBOX_SUBNET)
+        let error = NetworkPolicy::parse("bridge", DEFAULT_SANDBOX_ADDRESS_POOL)
             .expect_err("an unknown policy is refused");
         assert_eq!(error.code, error_codes::INVALID_PARAMETER);
         assert!(
             error.message.contains("unknown network policy"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn a_malformed_address_pool_is_refused() {
+        assert!(NetworkPolicy::parse(INTERNAL_EGRESS_PROXY, "172.16.0.1/12").is_err());
+        assert!(NetworkPolicy::parse(INTERNAL_EGRESS_PROXY, "nonsense").is_err());
+    }
+
+    #[test]
+    fn only_a_subnet_inside_the_pool_counts_as_allocated_from_it() {
+        assert!(cidr_within("172.16.0.0/12", "172.18.0.0/16"));
+        assert!(cidr_within("172.16.0.0/12", "172.16.0.0/12"));
+        assert!(cidr_within("172.16.0.0/12", "172.31.255.0/24"));
+        // Outside the pool: a different range, and a wider block that
+        // only PARTIALLY overlaps it.
+        assert!(!cidr_within("172.16.0.0/12", "10.0.0.0/8"));
+        assert!(!cidr_within("172.16.0.0/12", "172.32.0.0/16"));
+        assert!(!cidr_within("172.16.0.0/12", "172.0.0.0/8"));
+        // A block wider than the pool cannot be inside it.
+        assert!(!cidr_within("172.16.0.0/12", "172.16.0.0/8"));
+        // Garbage in, no match.
+        assert!(!cidr_within("172.16.0.0/12", "not-a-cidr"));
+        assert!(!cidr_within("not-a-cidr", "172.18.0.0/16"));
     }
 
     #[test]

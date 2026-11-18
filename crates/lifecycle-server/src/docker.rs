@@ -122,6 +122,48 @@ impl DockerAdapter {
         Ok(())
     }
 
+    /// Refuse an image that carries the namespace of the execution
+    /// plane in its OWN environment.
+    ///
+    /// The request chooses the image, and the daemon merges the
+    /// environment of the image with the one of the container. An image
+    /// that declares `EXECD_*` or `OPENSANDBOX_*` would therefore write
+    /// into the namespace the server owns, by a door the composition of
+    /// the environment does not cover.
+    pub async fn assert_image_leaves_the_execution_plane_alone(
+        &self,
+        image: &str,
+    ) -> Result<(), DockerError> {
+        let inspected = match self.docker.inspect_image(image).await {
+            Ok(inspected) => inspected,
+            Err(error) => {
+                return Err(DockerError::op("inspect the image the request chose")(
+                    error,
+                ));
+            }
+        };
+        let env = inspected
+            .config
+            .as_ref()
+            .and_then(|config| config.env.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        for entry in env {
+            let Some((name, _)) = entry.split_once('=') else {
+                continue;
+            };
+            if compose::belongs_to_the_execution_plane(name) {
+                return Err(DockerError::Contract {
+                    code: error_codes::INVALID_PARAMETER,
+                    message: format!(
+                        "the image {image} declares {name}, which belongs to the execution plane"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The id of the image the container runs: the environment a check ran
     /// in is identified by that id, not by the tag it was requested with.
     /// It is read from the container, so it holds for an image pinned by
@@ -165,56 +207,11 @@ impl DockerAdapter {
             .filter(|token| !token.is_empty()))
     }
 
-    /// Make the sandbox network exist, and make sure it carries the
-    /// policy.
-    ///
-    /// A network that already exists is VERIFIED, not trusted: a
-    /// network without the internal property would hand the sandbox the
-    /// host's network, and a network with IPv6 would hand it a second
-    /// way out. Both stop the creation with the reason.
-    pub async fn ensure_network(&self, policy: &NetworkPolicy) -> Result<(), DockerError> {
-        let name = policy.network_name();
-        match self.inspect_network(name).await {
-            Ok(network) => validate_network(&network, policy),
-            Err(DockerError::Contract {
-                code: error_codes::SANDBOX_NOT_FOUND,
-                ..
-            }) => {
-                let request = bollard::models::NetworkCreateRequest {
-                    name: name.to_string(),
-                    driver: Some("bridge".to_string()),
-                    internal: Some(true),
-                    enable_ipv6: Some(false),
-                    options: Some(HashMap::from([(
-                        "com.docker.network.bridge.gateway_mode_ipv4".to_string(),
-                        "isolated".to_string(),
-                    )])),
-                    ipam: Some(bollard::models::Ipam {
-                        driver: Some("default".to_string()),
-                        config: Some(vec![bollard::models::IpamConfig {
-                            subnet: Some(policy.subnet().to_string()),
-                            ..Default::default()
-                        }]),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-                self.docker
-                    .create_network(request)
-                    .await
-                    .map_err(DockerError::op("create the sandbox network"))?;
-                let network = self.inspect_network(name).await?;
-                validate_network(&network, policy)
-            }
-            Err(other) => Err(other),
-        }
-    }
-
     /// Create a dedicated network. Docker allocates its subnet from its address pool.
     /// A pre-existing network is never adopted, even if its name matches.
     pub async fn create_sandbox_network(
         &self,
-        _policy: &NetworkPolicy,
+        policy: &NetworkPolicy,
         sandbox_id: &str,
         proxy: &str,
     ) -> Result<String, DockerError> {
@@ -235,7 +232,7 @@ impl DockerAdapter {
             .map_err(DockerError::op("create dedicated sandbox network"))?;
         let result = async {
             let network = self.inspect_network(&created.id).await?;
-            validate_sandbox_network(&network, sandbox_id)?;
+            validate_sandbox_network(&network, sandbox_id, policy)?;
             self.docker
                 .connect_network(
                     &created.id,
@@ -257,7 +254,11 @@ impl DockerAdapter {
             // back. The proxy may already be attached: the
             // disconnection comes first, because Docker refuses to
             // remove a network with a live endpoint.
-            let _ = self
+            //
+            // A rollback that fails is REPORTED: a network left on the
+            // host is a bridge nobody owns, and the operator has to be
+            // able to see it.
+            if let Err(error) = self
                 .docker
                 .disconnect_network(
                     &created.id,
@@ -266,8 +267,16 @@ impl DockerAdapter {
                         force: Some(false),
                     },
                 )
-                .await;
-            let _ = self.remove_network_with_retry(&created.id).await;
+                .await
+            {
+                tracing::warn!("the rollback could not detach the trusted proxy: {error}");
+            }
+            if let Err(error) = self
+                .remove_network_with_retry(&created.id, Some(&proxy_id))
+                .await
+            {
+                tracing::error!("the rollback could not remove the sandbox network: {error}");
+            }
         }
         result
     }
@@ -279,7 +288,16 @@ impl DockerAdapter {
     /// not released yet. A network that survives would be a bridge left
     /// on the host, so the removal is attempted a bounded number of
     /// times before it is reported as a failure.
-    async fn remove_network_with_retry(&self, id: &str) -> Result<(), DockerError> {
+    ///
+    /// Every attempt makes sure the proxy is really DETACHED: the
+    /// endpoint is what the daemon refuses the removal for, and a
+    /// detachment that only half took is the reason the network
+    /// outlives its sandbox.
+    async fn remove_network_with_retry(
+        &self,
+        id: &str,
+        proxy_id: Option<&str>,
+    ) -> Result<(), DockerError> {
         let mut attempt = 0;
         loop {
             match self.docker.remove_network(id).await {
@@ -288,6 +306,14 @@ impl DockerAdapter {
                     attempt += 1;
                     if attempt >= NETWORK_REMOVAL_ATTEMPTS {
                         return Err(DockerError::op("remove dedicated sandbox network")(error));
+                    }
+                    if let Some(proxy_id) = proxy_id {
+                        let request = |force: bool| bollard::models::NetworkDisconnectRequest {
+                            container: proxy_id.to_string(),
+                            force: Some(force),
+                        };
+                        let _ = self.docker.disconnect_network(id, request(false)).await;
+                        let _ = self.docker.disconnect_network(id, request(true)).await;
                     }
                     tokio::time::sleep(NETWORK_REMOVAL_DELAY).await;
                 }
@@ -304,7 +330,10 @@ impl DockerAdapter {
             Err(DockerError::Contract {
                 code: error_codes::SANDBOX_NOT_FOUND,
                 ..
-            }) => return Ok(false),
+            }) => {
+                tracing::info!("the sandbox network of {sandbox_id} was already gone");
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         };
         validate_network_owner(&network, sandbox_id)?;
@@ -321,7 +350,8 @@ impl DockerAdapter {
         {
             self.disconnect_proxy(id, proxy_id).await?;
         }
-        self.remove_network_with_retry(id).await?;
+        self.remove_network_with_retry(id, Some(proxy_id)).await?;
+        tracing::info!("the sandbox network of {sandbox_id} was removed");
         Ok(true)
     }
 
@@ -924,6 +954,7 @@ fn validate_network_owner(
 fn validate_sandbox_network(
     network: &bollard::models::NetworkInspect,
     sandbox_id: &str,
+    policy: &NetworkPolicy,
 ) -> Result<(), DockerError> {
     validate_network_owner(network, sandbox_id)?;
     let isolated = network
@@ -945,50 +976,26 @@ fn validate_sandbox_network(
                 })
                 && configs[0].gateway.as_deref().is_none_or(str::is_empty)
         });
+    // Docker allocated the subnet: it must come from the range the
+    // operator declared. A subnet from anywhere else is a boundary
+    // nobody chose, and it is refused instead of adopted.
+    let within_the_pool = network
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .and_then(|configs| configs.first())
+        .and_then(|config| config.subnet.as_deref())
+        .is_some_and(|subnet| crate::policy::cidr_within(policy.address_pool(), subnet));
     if network.driver.as_deref() != Some("bridge")
         || network.internal != Some(true)
         || network.enable_ipv6 != Some(false)
         || !isolated
         || !allocated
+        || !within_the_pool
     {
         return Err(network_violation(
-            "sandbox network is not an isolated internal IPv4 bridge",
+            "sandbox network is not an isolated internal IPv4 bridge inside the declared address pool",
         ));
-    }
-    Ok(())
-}
-
-fn validate_network(
-    network: &bollard::models::NetworkInspect,
-    policy: &NetworkPolicy,
-) -> Result<(), DockerError> {
-    let matching_ipam = network
-        .ipam
-        .as_ref()
-        .and_then(|ipam| ipam.config.as_ref())
-        .is_some_and(|configs| {
-            configs.len() == 1
-                && configs[0].subnet.as_deref() == Some(policy.subnet())
-                && configs[0].gateway.as_deref().is_none_or(str::is_empty)
-        });
-    let isolated = network
-        .options
-        .as_ref()
-        .and_then(|options| options.get("com.docker.network.bridge.gateway_mode_ipv4"))
-        .is_some_and(|mode| mode == "isolated");
-    if network.driver.as_deref() != Some("bridge")
-        || network.internal != Some(true)
-        || network.enable_ipv6 != Some(false)
-        || !matching_ipam
-        || !isolated
-    {
-        return Err(DockerError::Contract {
-            code: error_codes::NETWORK_POLICY_VIOLATION,
-            message: format!(
-                "network {} does not match the required isolated internal bridge and IPv4 subnet",
-                policy.network_name()
-            ),
-        });
     }
     Ok(())
 }
@@ -1051,6 +1058,11 @@ mod tests {
         let proxy_id = "a".repeat(64);
         let request = sandbox_network_request(&name, "sbx-123", &proxy_id);
         assert!(request.ipam.is_none(), "Docker must allocate the subnet");
+        let policy = NetworkPolicy::parse(
+            crate::policy::INTERNAL_EGRESS_PROXY,
+            crate::policy::DEFAULT_SANDBOX_ADDRESS_POOL,
+        )
+        .unwrap();
         let mut network = bollard::models::NetworkInspect {
             driver: request.driver,
             internal: request.internal,
@@ -1067,15 +1079,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(network_proxy_id(&network).unwrap(), proxy_id);
-        assert!(validate_sandbox_network(&network, "sbx-123").is_ok());
+        assert!(validate_sandbox_network(&network, "sbx-123", &policy).is_ok());
         assert!(validate_network_owner(&network, "other").is_err());
         network.enable_ipv6 = Some(true);
-        assert!(validate_sandbox_network(&network, "sbx-123").is_err());
+        assert!(validate_sandbox_network(&network, "sbx-123", &policy).is_err());
         network.enable_ipv6 = Some(false);
         network.ipam.as_mut().unwrap().config.as_mut().unwrap()[0].gateway =
             Some("172.25.0.1".into());
-        assert!(validate_sandbox_network(&network, "sbx-123").is_err());
+        assert!(validate_sandbox_network(&network, "sbx-123", &policy).is_err());
         assert!(sandbox_network_name("../other").is_err());
+    }
+
+    #[test]
+    fn a_subnet_outside_the_declared_pool_is_refused() {
+        let policy = NetworkPolicy::parse(
+            crate::policy::INTERNAL_EGRESS_PROXY,
+            crate::policy::DEFAULT_SANDBOX_ADDRESS_POOL,
+        )
+        .unwrap();
+        let network = bollard::models::NetworkInspect {
+            driver: Some("bridge".into()),
+            internal: Some(true),
+            enable_ipv6: Some(false),
+            options: Some(HashMap::from([(
+                "com.docker.network.bridge.gateway_mode_ipv4".into(),
+                "isolated".into(),
+            )])),
+            labels: Some(HashMap::from([
+                (NETWORK_OWNER_LABEL.into(), NETWORK_OWNER.into()),
+                (compose::LABEL_ID.into(), "sbx-123".into()),
+                (NETWORK_PROXY_ID_LABEL.into(), "a".repeat(64)),
+            ])),
+            ipam: Some(bollard::models::Ipam {
+                config: Some(vec![bollard::models::IpamConfig {
+                    subnet: Some("10.9.0.0/16".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = validate_sandbox_network(&network, "sbx-123", &policy)
+            .expect_err("a subnet from outside the pool is refused");
+        let message = error.to_string();
+        assert!(message.contains("address pool"), "{message}");
     }
 
     #[test]
@@ -1107,84 +1154,6 @@ mod tests {
         );
         assert!(loader_for_architecture("").is_err());
         assert!(loader_for_architecture("riscv64").is_err());
-    }
-
-    #[test]
-    fn isolated_internal_bridge_without_gateway_is_accepted() {
-        let policy = NetworkPolicy::parse(
-            crate::policy::INTERNAL_EGRESS_PROXY,
-            "sandbox-test",
-            "172.30.0.0/16",
-        )
-        .unwrap();
-        let network = bollard::models::NetworkInspect {
-            driver: Some("bridge".into()),
-            internal: Some(true),
-            enable_ipv6: Some(false),
-            options: Some(HashMap::from([(
-                "com.docker.network.bridge.gateway_mode_ipv4".into(),
-                "isolated".into(),
-            )])),
-            ipam: Some(bollard::models::Ipam {
-                config: Some(vec![bollard::models::IpamConfig {
-                    subnet: Some("172.30.0.0/16".into()),
-                    gateway: Some(String::new()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(validate_network(&network, &policy).is_ok());
-    }
-
-    #[test]
-    fn internal_network_with_host_gateway_is_refused() {
-        let policy = NetworkPolicy::parse(
-            crate::policy::INTERNAL_EGRESS_PROXY,
-            "sandbox-test",
-            "172.30.0.0/16",
-        )
-        .unwrap();
-        let network = bollard::models::NetworkInspect {
-            driver: Some("bridge".into()),
-            internal: Some(true),
-            enable_ipv6: Some(false),
-            ipam: Some(bollard::models::Ipam {
-                config: Some(vec![bollard::models::IpamConfig {
-                    subnet: Some("172.30.0.0/16".into()),
-                    gateway: Some("172.30.0.1".into()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(validate_network(&network, &policy).is_err());
-    }
-
-    #[test]
-    fn existing_network_must_match_the_configured_subnet_and_gateway() {
-        let policy = NetworkPolicy::parse(
-            crate::policy::INTERNAL_EGRESS_PROXY,
-            "sandbox-test",
-            "172.30.0.0/16",
-        )
-        .unwrap();
-        let network = bollard::models::NetworkInspect {
-            internal: Some(true),
-            enable_ipv6: Some(false),
-            ipam: Some(bollard::models::Ipam {
-                config: Some(vec![bollard::models::IpamConfig {
-                    subnet: Some("172.31.0.0/16".into()),
-                    gateway: Some("172.31.0.1".into()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(validate_network(&network, &policy).is_err());
     }
 
     #[test]

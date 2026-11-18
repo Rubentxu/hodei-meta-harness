@@ -8,8 +8,8 @@ use lifecycle_server::compose::DockerHardening;
 use lifecycle_server::docker::DockerAdapter;
 use lifecycle_server::http;
 use lifecycle_server::policy::{
-    DEFAULT_PUBLISH_ADDRESS, DEFAULT_SANDBOX_NETWORK, DEFAULT_SANDBOX_SUBNET,
-    INTERNAL_EGRESS_PROXY, LimitPolicy, NetworkPolicy, publish_address,
+    DEFAULT_PUBLISH_ADDRESS, DEFAULT_SANDBOX_ADDRESS_POOL, INTERNAL_EGRESS_PROXY, LimitPolicy,
+    NetworkPolicy, publish_address,
 };
 use lifecycle_server::service::{LifecycleService, ServiceConfig, TrustConfig};
 
@@ -25,6 +25,10 @@ const SANDBOX_NETWORK_ENV: &str = "SANDBOX_NETWORK";
 
 /// The environment variable that names the subnet of that network.
 const SANDBOX_SUBNET_ENV: &str = "SANDBOX_SUBNET";
+
+/// The environment variable that declares the address pool Docker may
+/// allocate the per-sandbox subnets from.
+const SANDBOX_ADDRESS_POOL_ENV: &str = "SANDBOX_ADDRESS_POOL";
 
 /// The environment variable that names the address the ports are
 /// published on.
@@ -56,7 +60,6 @@ fn trust_from_env() -> Result<TrustConfig, String> {
     if std::env::var_os(SANDBOX_NETWORK_ENV).is_some() {
         return Err("SANDBOX_NETWORK is unsupported: networks are created per sandbox".to_string());
     }
-    let network_name = DEFAULT_SANDBOX_NETWORK.to_string();
     let proxy_container = std::env::var("HODEI_MH_EGRESS_PROXY_CONTAINER")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -68,9 +71,11 @@ fn trust_from_env() -> Result<TrustConfig, String> {
             "SANDBOX_SUBNET is unsupported: Docker allocates per-sandbox subnets".to_string(),
         );
     }
-    let subnet = DEFAULT_SANDBOX_SUBNET.to_string();
-    let network =
-        NetworkPolicy::parse(&policy_name, &network_name, &subnet).map_err(|e| e.message)?;
+    let address_pool = std::env::var(SANDBOX_ADDRESS_POOL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SANDBOX_ADDRESS_POOL.to_string());
+    let network = NetworkPolicy::parse(&policy_name, &address_pool).map_err(|e| e.message)?;
     let public_publish_accepted = std::env::var(ALLOW_PUBLIC_PUBLISH_ENV)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
