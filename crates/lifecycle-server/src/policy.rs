@@ -18,8 +18,7 @@ pub const INTERNAL_EGRESS_PROXY: &str = "internal-egress-proxy";
 /// The network the sandboxes share.
 pub const DEFAULT_SANDBOX_NETWORK: &str = "hodei-mh-sandboxes";
 
-/// The subnet of that network. It is pinned so the address of the
-/// authorized proxy (the gateway of the network) is the same everywhere.
+/// The subnet of the isolated network.
 pub const DEFAULT_SANDBOX_SUBNET: &str = "172.30.0.0/16";
 
 /// The address the published sandbox ports are bound to. The loopback:
@@ -29,13 +28,11 @@ pub const DEFAULT_PUBLISH_ADDRESS: &str = "127.0.0.1";
 /// The network policy a sandbox runs under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkPolicy {
-    /// An internal Docker network: no route out, no external DNS, no
-    /// IPv6. The only way out is the authorized egress proxy, which
-    /// listens on the gateway of the network.
+    /// An isolated internal Docker network with IPv6 disabled. An egress
+    /// proxy, when configured, must be attached separately.
     InternalEgressProxy {
         network_name: String,
         subnet: String,
-        gateway: String,
     },
 }
 
@@ -49,11 +46,10 @@ impl NetworkPolicy {
     pub fn parse(policy: &str, network_name: &str, subnet: &str) -> Result<Self, ValidationError> {
         match policy {
             INTERNAL_EGRESS_PROXY => {
-                let gateway = gateway_of(subnet)?;
+                gateway_of(subnet)?;
                 Ok(Self::InternalEgressProxy {
                     network_name: network_name.to_string(),
                     subnet: subnet.to_string(),
-                    gateway,
                 })
             }
             other => Err(validation_error(
@@ -76,23 +72,9 @@ impl NetworkPolicy {
             Self::InternalEgressProxy { subnet, .. } => subnet,
         }
     }
-
-    /// The address of the authorized egress proxy: the gateway of the
-    /// internal network.
-    pub fn gateway(&self) -> &str {
-        match self {
-            Self::InternalEgressProxy { gateway, .. } => gateway,
-        }
-    }
-
-    /// The URL of the authorized egress proxy, as the sandbox uses it.
-    pub fn proxy_url(&self, port: u16) -> String {
-        format!("http://{}:{}", self.gateway(), port)
-    }
 }
 
-/// The first usable address of a subnet: the gateway Docker hands to
-/// the containers attached to it.
+/// The first usable address of an IPv4 subnet.
 pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
     let (address, prefix) = subnet.split_once('/').ok_or_else(|| {
         validation_error(
@@ -106,7 +88,7 @@ pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
             format!("the network subnet {subnet:?} has a malformed prefix"),
         )
     })?;
-    if prefix > 32 {
+    if prefix > 30 {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
             format!("the network subnet {subnet:?} has an impossible prefix"),
@@ -130,6 +112,13 @@ pub fn gateway_of(subnet: &str) -> Result<String, ValidationError> {
         ));
     }
     let network = u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]);
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    if network & !mask != 0 {
+        return Err(validation_error(
+            error_codes::INVALID_PARAMETER,
+            format!("the network subnet {subnet:?} has host bits set"),
+        ));
+    }
     let gateway = network + 1;
     let bytes = gateway.to_be_bytes();
     Ok(format!(
@@ -146,6 +135,18 @@ pub struct LimitPolicy {
     pub memory_bytes: i64,
     pub nano_cpus: i64,
     pub pids_limit: i64,
+}
+
+impl LimitPolicy {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.memory_bytes <= 0 || self.nano_cpus <= 0 || self.pids_limit <= 0 {
+            return Err(validation_error(
+                error_codes::INVALID_PARAMETER,
+                "memory, CPU and PID limits must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for LimitPolicy {
@@ -169,7 +170,14 @@ pub fn effective_limits(
     requested_nano_cpus: Option<i64>,
     policy: &LimitPolicy,
 ) -> Result<(i64, i64), ValidationError> {
+    policy.validate()?;
     let memory = requested_memory.unwrap_or(policy.memory_bytes);
+    if memory <= 0 {
+        return Err(validation_error(
+            error_codes::INVALID_PARAMETER,
+            "memory limit must be positive",
+        ));
+    }
     if memory > policy.memory_bytes {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
@@ -180,6 +188,12 @@ pub fn effective_limits(
         ));
     }
     let nano_cpus = requested_nano_cpus.unwrap_or(policy.nano_cpus);
+    if nano_cpus <= 0 {
+        return Err(validation_error(
+            error_codes::INVALID_PARAMETER,
+            "CPU limit must be positive",
+        ));
+    }
     if nano_cpus > policy.nano_cpus {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
@@ -232,8 +246,7 @@ mod tests {
         )
         .expect("the supported policy");
         assert_eq!(policy.network_name(), "hodei-mh-sandboxes");
-        assert_eq!(policy.gateway(), "172.30.0.1");
-        assert_eq!(policy.proxy_url(8888), "http://172.30.0.1:8888");
+        assert_eq!(policy.subnet(), "172.30.0.0/16");
     }
 
     #[test]
@@ -255,6 +268,9 @@ mod tests {
         assert!(gateway_of("172.30.0.0/abc").is_err());
         assert!(gateway_of("172.30.0/16").is_err());
         assert!(gateway_of("172.30.0.0/64").is_err());
+        assert!(gateway_of("172.30.1.0/16").is_err());
+        assert!(gateway_of("255.255.255.255/32").is_err());
+        assert!(gateway_of("10.0.0.0/31").is_err());
     }
 
     #[test]
@@ -263,6 +279,25 @@ mod tests {
         let (memory, cpus) = effective_limits(None, None, &policy).unwrap();
         assert_eq!(memory, policy.memory_bytes);
         assert_eq!(cpus, policy.nano_cpus);
+    }
+
+    #[test]
+    fn non_positive_mandatory_limits_are_refused() {
+        let policy = LimitPolicy {
+            memory_bytes: 0,
+            ..LimitPolicy::default()
+        };
+        assert!(effective_limits(None, None, &policy).is_err());
+        let policy = LimitPolicy {
+            nano_cpus: -1,
+            ..LimitPolicy::default()
+        };
+        assert!(effective_limits(None, None, &policy).is_err());
+        let policy = LimitPolicy {
+            pids_limit: 0,
+            ..LimitPolicy::default()
+        };
+        assert!(effective_limits(None, None, &policy).is_err());
     }
 
     #[test]

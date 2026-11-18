@@ -47,6 +47,16 @@ use opensandbox::execd::pipe;
 /// sessions. The port is published before the server inside answers.
 pub const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Quote a value for the shell that runs inside the sandbox.
+///
+/// The values that reach a sandbox command are configuration and
+/// credentials: an unquoted one would let a stray character change
+/// what the command means, and a credential is the last thing that
+/// should be re-interpreted by a shell.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Run a command in a sandbox that may still be booting.
 ///
 /// The readiness wait uses a harmless probe, so the command runs

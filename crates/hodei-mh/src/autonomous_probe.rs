@@ -148,20 +148,26 @@ fn make_fixture(base: &Path) -> Option<Fixture> {
     Some(Fixture { root, tickets })
 }
 
-fn agent_command() -> String {
+fn agent_command(proxy: &str) -> String {
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
     let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default();
     let base_prefix = if base.is_empty() {
         String::new()
     } else {
-        format!("ANTHROPIC_BASE_URL={base} ")
+        format!(
+            "ANTHROPIC_BASE_URL={} ",
+            crate::probe_util::shell_quote(&base)
+        )
     };
     format!(
-        "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY=http://172.17.0.1:8888 {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp"
+        "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY={proxy} {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp",
+        proxy = crate::probe_util::shell_quote(proxy),
+        base_prefix = base_prefix,
+        token = crate::probe_util::shell_quote(&token),
     )
 }
 
-pub async fn run(server: &str, image: &str) -> i32 {
+pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
     let started = Instant::now();
     let mut steps: Vec<Step> = Vec::new();
     let base = std::env::temp_dir().join(format!("hodei-autonomous-{}", std::process::id()));
@@ -358,7 +364,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             &execd,
             opensandbox::execd::api::CreateSessionRequest {
                 cwd: Some("/workspace/work"),
-                command: Some(agent_command().as_str()),
+                command: Some(agent_command(proxy_url).as_str()),
             },
         )
         .await;
@@ -672,7 +678,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
             &execd,
             opensandbox::execd::api::CreateSessionRequest {
                 cwd: Some("/workspace/work"),
-                command: Some(agent_command().as_str()),
+                command: Some(agent_command(proxy_url).as_str()),
             },
         )
         .await;

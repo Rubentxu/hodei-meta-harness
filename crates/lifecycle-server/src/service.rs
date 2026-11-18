@@ -37,6 +37,35 @@ impl ServiceError {
     }
 }
 
+/// How long a network that no sandbox owns is left alone before it is
+/// removed.
+///
+/// A creation in flight must never lose its network: the sandbox has a
+/// network before it has a container, and the sweeper runs every few
+/// seconds. The grace period is far longer than any creation takes.
+const ORPHAN_NETWORK_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Whether a network that no sandbox owns may be removed.
+///
+/// The answer is NO whenever there is a doubt: a network of a live
+/// sandbox is never removed, a network that is younger than the grace
+/// period may belong to a creation in flight, and a network whose age
+/// is unknown is left alone rather than destroyed on a guess.
+fn is_reapable_orphan(
+    id: &str,
+    live: &[String],
+    created: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if live.iter().any(|owned| owned == id) {
+        return false;
+    }
+    match created {
+        Some(created) => now.signed_duration_since(created) >= ORPHAN_NETWORK_GRACE,
+        None => false,
+    }
+}
+
 /// The trust boundary the server enforces: who may ask, where the
 /// sandbox lives, and how much of the host it may take.
 #[derive(Debug, Clone)]
@@ -53,6 +82,8 @@ pub struct TrustConfig {
     pub public_origin: String,
     /// The network the sandboxes are attached to.
     pub network: NetworkPolicy,
+    /// Operator-selected trusted proxy container, never supplied by a client.
+    pub proxy_container: Option<String>,
     /// The limits every sandbox runs under. They are mandatory.
     pub limits: LimitPolicy,
 }
@@ -69,6 +100,7 @@ impl Default for TrustConfig {
                 crate::policy::DEFAULT_SANDBOX_SUBNET,
             )
             .expect("the default policy is supported"),
+            proxy_container: None,
             limits: LimitPolicy::default(),
         }
     }
@@ -106,11 +138,16 @@ pub type SharedService = std::sync::Arc<LifecycleService>;
 pub struct LifecycleService {
     adapter: DockerAdapter,
     config: ServiceConfig,
+    relays: tokio::sync::Mutex<std::collections::HashMap<String, crate::relay::RelayHandle>>,
 }
 
 impl LifecycleService {
     pub fn new(adapter: DockerAdapter, config: ServiceConfig) -> Self {
-        Self { adapter, config }
+        Self {
+            adapter,
+            config,
+            relays: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// The credential that authorizes a client of this control plane.
@@ -157,6 +194,16 @@ impl LifecycleService {
             )?;
         }
 
+        let proxy = self
+            .config
+            .trust
+            .proxy_container
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ServiceError::Contract {
+                code: error_codes::NETWORK_POLICY_VIOLATION,
+                message: "trusted egress proxy container is not configured".to_string(),
+            })?;
         let image = req
             .image
             .as_ref()
@@ -205,24 +252,24 @@ impl LifecycleService {
             self.config.execd_run_as_init,
             &execd_access_token,
         );
-        let host = build_host_spec(
+        let mut host = build_host_spec(
             &self.config.hardening,
             Some(memory),
             Some(nano_cpus),
             &self.config.trust.network,
             &self.config.trust.publish_address.to_string(),
         );
+        host.pids_limit = Some(self.config.trust.limits.pids_limit);
 
-        // The network policy is ENFORCED, not assumed: the network is
-        // created if it is missing and verified if it already exists.
-        // A network that cannot carry the policy stops the creation.
-        self.adapter
-            .ensure_network(&self.config.trust.network)
+        let network_name = self
+            .adapter
+            .create_sandbox_network(&self.config.trust.network, &sandbox_id, proxy)
             .await?;
+        host.network_mode = network_name.clone();
 
         let labels_map: std::collections::HashMap<String, String> =
             labels.clone().into_iter().collect();
-        let container_id = self
+        let container_id = match self
             .adapter
             .create_sandbox_container(
                 &sandbox_id,
@@ -233,7 +280,16 @@ impl LifecycleService {
                 &labels_map,
                 &host,
             )
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                if let Err(cleanup) = self.adapter.remove_sandbox_network(&sandbox_id).await {
+                    tracing::error!("sandbox network cleanup failed: {cleanup}");
+                }
+                return Err(e.into());
+            }
+        };
 
         // The id of the image the container RUNS is what identifies the
         // environment: it is read from the container, never guessed from
@@ -241,7 +297,8 @@ impl LifecycleService {
         let image_id = match self.adapter.container_image_id(&container_id).await {
             Ok(image_id) => image_id,
             Err(e) => {
-                let _ = self.adapter.remove_container(&container_id).await;
+                self.cleanup_failed_creation(&container_id, &sandbox_id)
+                    .await;
                 return Err(e.into());
             }
         };
@@ -250,19 +307,61 @@ impl LifecycleService {
             .inject_execd_runtime(&container_id, docker_platform.as_deref())
             .await;
         if let Err(e) = prepared {
-            let _ = self.adapter.remove_container(&container_id).await;
+            self.cleanup_failed_creation(&container_id, &sandbox_id)
+                .await;
             return Err(e);
         }
         if let Err(e) = self.adapter.start_container(&container_id).await {
-            let _ = self.adapter.remove_container(&container_id).await;
+            self.cleanup_failed_creation(&container_id, &sandbox_id)
+                .await;
             return Err(e.into());
         }
+
+        // The isolation is VERIFIED, not assumed. The network was
+        // checked when it was created, but the ATTACHMENT of the
+        // container to it, and the limits it actually runs under, are
+        // facts about the container: they are read back, and a
+        // sandbox that does not match them is not created.
+        if let Err(e) = self
+            .adapter
+            .verify_sandbox_attachment(&container_id, &network_name)
+            .await
+        {
+            self.cleanup_failed_creation(&container_id, &sandbox_id)
+                .await;
+            return Err(e.into());
+        }
+        if let Err(e) = self
+            .adapter
+            .verify_applied_limits(
+                &container_id,
+                memory,
+                nano_cpus,
+                self.config.trust.limits.pids_limit,
+            )
+            .await
+        {
+            self.cleanup_failed_creation(&container_id, &sandbox_id)
+                .await;
+            return Err(e.into());
+        }
+        // The state is read back too: a start call that succeeded does
+        // not mean the container is running, and an environment that is
+        // not running cannot be used.
+        let state = match self.running_state(&container_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                self.cleanup_failed_creation(&container_id, &sandbox_id)
+                    .await;
+                return Err(error);
+            }
+        };
 
         Ok(CreateSandboxResponse {
             id: sandbox_id,
             image_id: Some(image_id),
             status: SandboxStatus {
-                state: "Running".to_string(),
+                state: state.clone(),
                 reason: Some("CONTAINER_RUNNING".to_string()),
                 message: Some("Sandbox container started successfully.".to_string()),
             },
@@ -271,6 +370,35 @@ impl LifecycleService {
             created_at,
             entrypoint: Some(entrypoint),
         })
+    }
+
+    /// The state the daemon reports for a container, once it has
+    /// settled.
+    ///
+    /// The daemon updates the state right after the start, and a read
+    /// that races it would report a container that is not running yet.
+    async fn running_state(&self, container: &str) -> Result<String, ServiceError> {
+        let mut state = String::new();
+        for _ in 0..10 {
+            state = self.adapter.container_state(container).await?;
+            if state == "running" {
+                return Ok(state);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(ServiceError::Contract {
+            code: error_codes::EXECD_START_FAILED,
+            message: format!("the sandbox container is {state:?} instead of running"),
+        })
+    }
+
+    async fn cleanup_failed_creation(&self, container: &str, id: &str) {
+        if let Err(error) = self.adapter.remove_container(container).await {
+            tracing::error!("sandbox container cleanup failed: {error}");
+        }
+        if let Err(error) = self.adapter.remove_sandbox_network(id).await {
+            tracing::error!("sandbox network cleanup failed: {error}");
+        }
     }
 
     /// Inject execd + bootstrap.sh into the created (stopped) container.
@@ -283,6 +411,13 @@ impl LifecycleService {
             .adapter
             .execd_artifacts(platform.unwrap_or("default"))
             .await?;
+        let loader = self.adapter.container_loader_name(container_id).await?;
+        if loader != artifacts.loader_name {
+            return Err(ServiceError::Contract {
+                code: error_codes::EXECD_DISTRIBUTION_FAILED,
+                message: "sandbox and execd image architectures do not match".to_string(),
+            });
+        }
         let name = container_id.to_string();
         self.adapter
             .ensure_directory(&name, compose::OPENSANDBOX_DIR)
@@ -300,6 +435,20 @@ impl LifecycleService {
                 &name,
                 compose::OPENSANDBOX_DIR,
                 (*artifacts.bootstrap_archive).clone(),
+            )
+            .await?;
+        self.adapter
+            .upload_archive(
+                &name,
+                compose::OPENSANDBOX_DIR,
+                (*artifacts.busybox_archive).clone(),
+            )
+            .await?;
+        self.adapter
+            .upload_archive(
+                &name,
+                compose::OPENSANDBOX_DIR,
+                (*artifacts.loader_archive).clone(),
             )
             .await?;
         Ok(artifacts)
@@ -332,10 +481,44 @@ impl LifecycleService {
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), ServiceError> {
+        // The relay registry is not a lock held across slow operations:
+        // the relay is taken out of it, and the Docker calls happen
+        // without holding anything.
+        let relay = self.relays.lock().await.remove(sandbox_id);
+        if let Some(relay) = relay {
+            relay.shutdown().await;
+        }
         let name = compose::container_name(sandbox_id);
-        // 404 when absent, mirroring the reference contract.
-        self.adapter.inspect(&name).await?;
-        self.adapter.remove_container(&name).await?;
+        let had_container = match self.adapter.inspect(&name).await {
+            Ok(inspect) => {
+                if sandbox_from_inspect(sandbox_id, &inspect).is_none() {
+                    return Err(ServiceError::Contract {
+                        code: error_codes::SANDBOX_NOT_FOUND,
+                        message: "sandbox identity does not match".to_string(),
+                    });
+                }
+                // Use the inspected immutable ID, never a name that can be reused.
+                let id = inspect
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| ServiceError::Contract {
+                        code: error_codes::INTERNAL,
+                        message: "sandbox has no container identity".to_string(),
+                    })?;
+                self.adapter.remove_container(id).await?;
+                true
+            }
+            Err(DockerError::Contract {
+                code: error_codes::SANDBOX_NOT_FOUND,
+                ..
+            }) => false,
+            Err(error) => return Err(error.into()),
+        };
+        let had_network = self.adapter.remove_sandbox_network(sandbox_id).await?;
+        if !had_container && !had_network {
+            return Err(DockerError::not_found(format!("sandbox {sandbox_id} not found")).into());
+        }
         Ok(())
     }
 
@@ -354,12 +537,63 @@ impl LifecycleService {
         for id in &due {
             let _ = self.delete_sandbox(id).await;
         }
+        // A sandbox whose container is gone but whose network is not
+        // would leave an isolated bridge on the host forever: nothing
+        // else looks for it.
+        self.reap_orphan_networks().await;
+        // The helper that reads the execd artifacts is only meant to
+        // live for the extraction; an interrupted run leaves it behind.
+        let helpers = self
+            .adapter
+            .reap_artifact_helpers(std::time::Duration::from_secs(600))
+            .await;
+        if helpers > 0 {
+            tracing::info!("removed {helpers} abandoned execd artifact helpers");
+        }
         due
     }
 
-    /// Resolve the host endpoint for a sandbox port. Only the two ports the
-    /// server publishes (execd 44772, main 8080) are addressable; any other
-    /// port is a contract error, not a silent fallback.
+    /// Remove the networks of sandboxes that no longer exist.
+    ///
+    /// A failed deletion (a foreign endpoint still attached, a daemon
+    /// error) leaves the network behind, and the container that owned it
+    /// is already gone: the TTL sweep only enumerates containers, so
+    /// without this the network would outlive every reaper.
+    pub async fn reap_orphan_networks(&self) {
+        let live: Vec<String> = self
+            .list_sandboxes()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sandbox| sandbox.id)
+            .collect();
+        let now = Utc::now();
+        for (id, created) in self
+            .adapter
+            .list_sandbox_networks()
+            .await
+            .unwrap_or_default()
+        {
+            // A network that is younger than the grace period is NEVER
+            // removed: a sandbox that is being created has its network
+            // before it has a container, and removing that network would
+            // make the creation fail for a reason that has nothing to
+            // do with the candidate.
+            if !is_reapable_orphan(&id, &live, created, now) {
+                continue;
+            }
+            match self.adapter.remove_sandbox_network(&id).await {
+                Ok(true) => tracing::info!("removed the orphan network of sandbox {id}"),
+                Ok(false) => {}
+                Err(error) => tracing::error!(
+                    "the orphan network of sandbox {id} could not be removed: {error}"
+                ),
+            }
+        }
+    }
+
+    /// Resolve the loopback endpoint for execd (port 44772). Other ports
+    /// are refused because the isolated relay does not expose them.
     ///
     /// The announced origin is the CONFIGURED one: the origin of the
     /// request belongs to the caller, and a server that echoes it lets
@@ -369,52 +603,69 @@ impl LifecycleService {
         sandbox_id: &str,
         port: i32,
     ) -> Result<Endpoint, ServiceError> {
-        let container_port = match port {
-            44772 => compose::EXECD_CONTAINER_PORT,
-            8080 => compose::HTTP_CONTAINER_PORT,
-            _ => {
-                return Err(ServiceError::Contract {
-                    code: error_codes::INVALID_PARAMETER,
-                    message: format!(
-                        "port {port} is not published by the sandbox; only 44772 (execd) and 8080 (main) are addressable"
-                    ),
-                });
-            }
+        if port != 44772 {
+            return Err(ServiceError::Contract {
+                code: error_codes::INVALID_PARAMETER,
+                message: format!("port {port} is not available through the isolated control relay"),
+            });
+        }
+        // The relay is taken out of the registry before any Docker call:
+        // the registry is not a lock held across slow operations. A
+        // relay whose listener died is replaced instead of advertised.
+        let reusable = {
+            let mut relays = self.relays.lock().await;
+            relays.remove(sandbox_id).filter(|relay| relay.is_running())
         };
         let name = compose::container_name(sandbox_id);
         let inspect = self.adapter.inspect(&name).await?;
-        let host_port =
-            find_host_port(&inspect, container_port).ok_or_else(|| ServiceError::Contract {
+        if sandbox_from_inspect(sandbox_id, &inspect).is_none() {
+            return Err(ServiceError::Contract {
                 code: error_codes::SANDBOX_NOT_FOUND,
-                message: format!(
-                    "no published host port for {container_port} on sandbox {sandbox_id}"
-                ),
+                message: "sandbox identity does not match".to_string(),
+            });
+        }
+        let token = self
+            .adapter
+            .execd_access_token(&name)
+            .await?
+            .ok_or_else(|| ServiceError::Contract {
+                code: error_codes::EXECD_START_FAILED,
+                message: "sandbox execd credential is missing".to_string(),
             })?;
-        // The execution plane carries its own credential: the client
-        // that resolves the execd endpoint is the one allowed to drive
-        // it.
-        let headers = if port == 44772 {
-            self.adapter
-                .execd_access_token(&name)
-                .await?
-                .map(|token| BTreeMap::from([("X-EXECD-ACCESS-TOKEN".to_string(), token)]))
-        } else {
-            None
+        let relay = match reusable {
+            Some(relay) => relay,
+            None => {
+                let loader_name = self.adapter.container_loader_name(&name).await?;
+                crate::relay::start(
+                    self.adapter.client(),
+                    name,
+                    vec![
+                        format!("{}/{}", compose::OPENSANDBOX_DIR, loader_name),
+                        format!("{}/busybox", compose::OPENSANDBOX_DIR),
+                        "nc".into(),
+                    ],
+                )
+                .await
+                .map_err(|_| ServiceError::Contract {
+                    code: error_codes::EXECD_START_FAILED,
+                    message: "could not start the isolated control relay".to_string(),
+                })?
+            }
         };
+        let host_port = relay.local_addr().port();
+        self.relays
+            .lock()
+            .await
+            .insert(sandbox_id.to_string(), relay);
+        let headers = Some(BTreeMap::from([(
+            "X-EXECD-ACCESS-TOKEN".to_string(),
+            token,
+        )]));
         Ok(Endpoint {
             endpoint: format!("{}:{host_port}", self.config.trust.public_origin),
             headers,
         })
     }
-}
-
-fn find_host_port(
-    inspect: &bollard::models::ContainerInspectResponse,
-    container_port: &str,
-) -> Option<String> {
-    let ports = inspect.network_settings.as_ref()?.ports.as_ref()?;
-    let bindings = ports.get(container_port)?;
-    bindings.as_ref()?.iter().find_map(|b| b.host_port.clone())
 }
 
 /// Map a container inspect into the contract Sandbox using the labels the
@@ -484,6 +735,140 @@ pub fn resource_limits_checked(
 mod tests {
     use super::*;
     use crate::compose::validation_error;
+
+    #[test]
+    fn a_network_of_a_live_sandbox_is_never_reaped() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        assert!(!is_reapable_orphan(
+            "sbx-1",
+            &["sbx-1".to_string()],
+            Some(old),
+            now
+        ));
+    }
+
+    #[test]
+    fn a_network_of_a_creation_in_flight_is_never_reaped() {
+        // The sandbox has its network before it has a container: a
+        // reaper that ignored the age would delete the network of a
+        // creation that is in flight and make it fail.
+        let now = Utc::now();
+        let fresh = now - chrono::Duration::seconds(30);
+        assert!(!is_reapable_orphan("sbx-2", &[], Some(fresh), now));
+    }
+
+    #[test]
+    fn an_old_network_without_a_sandbox_is_reaped() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::hours(2);
+        assert!(is_reapable_orphan("sbx-3", &[], Some(old), now));
+    }
+
+    #[test]
+    fn a_network_of_an_unknown_age_is_left_alone() {
+        let now = Utc::now();
+        assert!(!is_reapable_orphan("sbx-4", &[], None, now));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker and a locally available opensandbox/execd:v1.1.0 image"]
+    async fn orphan_network_cleanup_uses_original_proxy_after_reconfiguration() {
+        struct Cleanup {
+            proxy: String,
+            other: String,
+            network: String,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", &self.other])
+                    .output();
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", &self.proxy])
+                    .output();
+                let _ = std::process::Command::new("docker")
+                    .args(["network", "rm", &self.network])
+                    .output();
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let proxy = format!("hodei-cleanup-test-{id}");
+        let other = format!("hodei-cleanup-other-{id}");
+        let network = format!("hodei-sandbox-{id}");
+        let _cleanup = Cleanup {
+            proxy: proxy.clone(),
+            other: other.clone(),
+            network: network.clone(),
+        };
+        let run = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--network",
+                "bridge",
+                "--name",
+                &proxy,
+                "opensandbox/execd:v1.1.0",
+                "tail",
+                "-f",
+                "/dev/null",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let docker = bollard::Docker::connect_with_unix_defaults().unwrap();
+        let adapter = DockerAdapter::connect(docker, "opensandbox/execd:v1.1.0");
+        let config = ServiceConfig::default();
+        adapter
+            .create_sandbox_network(&config.trust.network, &id, &proxy)
+            .await
+            .unwrap();
+        // An unrelated endpoint causes removal to fail; it must not be detached.
+        let run_other = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--network",
+                &network,
+                "--name",
+                &other,
+                "opensandbox/execd:v1.1.0",
+                "tail",
+                "-f",
+                "/dev/null",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run_other.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run_other.stderr)
+        );
+        // A new service with no proxy configured simulates restart/reconfiguration.
+        let service = LifecycleService::new(adapter.clone(), config);
+        assert!(service.delete_sandbox(&id).await.is_err());
+        assert!(adapter.inspect(&other).await.is_ok());
+        let removed = std::process::Command::new("docker")
+            .args(["rm", "-f", &other])
+            .output()
+            .unwrap();
+        assert!(removed.status.success());
+        service.delete_sandbox(&id).await.unwrap();
+        assert!(adapter.inspect_network(&network).await.is_err());
+        assert!(
+            adapter.inspect(&proxy).await.is_ok(),
+            "proxy itself must survive cleanup"
+        );
+        assert_eq!(
+            service.delete_sandbox(&id).await.unwrap_err().code(),
+            error_codes::SANDBOX_NOT_FOUND
+        );
+    }
 
     #[test]
     fn missing_labels_yield_none_not_panic() {

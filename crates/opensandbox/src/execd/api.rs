@@ -242,7 +242,10 @@ pub async fn download_file(endpoint: &ExecdEndpoint, path: &str) -> Result<Vec<u
 }
 
 fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, ExecdApiError> {
-    Ok(reqwest::Client::builder().timeout(timeout).build()?)
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 #[cfg(test)]
@@ -298,6 +301,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.session_id, "pty-123");
+    }
+
+    #[tokio::test]
+    async fn execd_requests_do_not_follow_redirects_with_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = source.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/pty\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let endpoint =
+            ExecdEndpoint::with_token(format!("http://{source_addr}"), Some("secret".into()));
+        let result = create_session_with_timeout(
+            &endpoint,
+            CreateSessionRequest {
+                cwd: None,
+                command: None,
+            },
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(ExecdApiError::Status { status: 307, .. })
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

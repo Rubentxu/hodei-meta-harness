@@ -22,7 +22,8 @@ use release::reconcile::{
 };
 use serde_json::{Value, json};
 
-pub const DEFAULT_PROXY_URL: &str = "http://172.17.0.1:8888";
+/// Docker DNS alias assigned to the trusted proxy in each sandbox network.
+pub const DEFAULT_PROXY_URL: &str = "http://hodei-proxy:8888";
 
 /// Bounded wait for the sandbox's execd to start answering. A sandbox
 /// that never becomes usable is a FAILURE, not an infinite wait.
@@ -104,23 +105,46 @@ fn local_image_digest(uri: &str) -> Option<String> {
         .and_then(|d| d.split("@").nth(1).map(str::to_string))
 }
 
+/// Parse a proxy URL before using its address in a sandbox command.
+fn proxy_address(proxy_url: &str) -> Result<(String, u16), &'static str> {
+    let url = reqwest::Url::parse(proxy_url).map_err(|_| "invalid proxy URL")?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("proxy URL must be an HTTP origin without credentials");
+    }
+    let host = url.host_str().ok_or("proxy URL lacks a host")?;
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+    {
+        return Err("invalid proxy host");
+    }
+    Ok((
+        host.to_string(),
+        url.port().ok_or("proxy URL lacks a port")?,
+    ))
+}
+
 /// TCP reachability of the restricted egress proxy (read-only).
 fn egress_reachable(proxy_url: &str) -> bool {
-    let authority = proxy_url
-        .strip_prefix("http://")
-        .unwrap_or(proxy_url)
-        .trim_end_matches('/');
-    // bash's /dev/tcp wants HOST/PORT as separate path segments.
-    let Some((host, port)) = authority.split_once(':') else {
+    use std::net::ToSocketAddrs;
+    let Ok((host, port)) = proxy_address(proxy_url) else {
         return false;
     };
-    let output = std::process::Command::new("bash")
-        .args([
-            "-c",
-            &format!("timeout 3 bash -c 'cat < /dev/null > /dev/tcp/{host}/{port}' && echo ok"),
-        ])
-        .output();
-    matches!(output, Ok(o) if o.status.success())
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .is_some_and(|addresses| {
+            addresses.into_iter().any(|address| {
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(3)).is_ok()
+            })
+        })
 }
 
 /// The digest of the image as it is RESOLVED locally: what the daemon
@@ -147,7 +171,9 @@ fn run_doctor(
     subscription: &SubscriptionNote,
 ) -> (Vec<DoctorCheck>, GateDecision) {
     let local_digest = local_image_digest(&spec.image.uri);
-    let egress = egress_reachable(proxy_url);
+    let check_url =
+        std::env::var("HODEI_MH_PROXY_CHECK_URL").unwrap_or_else(|_| proxy_url.to_string());
+    let egress = egress_reachable(&check_url);
     let ready = {
         // block on the tiny readiness probe from sync context.
         tokio::task::block_in_place(|| {
@@ -158,6 +184,15 @@ fn run_doctor(
         doctor::checks_for(spec, local_digest.as_deref(), egress, ready, subscription);
     let decision = gate::decide(&input);
     (checks, decision)
+}
+
+fn network_observation_ok(succeeded: bool, output: &str) -> bool {
+    let lines: Vec<&str> = output.lines().map(str::trim).collect();
+    succeeded
+        && lines.contains(&"PROXY_REACHABLE")
+        && lines.contains(&"DIRECT_INTERNET_BLOCKED")
+        && !lines.contains(&"PROXY_UNREACHABLE")
+        && !lines.contains(&"DIRECT_INTERNET_REACHABLE")
 }
 
 /// `hodei-mh doctor --profile rust --server URL`: report + gate decision,
@@ -171,7 +206,9 @@ pub async fn run_doctor_cli(args: &[String]) -> i32 {
         }
     };
     let server = flag(args, "--server", "http://127.0.0.1:8081");
-    let proxy_url = flag(args, "--proxy-url", DEFAULT_PROXY_URL);
+    let proxy_default =
+        std::env::var("HODEI_MH_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = flag(args, "--proxy-url", &proxy_default);
     let (checks, decision) = run_doctor(&spec, &server, &proxy_url, &subscription);
     for check in &checks {
         let label = if check.ok {
@@ -219,7 +256,17 @@ fn tar_project(project_dir: &Path, dest: &Path) -> bool {
 pub async fn run_profile(args: &[String]) -> i32 {
     let started = std::time::Instant::now();
     let server = flag(args, "--server", "http://127.0.0.1:8081");
-    let proxy_url = flag(args, "--proxy-url", DEFAULT_PROXY_URL);
+    let proxy_default =
+        std::env::var("HODEI_MH_PROXY_URL").unwrap_or_else(|_| DEFAULT_PROXY_URL.to_string());
+    let proxy_url = flag(args, "--proxy-url", &proxy_default);
+    let (proxy_host, proxy_port) = match proxy_address(&proxy_url) {
+        Ok(address) => address,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return 2;
+        }
+    };
+    let proxy_url = format!("http://{proxy_host}:{proxy_port}");
     let (spec, subscription) = match spec_for(args) {
         Ok(pair) => pair,
         Err(message) => {
@@ -379,22 +426,39 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
     };
     let _ = search_failed;
-    let execd: ExecdEndpoint = match client
+    let result = match client
         .get(&ControlPlane::endpoint_path(&sid, 44772))
         .send()
         .await
     {
-        Ok(response) => {
-            let endpoint_value: Value = response.json().await.unwrap_or_default();
-            ExecdEndpoint::from_contract(&endpoint_value).unwrap_or_default()
+        Ok(response) if response.status().is_success() => match response.json::<Value>().await {
+            Ok(value) => ExecdEndpoint::from_contract(&value)
+                .ok_or_else(|| "invalid endpoint contract".to_string()),
+            Err(_) => Err("invalid endpoint response".to_string()),
+        },
+        Ok(response) => Err(format!(
+            "endpoint resolution returned {}",
+            response.status()
+        )),
+        Err(_) => Err("endpoint resolution failed".to_string()),
+    };
+    let execd = match result {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            let cleanup = client
+                .delete(&ControlPlane::sandbox_path(&sid))
+                .send()
+                .await;
+            if !matches!(cleanup, Ok(ref response) if response.status().is_success()) {
+                eprintln!("sandbox {sid} could not be cleaned up after endpoint failure");
+            }
+            eprintln!("sandbox {sid}: {reason}");
+            return 1;
         }
-        Err(_) => ExecdEndpoint::default(),
     };
 
-    // The sandbox publishes its execd port BEFORE the server inside can
-    // answer: the first attempts are refused while the container is
-    // still booting. Waiting (bounded) for it turns a boot delay into a
-    // wait instead of a false "the command failed".
+    // The relay may be ready before execd has started inside the sandbox.
+    // Wait with a deadline rather than treating a boot delay as a failed build.
     if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
         let _ = client
             .delete(&ControlPlane::sandbox_path(&sid))
@@ -417,15 +481,10 @@ pub async fn run_profile(args: &[String]) -> i32 {
     .await;
     // bash's /dev/tcp takes HOST and PORT as SEPARATE path segments
     // (/dev/tcp/host/port), never host:port.
-    let proxy_authority = proxy_url
-        .strip_prefix("http://")
-        .unwrap_or(&proxy_url)
-        .trim_end_matches('/')
-        .to_string();
-    let proxy_target = match proxy_authority.split_once(':') {
-        Some((host, port)) => format!("{host}/{port}"),
-        None => proxy_authority.clone(),
-    };
+    let proxy_target = format!(
+        "{}/{proxy_port}",
+        proxy_host.trim_start_matches('[').trim_end_matches(']')
+    );
     let egress = opensandbox::execd::oneshot::run(
         &execd,
         &format!(
@@ -438,6 +497,17 @@ pub async fn run_profile(args: &[String]) -> i32 {
     let proxy_reachable = egress.output.contains("PROXY_REACHABLE");
     let direct_blocked = egress.output.contains("DIRECT_INTERNET_BLOCKED");
     let direct_reachable = egress.output.contains("DIRECT_INTERNET_REACHABLE");
+    if !network_observation_ok(egress.succeeded(), &egress.output) {
+        let cleanup = client
+            .delete(&ControlPlane::sandbox_path(&sid))
+            .send()
+            .await;
+        if !matches!(cleanup, Ok(ref response) if response.status().is_success()) {
+            eprintln!("sandbox {sid} could not be cleaned up after network policy failure");
+        }
+        eprintln!("sandbox {sid}: network policy could not be verified");
+        return 1;
+    }
 
     // 4. Ship the project (pack host-side, upload, extract — no egress).
     // The directory name is SANITIZED: it is interpolated into a shell
@@ -623,4 +693,42 @@ pub async fn run_profile(args: &[String]) -> i32 {
         serde_json::to_string_pretty(&record).unwrap_or_default()
     );
     if all_ok && leaks.is_empty() { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{network_observation_ok, proxy_address};
+
+    #[test]
+    fn network_policy_requires_both_observations_and_a_successful_probe() {
+        let safe = "PROXY_REACHABLE\nDIRECT_INTERNET_BLOCKED\n";
+        assert!(network_observation_ok(true, safe));
+        assert!(!network_observation_ok(false, safe));
+        assert!(!network_observation_ok(true, "PROXY_REACHABLE"));
+        assert!(!network_observation_ok(
+            true,
+            "PROXY_UNREACHABLE\nDIRECT_INTERNET_BLOCKED"
+        ));
+        assert!(!network_observation_ok(
+            true,
+            "PROXY_REACHABLE\nDIRECT_INTERNET_REACHABLE"
+        ));
+    }
+
+    #[test]
+    fn proxy_address_rejects_credentials_and_shell_metacharacters() {
+        assert_eq!(
+            proxy_address("http://172.30.0.1:8888").unwrap(),
+            ("172.30.0.1".into(), 8888)
+        );
+        for url in [
+            "http://user:pass@proxy:8888",
+            "http://proxy:8888/$(id)",
+            "http://proxy:8888?x=secret",
+            "https://proxy:8888",
+            "http://proxy:8888/path",
+        ] {
+            assert!(proxy_address(url).is_err(), "accepted {url}");
+        }
+    }
 }

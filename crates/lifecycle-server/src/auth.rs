@@ -58,23 +58,14 @@ impl ControlToken {
 
     /// Whether the presented credential is the authorized one.
     ///
-    /// The comparison runs over the whole length of both values and
-    /// accumulates the differences: the answer does not depend on WHERE
-    /// the first difference is, so a caller cannot learn the token by
-    /// measuring how long the server takes to answer.
+    /// Comparison is constant-time for credentials of equal length;
+    /// unequal lengths are rejected without comparing their contents.
     pub fn authorizes(&self, presented: Option<&str>) -> bool {
+        use subtle::ConstantTimeEq;
         let Some(presented) = presented else {
             return false;
         };
-        let expected = self.0.as_bytes();
-        let given = presented.as_bytes();
-        let mut difference = (expected.len() ^ given.len()) as u8;
-        for index in 0..expected.len().max(given.len()) {
-            let mine = expected.get(index).copied().unwrap_or_default();
-            let theirs = given.get(index).copied().unwrap_or_default();
-            difference |= mine ^ theirs;
-        }
-        difference == 0
+        bool::from(self.0.as_bytes().ct_eq(presented.as_bytes()))
     }
 }
 
@@ -160,6 +151,7 @@ mod tests {
         assert!(!token.authorizes(Some("S3CR3T")));
         assert!(!token.authorizes(None));
         assert!(!token.authorizes(Some("")));
+        assert!(!token.authorizes(Some(&format!("s3cr3t{}", "\0".repeat(256)))));
     }
 
     #[test]

@@ -17,11 +17,20 @@ pub const CONTROL_TOKEN_ENV: &str = "HODEI_MH_CONTROL_TOKEN";
 pub const AUTHORIZATION_HEADER: &str = "Authorization";
 
 /// A client of the lifecycle control plane.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ControlPlane {
     base_url: String,
     token: Option<String>,
     http: Client,
+}
+
+impl std::fmt::Debug for ControlPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlane")
+            .field("base_url", &"<redacted>")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ControlPlane {
@@ -41,7 +50,10 @@ impl ControlPlane {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
-            http: Client::new(),
+            http: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static HTTP client configuration is valid"),
         }
     }
 
@@ -131,12 +143,44 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_does_not_expose_control_credentials() {
+        let control =
+            ControlPlane::with_token("http://127.0.0.1:8081", Some("private-token".into()));
+        assert!(!format!("{control:?}").contains("private-token"));
+    }
+
+    #[test]
     fn a_client_without_a_credential_says_why() {
         let control = ControlPlane::with_token("http://127.0.0.1:8081", None);
         let reason = control
             .missing_credential()
             .expect("the credential is missing");
         assert!(reason.contains(CONTROL_TOKEN_ENV), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn control_requests_do_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = source.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let _ = socket.read(&mut bytes).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let control =
+            ControlPlane::with_token(format!("http://{source_addr}"), Some("secret".into()));
+        let response = control.get("/v1/sandboxes").send().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

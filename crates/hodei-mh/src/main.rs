@@ -37,6 +37,7 @@ mod run_probe;
 mod supervisor_cli;
 mod supervisor_probe;
 mod tracker_probe;
+mod trust_probe;
 mod tui;
 mod verify_probe;
 mod workspace_probe;
@@ -64,6 +65,8 @@ product:
 
 probes (evidence about this host):
   release-probe | profile-probe | supervisor-probe | multiproject-probe | verify-probe
+  trust-probe                            measure the trust boundary, from the host and from
+                                         inside the sandbox
 
 options:
   --version                            print the version and exit
@@ -105,7 +108,8 @@ async fn main() {
         Some("autonomous-loop") => {
             let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
             let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
-            let code = autonomous_probe::run(&server, &image).await;
+            let proxy = flag(&args[1..], "--proxy-url", profile_run::DEFAULT_PROXY_URL);
+            let code = autonomous_probe::run(&server, &image, &proxy).await;
             std::process::exit(code);
         }
         Some("supervisor") => {
@@ -172,7 +176,8 @@ async fn main() {
         Some("interact-probe") => {
             let server = flag(&args[1..], "--server", "http://127.0.0.1:8081");
             let image = flag(&args[1..], "--image", "opensandbox/code-interpreter:v1.1.0");
-            let code = interact_probe::run(&server, &image).await;
+            let proxy = flag(&args[1..], "--proxy-url", profile_run::DEFAULT_PROXY_URL);
+            let code = interact_probe::run(&server, &image, &proxy).await;
             std::process::exit(code);
         }
         Some("oneshot-probe") => {
@@ -208,6 +213,10 @@ async fn main() {
                     .unwrap_or_else(|_| ".".to_string()),
             )
             .await;
+            std::process::exit(code);
+        }
+        Some("trust-probe") => {
+            let code = trust_probe::run(&args[1..]).await;
             std::process::exit(code);
         }
         Some("workspace-probe") => {
@@ -247,6 +256,7 @@ struct ProbeCheck {
 
 async fn acp_probe(args: &[String]) -> i32 {
     let server = flag(args, "--server", "http://127.0.0.1:8081");
+    let proxy_url = flag(args, "--proxy-url", profile_run::DEFAULT_PROXY_URL);
     let mode = flag(args, "--mode", "mock");
     let image = flag(args, "--image", "opensandbox/code-interpreter:v1.1.0");
     let started = Instant::now();
@@ -478,14 +488,15 @@ async fn acp_probe(args: &[String]) -> i32 {
             let base_prefix = if base.is_empty() {
                 String::new()
             } else {
-                format!("ANTHROPIC_BASE_URL={base} ")
+                format!("ANTHROPIC_BASE_URL={} ", probe_util::shell_quote(&base))
             };
-            // The host bridge proxy (docker gateway IP) provides the HTTPS
-            // egress the agent uses. Direct internet is NOT blocked by the
-            // harness: the proxy is the authorized path, not an enforced
-            // boundary (see docs/profiles.md).
+            // The authorized egress proxy provides the HTTPS egress the
+            // agent uses. It is the ONLY way out of the sandbox: the
+            // network policy denies the direct one (see docs/profiles.md).
             format!(
-                "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY=http://172.17.0.1:8888 {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp"
+                "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY={proxy} {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp",
+                proxy = probe_util::shell_quote(&proxy_url),
+                token = probe_util::shell_quote(&token),
             )
         }
     };

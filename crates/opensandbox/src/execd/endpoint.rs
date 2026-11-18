@@ -20,16 +20,32 @@ pub const EXECD_ACCESS_TOKEN_HEADER: &str = "X-EXECD-ACCESS-TOKEN";
 pub const EXECD_ACCESS_TOKEN_ENV: &str = "HODEI_MH_EXECD_ACCESS_TOKEN";
 
 /// An execd, with the credential that authorizes the calls to it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ExecdEndpoint {
     base_url: String,
     access_token: Option<String>,
 }
 
+impl std::fmt::Debug for ExecdEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecdEndpoint")
+            .field("base_url", &"<redacted>")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 impl std::fmt::Display for ExecdEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The credential NEVER appears in a rendered endpoint.
-        f.write_str(&self.base_url)
+        // URLs can contain userinfo, paths and queries supplied by a caller.
+        // Display only the origin, never arbitrary URL components.
+        match reqwest::Url::parse(&self.base_url) {
+            Ok(url) if url.host().is_some() => f.write_str(&url.origin().ascii_serialization()),
+            _ => f.write_str("<invalid endpoint>"),
+        }
     }
 }
 
@@ -138,6 +154,24 @@ mod tests {
         assert_eq!(endpoint.base_url(), "http://127.0.0.1:45678");
         assert_eq!(endpoint.access_token(), None);
         assert!(endpoint.attach_options().header_token.is_none());
+    }
+
+    #[test]
+    fn debug_output_does_not_expose_execd_credentials() {
+        let endpoint =
+            ExecdEndpoint::with_token("http://127.0.0.1:45678", Some("private-token".into()));
+        assert!(!format!("{endpoint:?}").contains("private-token"));
+    }
+
+    #[test]
+    fn display_never_exposes_sensitive_url_components() {
+        let endpoint =
+            ExecdEndpoint::new("http://user:secret@localhost:1234/private?token=secret#secret");
+        assert_eq!(endpoint.to_string(), "http://localhost:1234");
+        assert_eq!(
+            ExecdEndpoint::new("secret").to_string(),
+            "<invalid endpoint>"
+        );
     }
 
     #[test]

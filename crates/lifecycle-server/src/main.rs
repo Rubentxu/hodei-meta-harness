@@ -53,10 +53,22 @@ fn trust_from_env() -> Result<TrustConfig, String> {
     let control_token = ControlToken::from_env().map_err(|e| e.to_string())?;
     let policy_name =
         std::env::var(NETWORK_POLICY_ENV).unwrap_or_else(|_| INTERNAL_EGRESS_PROXY.to_string());
-    let network_name =
-        std::env::var(SANDBOX_NETWORK_ENV).unwrap_or_else(|_| DEFAULT_SANDBOX_NETWORK.to_string());
-    let subnet =
-        std::env::var(SANDBOX_SUBNET_ENV).unwrap_or_else(|_| DEFAULT_SANDBOX_SUBNET.to_string());
+    if std::env::var_os(SANDBOX_NETWORK_ENV).is_some() {
+        return Err("SANDBOX_NETWORK is unsupported: networks are created per sandbox".to_string());
+    }
+    let network_name = DEFAULT_SANDBOX_NETWORK.to_string();
+    let proxy_container = std::env::var("HODEI_MH_EGRESS_PROXY_CONTAINER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "HODEI_MH_EGRESS_PROXY_CONTAINER must identify the trusted proxy container".to_string()
+        })?;
+    if std::env::var_os(SANDBOX_SUBNET_ENV).is_some() {
+        return Err(
+            "SANDBOX_SUBNET is unsupported: Docker allocates per-sandbox subnets".to_string(),
+        );
+    }
+    let subnet = DEFAULT_SANDBOX_SUBNET.to_string();
     let network =
         NetworkPolicy::parse(&policy_name, &network_name, &subnet).map_err(|e| e.message)?;
     let public_publish_accepted = std::env::var(ALLOW_PUBLIC_PUBLISH_ENV)
@@ -67,20 +79,40 @@ fn trust_from_env() -> Result<TrustConfig, String> {
         public_publish_accepted,
     )
     .map_err(|e| e.message)?;
+    if !publish_address.is_loopback() {
+        return Err("the isolated control relay only supports loopback publication".to_string());
+    }
+    let public_origin =
+        std::env::var(PUBLIC_ORIGIN_ENV).unwrap_or_else(|_| DEFAULT_PUBLISH_ADDRESS.to_string());
+    if public_origin != "localhost"
+        && !public_origin
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+    {
+        return Err("the isolated control relay requires a loopback public origin".to_string());
+    }
     let defaults = LimitPolicy::default();
     let limits = LimitPolicy {
         memory_bytes: limit_from_env("SANDBOX_MEMORY_LIMIT_BYTES", defaults.memory_bytes)?,
         nano_cpus: limit_from_env("SANDBOX_CPU_LIMIT_NANOCPUS", defaults.nano_cpus)?,
         pids_limit: limit_from_env("SANDBOX_PIDS_LIMIT", defaults.pids_limit)?,
     };
+    limits.validate().map_err(|e| e.message)?;
     Ok(TrustConfig {
         control_token,
         publish_address,
-        public_origin: std::env::var(PUBLIC_ORIGIN_ENV)
-            .unwrap_or_else(|_| DEFAULT_PUBLISH_ADDRESS.to_string()),
+        public_origin,
         network,
+        proxy_container: Some(proxy_container),
         limits,
     })
+}
+
+fn loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[tokio::main]
@@ -92,6 +124,12 @@ async fn main() {
         .init();
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    if !loopback_host(&host) {
+        eprintln!(
+            "the lifecycle server requires a loopback HOST; remote HTTP exposes the control credential"
+        );
+        std::process::exit(1);
+    }
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -129,6 +167,8 @@ async fn main() {
     });
 
     let adapter = DockerAdapter::connect(docker, execd_image);
+
+    tracing::info!("sandbox networks are allocated per sandbox; isolated=true ipv6=false");
     let mut server_env = BTreeMap::new();
     if let Ok(extra) = std::env::var("SANDBOX_ENV") {
         // Format: KEY=VALUE,KEY2=VALUE2
@@ -188,4 +228,18 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loopback_host;
+
+    #[test]
+    fn control_listener_rejects_remote_and_ambiguous_hosts() {
+        assert!(loopback_host("127.0.0.1"));
+        assert!(loopback_host("localhost"));
+        assert!(!loopback_host("0.0.0.0"));
+        assert!(!loopback_host("192.0.2.1"));
+        assert!(!loopback_host("localhost.example"));
+    }
 }

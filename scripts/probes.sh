@@ -5,6 +5,7 @@
 #   scripts/probes.sh                # one round of the probes
 #   scripts/probes.sh --rounds 3     # three consecutive rounds
 #   scripts/probes.sh --probe profile-probe
+#   scripts/probes.sh --probe trust-probe
 #   scripts/probes.sh --preflight    # only check the prerequisites
 #
 # These probes are NOT part of the fast gate: they start sandboxes and run
@@ -17,10 +18,13 @@
 #
 # PREREQUISITES. The lane states what it needs and refuses to run without
 # it, with the reason: the official Backlog.md CLI (the probes use the real
-# tracker), Docker, a restricted egress proxy (the profiles' gate refuses
-# to build without one, and it does not fall back), and the images of the
-# profiles (the doctor is read-only and refuses an image that is not
-# already in the local daemon). A missing prerequisite fails the lane; it
+# tracker), Docker, an operator-configured restricted egress proxy, and the
+# images of the profiles. Set HODEI_MH_EGRESS_PROXY_CONTAINER to the trusted
+# running container and HODEI_MH_PROXY_CHECK_URL to its host-reachable HTTP
+# origin. PROXY_PORT selects its listening port inside sandbox networks (8888
+# by default). Its client ACL must allow Docker's dynamic sandbox network pools.
+# The doctor is read-only and refuses an image that is not
+# already in the local daemon. A missing prerequisite fails the lane; it
 # never degrades it in silence.
 set -uo pipefail
 
@@ -29,17 +33,15 @@ cd "$REPO_ROOT" || exit 1
 
 PORT="${PORT:-8081}"
 ROUNDS=1
-PROBES="release-probe supervisor-probe profile-probe multiproject-probe verify-probe"
+PROBES="release-probe supervisor-probe profile-probe multiproject-probe verify-probe trust-probe"
 OUT="${OUT:-/tmp/hodei-probes}"
 BIN="target/x86_64-unknown-linux-gnu/release/hodei-mh"
 SERVER="target/x86_64-unknown-linux-gnu/release/hodei-mh-lifecycle-server"
 
-# The restricted egress proxy the profiles require. The address is the one
-# the probes use to reach it (DEFAULT_PROXY_URL in
-# crates/hodei-mh/src/profile_run.rs): the gateway of the Docker bridge.
-PROXY_HOST="${PROXY_HOST:-172.17.0.1}"
+# The lifecycle server attaches the operator's trusted proxy to each
+# sandbox network under this stable alias. The host check uses a separate URL.
 PROXY_PORT="${PROXY_PORT:-8888}"
-PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+PROXY_URL="http://hodei-proxy:${PROXY_PORT}"
 
 # The official Backlog.md CLI the probes use. The version is only reported:
 # the lane needs the CLI, not a particular build of it.
@@ -49,7 +51,10 @@ BACKLOG_CLI_VERSION="${BACKLOG_CLI_VERSION:-1.55.3}"
 # it never pulls, and it refuses an image that is not already there, so
 # the lane pulls what is missing before the probes and says what it did.
 # The pinned profiles are in docs/profiles.md.
-PROBE_IMAGES="${PROBE_IMAGES:-rust:1-bookworm opensandbox/code-interpreter:v1.1.0}"
+# The trust probe measures the boundary from INSIDE a sandbox, so its
+# image must carry a python interpreter: the measurement is a program,
+# not a shell pipeline.
+PROBE_IMAGES="${PROBE_IMAGES:-rust:1-bookworm opensandbox/code-interpreter:v1.1.0 python:3.12-slim}"
 
 # Preflight only: check the prerequisites and report, without running a
 # probe and without starting the control plane.
@@ -75,23 +80,6 @@ die() {
   exit 1
 }
 
-# Whether a TCP port answers, measured and not assumed.
-tcp_reachable() {
-  python3 - "$1" "$2" <<'PY'
-import socket
-import sys
-
-sock = socket.socket()
-sock.settimeout(2)
-try:
-    sock.connect((sys.argv[1], int(sys.argv[2])))
-except OSError:
-    sys.exit(1)
-finally:
-    sock.close()
-PY
-}
-
 # The official Backlog.md CLI: the probes drive the REAL tracker, so
 # without it there is nothing to probe.
 require_backlog_cli() {
@@ -103,20 +91,12 @@ require_backlog_cli() {
   say "   Backlog.md CLI: $version"
 }
 
-# Docker, and the address the sandboxes use to reach the proxy: the
-# gateway of the bridge network. If the host's gateway is another address,
-# the probes would look for the proxy where it cannot be, and the lane
-# would fail later for a reason that has nothing to do with the candidate.
-require_docker_gateway() {
+# Docker must be available to create the per-sandbox networks.
+require_docker() {
   command -v docker >/dev/null 2>&1 || die "docker is not installed: the probes need it"
   docker version --format '{{.Server.Version}}' >/dev/null 2>&1 \
     || die "the docker daemon is not answering: the probes need it"
-  local gateway
-  gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null)"
-  [ -n "$gateway" ] || die "the docker bridge network has no gateway address"
-  [ "$gateway" = "$PROXY_HOST" ] || die \
-    "the docker bridge gateway is $gateway but the probes reach the proxy at $PROXY_HOST: the sandbox would not find the proxy"
-  say "   docker bridge gateway: $gateway"
+  say "   Docker daemon available"
 }
 
 # The images the probes need: the doctor refuses an image that is not in
@@ -137,33 +117,33 @@ require_images() {
   done
 }
 
-# The restricted egress proxy. One already answering is reused; otherwise
-# the lane starts the versioned one and stops it at the end.
-start_proxy() {
-  say "── starting the restricted egress proxy (scripts/egress-proxy.py)"
-  python3 scripts/egress-proxy.py --bind "$PROXY_HOST" --port "$PROXY_PORT" \
-    > "$OUT/proxy.log" 2>&1 &
-  PROXY_PID=$!
-  local attempt
-  for attempt in $(seq 1 20); do
-    if tcp_reachable "$PROXY_HOST" "$PROXY_PORT"; then
-      say "   restricted egress proxy reachable at $PROXY_URL (pid $PROXY_PID)"
-      return 0
-    fi
-    kill -0 "$PROXY_PID" 2>/dev/null || break
-    sleep 0.5
-  done
-  say "the proxy output:" >&2
-  cat "$OUT/proxy.log" >&2 2>/dev/null
-  die "the restricted egress proxy did not become reachable at $PROXY_URL"
-}
+# The proxy is an operator-owned trust decision, not a container selected by
+# a sandbox request. Its host endpoint is only a reachability check; actual
+# sandbox reachability and restricted egress are exercised by the probes.
+require_proxy() {
+  [ -n "${HODEI_MH_EGRESS_PROXY_CONTAINER:-}" ] || die "set HODEI_MH_EGRESS_PROXY_CONTAINER to the running trusted proxy container"
+  [ -n "${HODEI_MH_PROXY_CHECK_URL:-}" ] || die "set HODEI_MH_PROXY_CHECK_URL to the host-reachable proxy HTTP origin"
+  [ "$(docker inspect --format '{{.State.Running}}' "$HODEI_MH_EGRESS_PROXY_CONTAINER" 2>/dev/null)" = true ] \
+    || die "the configured trusted proxy container is not running"
+  python3 - "$HODEI_MH_PROXY_CHECK_URL" <<'PY'
+import socket
+import sys
+from urllib.parse import urlsplit
 
-ensure_proxy() {
-  if tcp_reachable "$PROXY_HOST" "$PROXY_PORT"; then
-    say "   restricted egress proxy already reachable at $PROXY_URL"
-    return 0
-  fi
-  start_proxy
+try:
+    url = urlsplit(sys.argv[1])
+    if (url.scheme != 'http' or not url.hostname or url.port is None
+            or url.username is not None or url.password is not None
+            or url.path not in ('', '/') or url.query or url.fragment):
+        raise ValueError('expected an HTTP origin with an explicit port')
+    with socket.create_connection((url.hostname, url.port), timeout=3):
+        pass
+except (ValueError, OSError) as error:
+    print(f'proxy host check failed: {error}', file=sys.stderr)
+    sys.exit(1)
+PY
+  [ "$?" = 0 ] || die "the host proxy check URL is invalid or unreachable"
+  say "   trusted proxy container running; host check reachable; sandbox endpoint: $PROXY_URL"
 }
 
 # The lane owns its port: a stale server answering on it would make the
@@ -174,6 +154,10 @@ import socket
 import sys
 
 sock = socket.socket()
+# The server binds with SO_REUSEADDR, so a port left in TIME_WAIT by the
+# previous round is still usable. The check asks the question the server
+# will actually face.
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     sock.bind(("127.0.0.1", int(sys.argv[1])))
 except OSError as error:
@@ -184,32 +168,21 @@ finally:
 PY
 }
 
-# The processes the lane owns: the control plane and, when the lane
-# started it, the restricted egress proxy. Both stop when the lane ends,
-# whatever the reason.
+# The lane owns the control plane, but never the operator's proxy.
 SERVER_PID=""
-PROXY_PID=""
 cleanup() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null
     wait "$SERVER_PID" 2>/dev/null
-  fi
-  if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    kill "$PROXY_PID" 2>/dev/null
-    wait "$PROXY_PID" 2>/dev/null
   fi
 }
 trap cleanup EXIT
 
 say "── the probe prerequisites"
 require_backlog_cli
-require_docker_gateway
+require_docker
 require_images
-if tcp_reachable "$PROXY_HOST" "$PROXY_PORT"; then
-  say "   restricted egress proxy reachable at $PROXY_URL"
-else
-  say "   restricted egress proxy not running at $PROXY_URL (the lane starts its own)"
-fi
+require_proxy
 
 if [ "$PREFLIGHT" = "1" ]; then
   say ""
@@ -228,10 +201,7 @@ if ! port_is_free "$PORT" > "$OUT/port.log" 2>&1; then
   exit 1
 fi
 
-# The restricted egress proxy belongs to the lane: it starts it before the
-# probes and stops it at the end.
-ensure_proxy
-
+[ -n "${HODEI_MH_CONTROL_TOKEN:-}" ] || die "set HODEI_MH_CONTROL_TOKEN for the server and probe clients"
 say "── starting the control plane on port $PORT"
 PORT="$PORT" "$SERVER" > "$OUT/server.log" 2>&1 &
 SERVER_PID=$!
@@ -260,11 +230,14 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 say "   control plane ready (pid $SERVER_PID)"
 
+# The server attaches the configured proxy when it creates each sandbox.
+export HODEI_MH_PROXY_URL="$PROXY_URL"
+
 status=0
 for round in $(seq 1 "$ROUNDS"); do
   for probe in $PROBES; do
     log="$OUT/$probe-$round.json"
-    if "$BIN" "$probe" --server "http://127.0.0.1:$PORT" > "$log" 2> "$log.err"; then
+    if "$BIN" "$probe" --server "http://127.0.0.1:$PORT" --proxy-url "$PROXY_URL" > "$log" 2> "$log.err"; then
       say "   round $round: $probe PASS"
     else
       say "   round $round: $probe FAIL (see $log and $log.err)"
@@ -274,11 +247,27 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 say "── residue left on the host"
-sandboxes=$(curl -s "http://127.0.0.1:$PORT/v1/sandboxes" 2>/dev/null \
-  | python3 -c 'import json,sys; print(len((json.load(sys.stdin) or {}).get("items",[])))' 2>/dev/null)
-containers=$(docker ps -a --filter "name=sandbox-" --format '{{.Names}}' 2>/dev/null | wc -l)
-say "   sandboxes=${sandboxes:-unknown} containers=${containers}"
-if [ "${sandboxes:-1}" != "0" ] || [ "$containers" != "0" ]; then
+sandboxes=$(python3 - "$PORT" <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    f"http://127.0.0.1:{sys.argv[1]}/v1/sandboxes",
+    headers={"Authorization": "Bearer " + os.environ["HODEI_MH_CONTROL_TOKEN"]},
+)
+try:
+    with urllib.request.urlopen(request, timeout=5) as response:
+        print(len(json.load(response)["items"]))
+except (OSError, KeyError, ValueError):
+    sys.exit(1)
+PY
+)
+containers=$(docker ps -a --filter "name=sandbox-" --format '{{.Names}}' 2>/dev/null | wc -l) || containers=unknown
+networks=$(docker network ls --filter 'label=hodei.io/network-owner=lifecycle-server' --format '{{.ID}}' 2>/dev/null | wc -l) || networks=unknown
+say "   sandboxes=${sandboxes:-unknown} containers=${containers} networks=${networks}"
+if [ "${sandboxes:-1}" != "0" ] || [ "$containers" != "0" ] || [ "$networks" != "0" ]; then
   say "probes: the lane left residue on the host"
   status=1
 fi

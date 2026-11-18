@@ -99,6 +99,20 @@ jobs:
         # behaviour because a floating dependency moved.
         run: npm install -g backlog.md@1.55.3
 
+      - name: Start the restricted proxy for the probe lane
+        run: |
+          token="$(openssl rand -hex 32)"
+          printf '::add-mask::%s\n' "$token"
+          printf 'HODEI_MH_CONTROL_TOKEN=%s\n' "$token" >> "$GITHUB_ENV"
+          printf 'HODEI_MH_PROXY_CHECK_URL=http://127.0.0.1:18888\n' >> "$GITHUB_ENV"
+          proxy="hodei-ci-egress-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d --name "$proxy" --network bridge \
+            -p 127.0.0.1:18888:8888 \
+            -v "$PWD/scripts/egress-proxy.py:/opt/egress-proxy.py:ro" \
+            --entrypoint python3 rust:1-bookworm /opt/egress-proxy.py \
+            --bind 0.0.0.0 --port 8888 --allow-prefix 172.16.0.0/12
+          printf 'HODEI_MH_EGRESS_PROXY_CONTAINER=%s\n' "$proxy" >> "$GITHUB_ENV"
+
       - name: The probe prerequisites are present
         # The lane states what it needs and refuses to run without it,
         # with the reason.
@@ -106,6 +120,13 @@ jobs:
 
       - name: Run the probes
         run: scripts/probes.sh --rounds 1
+
+      - name: Remove the probe proxy
+        if: always()
+        run: |
+          if [ -n "${HODEI_MH_EGRESS_PROXY_CONTAINER:-}" ]; then
+            docker rm -f "$HODEI_MH_EGRESS_PROXY_CONTAINER" >/dev/null 2>&1 || true
+          fi
 
       - name: Publish the probe output
         # WHY a probe failed lives in these files, not in the job log:

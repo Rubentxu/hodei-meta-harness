@@ -28,10 +28,14 @@ pub const EXECED_INSTALL_PATH: &str = "/opt/opensandbox/execd";
 pub const BOOTSTRAP_PATH: &str = "/opt/opensandbox/bootstrap.sh";
 pub const OPENSANDBOX_DIR: &str = "/opt/opensandbox";
 
-/// The environment variable that carries the credential of the
-/// execution plane. The execd reads it from the environment of its own
-/// process: the credential never travels in a command, a label or a
+/// The name of the environment variable that carries the credential of
+/// the execution plane. The execd reads it from the environment of its
+/// own process: the credential never travels in a command, a label or a
 /// record.
+pub const EXECD_ACCESS_TOKEN_NAME: &str = "EXECD_ACCESS_TOKEN";
+
+/// The environment variable that carries the credential of the
+/// execution plane, as it appears in the environment of a container.
 pub const EXECD_ACCESS_TOKEN_ENV: &str = "EXECD_ACCESS_TOKEN=";
 
 /// Hardening defaults mirroring the example `~/.sandbox.toml` (docker section).
@@ -189,12 +193,51 @@ pub fn build_labels(
     labels
 }
 
-/// Environment list (reference `_build_labels_and_env`): config env merged
-/// under request env, then the identity of the sandbox.
+/// The prefixes of the environment entries the server owns.
+///
+/// The credential and the identity of the sandbox are read back from
+/// the container by prefix. A key like `EXECD_ACCESS_TOKEN=x` would
+/// produce the entry `EXECD_ACCESS_TOKEN=x=...`, which carries the
+/// same prefix and would be read back INSTEAD of the credential the
+/// server minted: the whole prefix is reserved, not only its exact
+/// name.
+const RESERVED_ENV_PREFIXES: [&str; 3] = [EXECD_ACCESS_TOKEN_ENV, "OPENSANDBOX_ID=", "EXECD_INIT="];
+
+/// The namespaces the execution plane reads its own configuration from.
+///
+/// The execd takes its configuration from the environment of its own
+/// process. A request that may write into that namespace would steer
+/// the execution plane, so it may not: the operator owns it.
+const EXECUTION_PLANE_PREFIXES: [&str; 2] = ["OPENSANDBOX_", "EXECD_"];
+
+/// True when the entry `key=value` would shadow one of the entries the
+/// server owns.
+fn shadows_a_reserved_entry(key: &str) -> bool {
+    let entry = format!("{key}=");
+    RESERVED_ENV_PREFIXES
+        .iter()
+        .any(|prefix| entry.starts_with(prefix))
+}
+
+/// True when the key belongs to the namespace of the execution plane.
+fn belongs_to_the_execution_plane(key: &str) -> bool {
+    EXECUTION_PLANE_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
+/// Environment list (reference `_build_labels_and_env`): request env merged
+/// UNDER the config env, then the identity of the sandbox.
 ///
 /// The identity comes LAST: a request may not choose the identity of the
 /// environment it asks for, and the credential of the execution plane
 /// belongs to the server.
+///
+/// The request does NOT win over the operator's configuration: the
+/// environment of the sandbox is read by the execd, and a client that
+/// could overwrite the operator's variables would be able to steer the
+/// execution plane. A request may only add the keys the operator did
+/// not set, and never in the namespace the execution plane reads.
 pub fn build_env(
     server_env: &BTreeMap<String, String>,
     request_env: Option<&BTreeMap<String, String>>,
@@ -203,14 +246,21 @@ pub fn build_env(
     execd_access_token: &str,
 ) -> Vec<String> {
     let mut merged: BTreeMap<&String, &String> = BTreeMap::new();
-    for (k, v) in server_env {
-        merged.insert(k, v);
-    }
     if let Some(req) = request_env {
         for (k, v) in req {
+            // The namespace of the execution plane belongs to the
+            // operator: a request that writes into it would steer the
+            // execd, whatever the value the operator gave.
+            if belongs_to_the_execution_plane(k) {
+                continue;
+            }
             merged.insert(k, v);
         }
     }
+    for (k, v) in server_env {
+        merged.insert(k, v);
+    }
+    merged.retain(|key, _| !shadows_a_reserved_entry(key));
     let mut env: Vec<String> = merged
         .into_iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -221,6 +271,31 @@ pub fn build_env(
     env.push(format!("OPENSANDBOX_ID={sandbox_id}"));
     env.push(format!("{EXECD_ACCESS_TOKEN_ENV}{execd_access_token}"));
     env
+}
+
+/// The credential of the execution plane, read back from the
+/// environment of a container.
+///
+/// The entries are matched by EXACT name: an entry that merely starts
+/// with the name of the variable (`EXECD_ACCESS_TOKEN=x`) belongs to
+/// another variable and must not be taken as the credential. Two
+/// entries with the exact name make the credential ambiguous, and an
+/// ambiguous credential is no credential: the read fails closed.
+pub fn token_from_env(env: Vec<String>) -> Option<String> {
+    let mut found: Option<String> = None;
+    for entry in env {
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if name != EXECD_ACCESS_TOKEN_NAME {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(value.to_string());
+    }
+    found
 }
 
 /// Parse a Docker-style memory limit ("2Gi", "512Mi", "262144000", plain bytes).
@@ -271,7 +346,7 @@ pub fn parse_cpu_nano_cpus(raw: &str) -> Result<i64, ValidationError> {
             format!("Invalid resourceLimits.cpu: {raw:?}; must be a positive CPU count"),
         )
     })?;
-    if cpus <= 0.0 {
+    if !cpus.is_finite() || cpus < 0.000_000_001 || cpus > i64::MAX as f64 / 1_000_000_000.0 {
         return Err(validation_error(
             error_codes::INVALID_PARAMETER,
             format!("Invalid resourceLimits.cpu: {raw:?}; must be a positive CPU count"),
@@ -299,8 +374,7 @@ pub fn resolve_resource_limits(
     Ok((memory, nano_cpus))
 }
 
-/// Base HostConfig spec (reference `_base_host_config_kwargs`) with
-/// auto-assigned host ports for the two exposed container ports.
+/// Base HostConfig spec. The isolated relay does not publish sandbox ports.
 pub fn build_host_spec(
     hardening: &DockerHardening,
     memory: Option<i64>,
@@ -320,7 +394,7 @@ pub fn build_host_spec(
         pids_limit: hardening.pids_limit,
         memory,
         nano_cpus,
-        auto_assign_ports: true,
+        auto_assign_ports: false,
     }
 }
 
@@ -478,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn env_merges_request_over_server_and_appends_identity() {
+    fn env_merges_the_request_under_the_server_and_appends_identity() {
         let server = BTreeMap::from([
             ("A".to_string(), "1".to_string()),
             ("B".to_string(), "server".to_string()),
@@ -489,11 +563,44 @@ mod tests {
             env,
             vec![
                 "A=1",
-                "B=req",
+                "B=server",
                 "EXECD_INIT=1",
                 "OPENSANDBOX_ID=sbx3",
                 "EXECD_ACCESS_TOKEN=token-1"
             ]
+        );
+    }
+
+    #[test]
+    fn a_request_cannot_steer_the_execution_plane_through_the_environment() {
+        // The environment of the sandbox is read by the execd. A client
+        // that could overwrite the operator's variables would steer the
+        // execution plane, so the operator's configuration wins.
+        let server = BTreeMap::from([
+            (
+                "OPENSANDBOX_LISTEN".to_string(),
+                "127.0.0.1:44772".to_string(),
+            ),
+            ("SANDBOX_ENV".to_string(), "operator".to_string()),
+        ]);
+        let request = BTreeMap::from([
+            (
+                "OPENSANDBOX_LISTEN".to_string(),
+                "0.0.0.0:44772".to_string(),
+            ),
+            ("SANDBOX_ENV".to_string(), "caller".to_string()),
+            ("EXTRA".to_string(), "caller".to_string()),
+        ]);
+        let env = build_env(&server, Some(&request), "sbx5", true, "token-3");
+        assert!(
+            env.contains(&"OPENSANDBOX_LISTEN=127.0.0.1:44772".to_string()),
+            "{env:?}"
+        );
+        assert!(env.contains(&"SANDBOX_ENV=operator".to_string()), "{env:?}");
+        assert!(env.contains(&"EXTRA=caller".to_string()), "{env:?}");
+        assert!(
+            !env.contains(&"OPENSANDBOX_LISTEN=0.0.0.0:44772".to_string()),
+            "{env:?}"
         );
     }
 
@@ -514,10 +621,111 @@ mod tests {
             env.contains(&"EXECD_ACCESS_TOKEN=token-2".to_string()),
             "{env:?}"
         );
+        assert_eq!(
+            env.iter()
+                .filter(|entry| entry.starts_with("EXECD_ACCESS_TOKEN="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|entry| entry.starts_with("OPENSANDBOX_ID="))
+                .count(),
+            1
+        );
         assert!(
-            !env.contains(&"a-token-of-the-caller".to_string()),
+            !env.iter()
+                .any(|entry| entry.contains("a-token-of-the-caller"))
+        );
+    }
+
+    #[test]
+    fn a_request_cannot_shadow_the_credential_with_a_prefixed_key() {
+        // The credential is read back from the container by prefix. A
+        // request that writes the name of the variable inside another
+        // key produces an entry with the same prefix, and that entry
+        // is the one the server would read back and hand out: the
+        // caller would choose the credential of its own execution
+        // plane.
+        let request = BTreeMap::from([
+            ("EXECD_ACCESS_TOKEN=x".to_string(), "y".to_string()),
+            ("OPENSANDBOX_ID=z".to_string(), "w".to_string()),
+        ]);
+        let env = build_env(&BTreeMap::new(), Some(&request), "sbx6", true, "token-4");
+        assert_eq!(
+            env.iter()
+                .filter(|entry| entry.starts_with("EXECD_ACCESS_TOKEN="))
+                .count(),
+            1,
             "{env:?}"
         );
+        assert_eq!(
+            env.iter()
+                .filter(|entry| entry.starts_with("OPENSANDBOX_ID="))
+                .count(),
+            1,
+            "{env:?}"
+        );
+        assert!(!env.iter().any(|entry| entry.contains("x=y")), "{env:?}");
+        assert!(!env.iter().any(|entry| entry.contains("z=w")), "{env:?}");
+    }
+
+    #[test]
+    fn a_request_cannot_write_into_the_namespace_of_the_execution_plane() {
+        // The execd takes its configuration from the environment of its
+        // own process. A request that may write into that namespace
+        // would steer the execution plane, whatever the operator set.
+        let request = BTreeMap::from([
+            ("EXECD_LISTEN".to_string(), "0.0.0.0:44772".to_string()),
+            (
+                "OPENSANDBOX_LISTEN".to_string(),
+                "0.0.0.0:44772".to_string(),
+            ),
+            ("APP_PORT".to_string(), "8080".to_string()),
+        ]);
+        let env = build_env(&BTreeMap::new(), Some(&request), "sbx7", true, "token-5");
+        assert!(
+            !env.iter().any(|entry| entry.starts_with("EXECD_")
+                && !entry.starts_with("EXECD_INIT=")
+                && !entry.starts_with("EXECD_ACCESS_TOKEN=")),
+            "{env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry.starts_with("OPENSANDBOX_")
+                    && !entry.starts_with("OPENSANDBOX_ID=")),
+            "{env:?}"
+        );
+        assert!(env.contains(&"APP_PORT=8080".to_string()), "{env:?}");
+    }
+
+    #[test]
+    fn the_credential_is_read_back_by_exact_name() {
+        // A prefixed entry belongs to another variable, and an
+        // ambiguous credential is no credential at all.
+        assert_eq!(
+            token_from_env(vec![
+                "EXECD_ACCESS_TOKEN=the-real-one".to_string(),
+                "APP=1".to_string(),
+            ]),
+            Some("the-real-one".to_string())
+        );
+        assert_eq!(
+            token_from_env(vec![
+                "EXECD_ACCESS_TOKEN=x=y".to_string(),
+                "EXECD_ACCESS_TOKEN=the-real-one".to_string(),
+            ]),
+            None,
+            "an ambiguous credential is refused, not guessed"
+        );
+        assert_eq!(
+            token_from_env(vec![
+                "EXECD_ACCESS_TOKEN=one".to_string(),
+                "EXECD_ACCESS_TOKEN=two".to_string(),
+            ]),
+            None
+        );
+        assert_eq!(token_from_env(vec!["APP=1".to_string()]), None);
     }
 
     #[test]
@@ -538,6 +746,9 @@ mod tests {
         assert_eq!(parse_cpu_nano_cpus("0.5").unwrap(), 500_000_000);
         assert!(parse_cpu_nano_cpus("0").is_err());
         assert!(parse_cpu_nano_cpus("x").is_err());
+        assert!(parse_cpu_nano_cpus("NaN").is_err());
+        assert!(parse_cpu_nano_cpus("0.00000000001").is_err());
+        assert!(parse_cpu_nano_cpus("inf").is_err());
     }
 
     #[test]
@@ -566,7 +777,7 @@ mod tests {
         assert_eq!(spec.cap_drop.len(), 9);
         assert_eq!(spec.pids_limit, Some(4096));
         assert_eq!(spec.memory, Some(1024));
-        assert!(spec.auto_assign_ports);
+        assert!(!spec.auto_assign_ports);
     }
 
     #[test]

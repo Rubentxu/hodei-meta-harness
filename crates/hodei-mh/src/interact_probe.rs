@@ -24,7 +24,7 @@ use opensandbox::execd::pipe::{self, AttachOptions};
 
 use crate::probe_util::run_command_session_with_output;
 
-fn agent_command() -> String {
+fn agent_command(proxy: &str) -> String {
     // Gateway credentials come from the host environment and reach the
     // sandbox only as process env — never persisted anywhere.
     let token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
@@ -32,10 +32,16 @@ fn agent_command() -> String {
     let base_prefix = if base.is_empty() {
         String::new()
     } else {
-        format!("ANTHROPIC_BASE_URL={base} ")
+        format!(
+            "ANTHROPIC_BASE_URL={} ",
+            crate::probe_util::shell_quote(&base)
+        )
     };
     format!(
-        "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY=http://172.17.0.1:8888 {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp"
+        "PATH=/workspace/ccacp/node_modules/.bin:$PATH HTTPS_PROXY={proxy} {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp",
+        proxy = crate::probe_util::shell_quote(proxy),
+        base_prefix = base_prefix,
+        token = crate::probe_util::shell_quote(&token),
     )
 }
 
@@ -68,7 +74,7 @@ fn typed_request(message: &Value) -> Option<InteractionRequest> {
     })
 }
 
-pub async fn run(server: &str, image: &str) -> i32 {
+pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
     let started = Instant::now();
     let mut checks: Vec<Check> = Vec::new();
     let client = ControlPlane::new(server);
@@ -191,7 +197,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
         &execd,
         CreateSessionRequest {
             cwd: Some("/workspace"),
-            command: Some(agent_command().as_str()),
+            command: Some(agent_command(proxy_url).as_str()),
         },
     )
     .await
