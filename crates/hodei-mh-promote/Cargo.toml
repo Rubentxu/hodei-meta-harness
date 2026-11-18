@@ -9,6 +9,7 @@ license.workspace = true
 name = "promote"
 
 [dependencies]
+verify = { path = "../hodei-mh-verify", package = "hodei-mh-verify" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -783,6 +783,7 @@ dependencies = [
 name = "hodei-mh-promote"
 version = "0.1.1"
 dependencies = [
+ "hodei-mh-verify",
  "serde",
  "serde_json",
  "thiserror",

@@ -29,6 +29,9 @@ pub enum PromoteError {
     NotFastForward,
     #[error("git {context} failed: {detail}")]
     Git { context: String, detail: String },
+    /// The candidate has no evidence that speaks for it.
+    #[error("the candidate was not verified: {detail}")]
+    Unverified { detail: String },
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<(bool, String, String), PromoteError> {
@@ -103,7 +106,12 @@ pub fn candidate_head(bundle: &Path, candidate_branch: &str) -> Result<String, P
 
 /// Promote the candidate into the managed branch as a fast-forward, guarded
 /// by a native CAS on the verified base. Returns the candidate head commit.
-pub fn promote_ff_only(
+///
+/// UNCHECKED: this function knows nothing about evidence. It moves a
+/// candidate that was never verified, and it is named after that fact so
+/// the call site cannot hide it. The product path is `promote_verified`,
+/// which demands the evidence of the candidate before calling this.
+pub fn promote_ff_only_unchecked(
     repo: &Path,
     managed_branch: &str,
     bundle: &Path,
@@ -169,6 +177,57 @@ pub fn promote_ff_only(
         });
     }
     Ok(head)
+}
+
+/// Promote the candidate into the managed branch, but only with the
+/// evidence that speaks for it: the same work, the same commit and the very
+/// bundle that was verified. The facts are read from the bundle itself, at
+/// the boundary where the candidate is promoted. The CAS is unchanged.
+pub fn promote_verified(
+    repo: &Path,
+    managed_branch: &str,
+    bundle: &Path,
+    candidate_branch: &str,
+    expected_base: &str,
+    evidence: &verify::evidence::EvidenceSet,
+    work_ref: &str,
+) -> Result<String, PromoteError> {
+    let candidate = bundle_candidate(bundle, candidate_branch, work_ref)?;
+    crate::evidence::require_evidence(evidence, &candidate).map_err(|error| {
+        PromoteError::Unverified {
+            detail: error.to_string(),
+        }
+    })?;
+    promote_ff_only_unchecked(
+        repo,
+        managed_branch,
+        bundle,
+        candidate_branch,
+        expected_base,
+    )
+}
+
+/// The facts of the candidate, read from the bundle at the promotion
+/// boundary: the head it names and the digest of its bytes.
+fn bundle_candidate(
+    bundle: &Path,
+    candidate_branch: &str,
+    work_ref: &str,
+) -> Result<crate::evidence::PromotionCandidate, PromoteError> {
+    let head = candidate_head(bundle, candidate_branch)?;
+    let revision = verify::git::GitRevision::parse(&head).map_err(|error| PromoteError::Git {
+        context: "bundle head".into(),
+        detail: error.to_string(),
+    })?;
+    let bytes = std::fs::read(bundle).map_err(|error| PromoteError::Git {
+        context: "read bundle".into(),
+        detail: error.to_string(),
+    })?;
+    Ok(crate::evidence::PromotionCandidate {
+        work_ref: work_ref.to_string(),
+        revision,
+        transport_digest: verify::transport::TransportDigest::of(&bytes),
+    })
 }
 
 /// Re-read the managed branch: the crash-recovery verification compares the
@@ -284,7 +343,7 @@ mod tests {
         must(&repo, "branch", &["branch", "-q", "hodei-mh/main", &base]).unwrap();
 
         let promoted =
-            promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap();
+            promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap();
         assert_eq!(promoted, head);
         assert_eq!(
             current_ref(&repo, "hodei-mh/main").unwrap().as_deref(),
@@ -321,7 +380,8 @@ mod tests {
         let human = commit_file(&repo, "c.txt", "human change on managed");
         must(&repo, "checkout", &["checkout", "-q", "main"]).unwrap();
 
-        let err = promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap_err();
+        let err = promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base)
+            .unwrap_err();
         match err {
             PromoteError::BaseMoved { current, .. } => assert_eq!(current, human),
             other => panic!("expected BaseMoved, got {other:?}"),
@@ -361,7 +421,8 @@ mod tests {
             .trim()
             .to_string();
 
-        let err = promote_ff_only(&repo, "hodei-mh/main", &bundle, "candidate", &base).unwrap_err();
+        let err = promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base)
+            .unwrap_err();
         assert_eq!(err, PromoteError::NotFastForward);
         let _ = std::fs::remove_dir_all(&repo);
     }

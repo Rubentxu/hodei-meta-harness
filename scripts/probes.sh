@@ -2,7 +2,7 @@
 # The EXPENSIVE lane: the probes that need real infrastructure (Docker and
 # the OpenSandbox lifecycle server).
 #
-#   scripts/probes.sh                # one round of the four probes
+#   scripts/probes.sh                # one round of the probes
 #   scripts/probes.sh --rounds 3     # three consecutive rounds
 #   scripts/probes.sh --probe profile-probe
 #
@@ -20,7 +20,7 @@ cd "$REPO_ROOT" || exit 1
 
 PORT="${PORT:-8081}"
 ROUNDS=1
-PROBES="release-probe supervisor-probe profile-probe multiproject-probe"
+PROBES="release-probe supervisor-probe profile-probe multiproject-probe verify-probe"
 OUT="${OUT:-/tmp/hodei-probes}"
 BIN="target/x86_64-unknown-linux-gnu/release/hodei-mh"
 SERVER="target/x86_64-unknown-linux-gnu/release/hodei-mh-lifecycle-server"

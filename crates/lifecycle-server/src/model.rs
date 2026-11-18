@@ -53,6 +53,10 @@ pub struct PlatformSpec {
 #[serde(rename_all = "camelCase")]
 pub struct CreateSandboxResponse {
     pub id: String,
+    /// The id the runtime resolved for the image the sandbox runs, so a
+    /// consumer can tell which environment it actually got.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
     pub status: SandboxStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BTreeMap<String, String>>,

@@ -19,9 +19,10 @@ use promote::git;
 use promote::ledger::{PromotionLedger, PromotionPlan};
 use promote::ticket::TicketUpdate;
 use promote::writer::{BacklogWorkWriter, WorkWriter};
-use verify::digest::CandidateDigest;
 use verify::evidence::EvidenceSet;
+use verify::git::{GitRevision, GitTree};
 use verify::runner::{Candidate, Check, CleanRunner};
+use verify::transport::TransportDigest;
 
 struct Step {
     name: &'static str,
@@ -437,16 +438,45 @@ pub async fn run(server: &str, image: &str) -> i32 {
             opensandbox::execd::api::download_file(&execd, None, "/tmp/candidate-out.bundle")
                 .await
                 .unwrap_or_default();
+        // The candidate names a commit and a content: both are observed
+        // WHERE THE CANDIDATE LIVES, while the sandbox is still alive, so
+        // the verification can compare them with what it checks out.
+        let head = crate::probe_util::run_in_sandbox(
+            &execd,
+            "git -C /workspace/work rev-parse HEAD",
+            Duration::from_secs(30),
+        )
+        .await;
+        let tree = crate::probe_util::run_in_sandbox(
+            &execd,
+            "git -C /workspace/work rev-parse 'HEAD^{tree}'",
+            Duration::from_secs(30),
+        )
+        .await;
         let _ = sandbox
             .delete(format!("{server}/v1/sandboxes/{sid}"))
             .send()
             .await;
+        let (Ok(revision), Ok(tree)) = (
+            GitRevision::parse(head.output.trim()),
+            GitTree::parse(tree.output.trim()),
+        ) else {
+            steps.push(Step {
+                name: "verify",
+                passed: false,
+                detail: format!(
+                    "the candidate names no commit: head={:?}",
+                    head.output.trim()
+                ),
+            });
+            break;
+        };
 
         // VERIFY in a CLEAN environment: does the criterion actually hold?
-        let digest = CandidateDigest::from_bytes(&candidate_bundle);
         let candidate = Candidate {
-            revision: "autonomous-candidate".into(),
-            digest,
+            revision,
+            tree,
+            transport_digest: TransportDigest::of(&candidate_bundle),
             bundle: candidate_bundle.clone(),
         };
         let checks = vec![Check {
@@ -506,12 +536,18 @@ pub async fn run(server: &str, image: &str) -> i32 {
                 target_status: "Done".into(),
             },
         });
-        let promoted = git::promote_ff_only(
+        // The promotion demands the evidence of the candidate it promotes:
+        // the same work, the same commit and the very bundle that was
+        // verified. The CAS is unchanged; the evidence gate is a
+        // precondition of it.
+        let promoted = git::promote_verified(
             &fixture.root,
             "hodei-mh/main",
             Path::new(&base.join("candidate-out.bundle")),
             candidate_branch,
             &current_base,
+            &evidence,
+            ticket,
         );
         let commit = match promoted {
             Ok(commit) => commit,
@@ -676,6 +712,20 @@ pub async fn run(server: &str, image: &str) -> i32 {
             opensandbox::execd::api::download_file(&execd, None, "/tmp/candidate-out.bundle")
                 .await
                 .unwrap_or_default();
+        // The observation happens while the sandbox is alive: the candidate
+        // is identified where it lives, not after it is gone.
+        let fraud_head = crate::probe_util::run_in_sandbox(
+            &execd,
+            "git -C /workspace/work rev-parse HEAD",
+            Duration::from_secs(30),
+        )
+        .await;
+        let fraud_tree = crate::probe_util::run_in_sandbox(
+            &execd,
+            "git -C /workspace/work rev-parse 'HEAD^{tree}'",
+            Duration::from_secs(30),
+        )
+        .await;
         let _ = sandbox
             .delete(format!("{server}/v1/sandboxes/{sid}"))
             .send()
@@ -685,17 +735,35 @@ pub async fn run(server: &str, image: &str) -> i32 {
             id: "fraud".into(),
             command: "test -f fraud.txt && grep -q 'fraud' fraud.txt".into(),
         }];
-        let evidence = runner
-            .verify(
-                &fraud_ticket,
-                &Candidate {
-                    revision: "fraud-claim".into(),
-                    digest: CandidateDigest::from_bytes(&candidate_bundle),
-                    bundle: candidate_bundle,
-                },
-                &evidence_checks,
-            )
-            .await;
+        let fraud_candidate = match (
+            GitRevision::parse(fraud_head.output.trim()),
+            GitTree::parse(fraud_tree.output.trim()),
+        ) {
+            (Ok(revision), Ok(tree)) => Some(Candidate {
+                revision,
+                tree,
+                transport_digest: TransportDigest::of(&candidate_bundle),
+                bundle: candidate_bundle,
+            }),
+            _ => None,
+        };
+        let evidence = match fraud_candidate {
+            Some(candidate) => {
+                runner
+                    .verify(&fraud_ticket, &candidate, &evidence_checks)
+                    .await
+            }
+            None => {
+                steps.push(Step {
+                    name: "verify",
+                    passed: false,
+                    detail: "the candidate names no commit".into(),
+                });
+                Err(verify::runner::RunnerError(
+                    "the candidate names no commit".to_string(),
+                ))
+            }
+        };
         let ticket_state = writer.read_ticket(&fraud_ticket).ok().map(|s| s.status);
         // The decisive protection: whatever the agent claimed, WITHOUT valid
         // evidence the ticket is never promoted nor closed.

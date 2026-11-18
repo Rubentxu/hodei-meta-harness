@@ -71,6 +71,12 @@ impl DockerAdapter {
         }
     }
 
+    /// Make sure the image is available locally: present, or pulled.
+    ///
+    /// The id of the image is NOT resolved here. A tag is a name, and an
+    /// image pinned by digest has no tag to match; the id that identifies
+    /// the environment is the one the container actually runs, and it is
+    /// read from the container (`container_image_id`).
     pub async fn ensure_image_available(
         &self,
         image: &str,
@@ -87,7 +93,7 @@ impl DockerAdapter {
             .map_err(DockerError::op("list images"))?;
         let present = existing
             .iter()
-            .any(|i| i.repo_tags.iter().any(|t| t == image));
+            .any(|summary| summary.repo_tags.iter().any(|tag| tag == image));
         if present {
             return Ok(());
         }
@@ -103,6 +109,21 @@ impl DockerAdapter {
             })?;
         }
         Ok(())
+    }
+
+    /// The id of the image the container runs: the environment a check ran
+    /// in is identified by that id, not by the tag it was requested with.
+    /// It is read from the container, so it holds for an image pinned by
+    /// digest and for an untagged image alike.
+    pub async fn container_image_id(&self, container: &str) -> Result<String, DockerError> {
+        let inspected = self.inspect(container).await?;
+        inspected
+            .image
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| DockerError::Contract {
+                code: error_codes::INTERNAL,
+                message: format!("the container {container} does not report the image it runs"),
+            })
     }
 
     /// Extract execd + bootstrap.sh archives from the execd image, caching per

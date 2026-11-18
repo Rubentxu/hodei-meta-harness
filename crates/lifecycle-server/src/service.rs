@@ -117,6 +117,10 @@ impl LifecycleService {
                 password: Some(a.password.clone()),
                 ..Default::default()
             });
+        // The image must be present before the container is created. Its
+        // id is NOT resolved from the tag: a tag is a name, and an image
+        // pinned by digest has none. The id comes from the container
+        // itself, below.
         self.adapter
             .ensure_image_available(&image.uri, credentials, docker_platform.as_deref())
             .await?;
@@ -145,6 +149,17 @@ impl LifecycleService {
             )
             .await?;
 
+        // The id of the image the container RUNS is what identifies the
+        // environment: it is read from the container, never guessed from
+        // the tag that was requested.
+        let image_id = match self.adapter.container_image_id(&container_id).await {
+            Ok(image_id) => image_id,
+            Err(e) => {
+                let _ = self.adapter.remove_container(&container_id).await;
+                return Err(e.into());
+            }
+        };
+
         let prepared = self
             .inject_execd_runtime(&container_id, docker_platform.as_deref())
             .await;
@@ -159,6 +174,7 @@ impl LifecycleService {
 
         Ok(CreateSandboxResponse {
             id: sandbox_id,
+            image_id: Some(image_id),
             status: SandboxStatus {
                 state: "Running".to_string(),
                 reason: Some("CONTAINER_RUNNING".to_string()),
