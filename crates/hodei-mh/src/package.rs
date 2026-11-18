@@ -104,6 +104,7 @@ fn resolve_release_dir(repo: &Path) -> PathBuf {
 }
 
 pub async fn run_package(args: &[String]) -> i32 {
+    let version = env!("CARGO_PKG_VERSION");
     let out_dir = PathBuf::from(flag(args, "--out", "/tmp/hodei-mh-package"));
     let repo =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()))
@@ -182,8 +183,13 @@ pub async fn run_package(args: &[String]) -> i32 {
     }
     let install_sh = out_dir.join("install.sh");
     let install_md = out_dir.join("INSTALL.md");
+    let install_md_text = format!(
+        "{INSTALL_MD}\nRelease: v{version} ({}-{})\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     let wrote_installers = std::fs::write(&install_sh, INSTALL_SH).is_ok()
-        && std::fs::write(&install_md, INSTALL_MD).is_ok()
+        && std::fs::write(&install_md, install_md_text).is_ok()
         && {
             #[cfg(unix)]
             {
@@ -201,11 +207,15 @@ pub async fn run_package(args: &[String]) -> i32 {
         return 1;
     }
 
-    // Tar it up.
-    let tar_path = out_dir
-        .parent()
-        .unwrap_or(Path::new("/tmp"))
-        .join("hodei-mh-package.tar.gz");
+    // Tar it up. The name carries the version, the OS and the
+    // architecture: a bundle is a release artifact, and its name is
+    // part of its identity.
+    let version = env!("CARGO_PKG_VERSION");
+    let tar_path = out_dir.parent().unwrap_or(Path::new("/tmp")).join(format!(
+        "hodei-mh-v{version}-{}-{}.tar.gz",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
     let tar_ok = std::process::Command::new("tar")
         .args([
             "czf",
@@ -255,6 +265,7 @@ pub async fn run_package(args: &[String]) -> i32 {
         "{}",
         serde_json::json!({
             "package": tar_path.to_string_lossy(),
+            "version": version,
             "bytes": std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0),
             "contents": contents,
             "guarantees": {
