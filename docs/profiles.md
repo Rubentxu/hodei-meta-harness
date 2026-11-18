@@ -195,6 +195,12 @@ is retried, and every attempt makes sure the proxy is really detached. A
 bridge that survives anyway is not lost: the sweep removes the networks of
 sandboxes that no longer exist, two minutes after they were created.
 
+**What happens to the bridge of a creation that is still working.** The sweep
+never touches it: the creations in flight are recorded, and the age of a
+network says nothing about how long the creation takes. The two-minute margin
+is only the last line for the bridges that no creation owns, because the
+process that created them is gone.
+
 **What happens to the bridge of a creation that never finishes.** The bridge
 is created BEFORE the container, so a creation that fails — or that is
 abandoned because its client gave up — would leave a bridge on the host that
