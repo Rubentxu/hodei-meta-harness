@@ -100,11 +100,15 @@ pub async fn run_command_session_with_output(execd_base: &str, command: &str) ->
     let mut running = true;
     while Instant::now() < deadline {
         match api::session_status(execd_base, None, &session.session_id).await {
-            Ok(status) if !status.running => {
-                running = false;
-                break;
+            Ok(status) => {
+                // A daemon that does not say whether the session runs
+                // is treated as a finished one: the reading below is
+                // bounded either way.
+                if status.running != Some(true) {
+                    running = false;
+                    break;
+                }
             }
-            Ok(_) => {}
             Err(_) => break,
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
