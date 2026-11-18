@@ -26,7 +26,7 @@ When working in this repository, agents should use these skills:
 |---|---|
 | `backlog-agile-workflow` | Always. Task lifecycle: read board, pick work, branch, implement, verify with evidence, close. Anti-stall: after two sterile iterations, change strategy and record it. |
 | `pure-functional-design` | Before and during implementation. Functional core design: domain ADTs, invariants, effect separation, pure algorithm selection. |
-| `pipelinek-local-ci` | Local CI gates. Full validation gates run every 10 completed tasks; targeted checks per task. |
+| `pipelinek-local-ci` | Local CI gates (optional). The project's own gates are the validation lanes below. |
 | `goldfish-review` | Independent review of designs/plans/theses with fresh-context subagents before merge of architecturally significant work. |
 
 ## Work cycle
@@ -51,7 +51,8 @@ Repeat without asking permission between steps:
    evidence, final summary), then go back to step 1.
 
 Full validation gates (fmt, clippy `-D warnings`, full test suite) run
-every 10 completed tasks; targeted checks run per task.
+every 10 completed tasks; the lane that fits the change runs per task. The
+lanes are defined once, in [Validation lanes](#validation-lanes).
 
 ## Code standard: functional paradigm (Rust like Haskell)
 
@@ -80,8 +81,46 @@ effects pushed to the edges.
 7. **TDD.** Unit tests sit next to the pure modules they verify and must
    run offline. Integration tests require real infrastructure (Docker,
    sandbox server) and are clearly separated.
-8. **Tooling gates.** `cargo fmt`, `cargo clippy --workspace --all-targets
-   -- -D warnings`, `cargo test` before every merge to `main`.
+8. **Tooling gates.** `cargo fmt`, `cargo clippy --all-targets -- -D
+   warnings` and `cargo test` before every merge to `main`. The lanes below
+   decide which of them run, and how often.
+
+## Validation lanes
+
+Three gates, with different costs. None of them is allowed to fail open:
+a check that cannot run is a failure, not a skip.
+
+| Gate | What it runs | Cost | When |
+|---|---|---|---|
+| **local** | `scripts/fast-check.sh`: `fmt`, `clippy` and the tests of the crate you touched **and the crates that depend on it** | seconds, no Docker | while you work, before every merge |
+| **workspace** | the CI `fast` job: `fmt`, `clippy -D warnings`, the whole test suite and the doctests | minutes, no Docker | on every push and pull request |
+| **integration** | `scripts/probes.sh`: the four probes (`release`, `supervisor`, `profile`, `multiproject`) against real Docker and the lifecycle server | minutes, starts sandboxes and runs real builds | on `main`, on demand, and locally before publishing |
+
+```bash
+scripts/fast-check.sh                                  # what changed vs the base
+scripts/fast-check.sh crates/hodei-mh-verify/src/runner.rs
+scripts/fast-check.sh --all                            # the whole workspace
+scripts/probes.sh --rounds 3                           # the expensive lane
+```
+
+The merge gate is the **local** gate for the crates you touched; the
+**workspace** gate completes it on every push, so a merge never depends on
+the affected-crate selection being right. The **integration** lane adds the
+probes when the change touches the sandbox, the ACP flow or the release.
+The probes are expensive on purpose, and they are kept in their own lane so
+the cheap gate never hides their cost.
+
+Two rules about those probes:
+
+- **A probe is only removed when its invariant is asserted in the productive
+  path.** The probe is the evidence; the productive path is the product. If
+  the invariant is not enforced by the code the consumers use, the probe
+  stays.
+- **Failure paths are tested with fakes, not with tokens and not with
+  sleeps.** The ACP surface and the HTTP surface have offline fakes: the
+  tests exercise the refusals without a provider, without a container and
+  without waiting for anything. A test that sleeps to see whether something
+  happens is a test that lies.
 
 ## Code quality and documentation (progressive application)
 

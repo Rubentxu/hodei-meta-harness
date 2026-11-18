@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
-use opensandbox::acp::{self, AcpAssembler};
+use opensandbox::acp::AcpAssembler;
 use opensandbox::execd::api::{self, CreateSessionRequest};
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
 
+mod acp_dialogue;
 mod autonomous_probe;
 mod budget_probe;
 mod custom_goal_probe;
@@ -38,6 +39,7 @@ mod tui;
 mod verify_probe;
 mod workspace_probe;
 
+use acp_dialogue::{AcpAction, AcpDialogue};
 use probe_util::{MOCK_AGENT_JS, run_command_session_with_output, ws_url_for};
 
 const PROBE_FILE: &str = "/workspace/hodei-probe.txt";
@@ -571,33 +573,22 @@ struct AgentProbeResult {
 /// Drive the ACP v1 conversation over the pipe: initialize, session/new,
 /// session/prompt, collect structured events, verify stderr separation,
 /// then cancel and observe process release.
+///
+/// The policy of the conversation lives in `AcpDialogue`; this function is
+/// only the transport around it: bytes in, bytes out.
 async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentProbeResult {
     let mut checks = Vec::new();
+    let mut dialogue = AcpDialogue::new();
     let mut assembler = AcpAssembler::new();
     let mut stdout_bytes = 0usize;
     let mut stderr_bytes = 0usize;
     let mut stderr_sample: Vec<u8> = Vec::new();
-    let mut acp_methods: Vec<String> = Vec::new();
-    let mut agent_text = String::new();
-    let mut updates = 0usize;
-    let mut next_id: u64 = 1;
-    let mut pending_prompt_id: Option<u64> = None;
-    let mut prompt_answer: Option<Value> = None;
+    let mut saw_connected = false;
+    let mut saw_exit = None;
 
     // Handshake.
-    let init_id = next_id;
-    next_id += 1;
-    // No fs capabilities advertised: the agent uses its OWN tools inside
-    // the sandbox instead of delegating writes to this client.
-    let init_params = json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {}
-    });
-    if pipe_session
-        .send_stdin(acp::encode_request(init_id, "initialize", init_params).as_bytes())
-        .await
-        .is_err()
-    {
+    let handshake = dialogue.handshake();
+    if pipe_session.send_stdin(handshake.bytes()).await.is_err() {
         checks.push(ProbeCheck {
             name: "acp-initialize",
             passed: false,
@@ -607,11 +598,7 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
     }
 
     let deadline = Instant::now() + Duration::from_secs(if mode == "claude" { 240 } else { 60 });
-    let mut new_session_sent = false;
-    let mut prompt_sent = false;
     let mut cancel_sent = false;
-    let mut saw_connected = false;
-    let mut saw_exit = None;
 
     while Instant::now() < deadline {
         let Some(event) = tokio::time::timeout(Duration::from_secs(5), pipe_session.next_event())
@@ -634,88 +621,9 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
             }
             ServerEvent::Stdout(bytes) => {
                 stdout_bytes += bytes.len();
-
                 for message in assembler.push(&bytes).unwrap_or_default() {
-                    // Structured ACP events (notifications) count separately.
-                    if message.get("method").and_then(|m| m.as_str()) == Some("session/update") {
-                        updates += 1;
-                        // Capture the agent's visible text (diagnostics):
-                        let chunk = message["params"]["update"]["content"]["text"]
-                            .as_str()
-                            .unwrap_or_default();
-                        if !chunk.is_empty() && agent_text.len() < 4000 {
-                            agent_text.push_str(chunk);
-                        }
-                    }
-                    if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
-                        acp_methods.push(method.to_string());
-                        // The real agent asks the client for tool permission:
-                        // select the allow_once option it offered and keep
-                        // driving (ACP outcome = selected + optionId).
-                        if method == "session/request_permission" {
-                            let allow_option = message["params"]["options"]
-                                .as_array()
-                                .and_then(|opts| {
-                                    opts.iter()
-                                        .find(|o| o["kind"].as_str() == Some("allow_once"))
-                                        .and_then(|o| o["optionId"].as_str().map(str::to_string))
-                                })
-                                .unwrap_or_default();
-                            let response = acp::encode_response(
-                                message.get("id").cloned().unwrap_or(json!(0)),
-                                json!({"outcome": {"outcome": "selected", "optionId": allow_option}}),
-                            );
-                            let _ = pipe_session.send_stdin(response.as_bytes()).await;
-                        }
-                    }
-                    let id = message.get("id").and_then(|v| v.as_u64());
-                    if id == Some(init_id) && message.get("result").is_some() {
-                        let version = message["result"]["protocolVersion"].clone();
-                        checks.push(ProbeCheck {
-                            name: "acp-initialize",
-                            passed: true,
-                            detail: format!("agent protocol v{version}"),
-                        });
-                        let sid = next_id;
-                        next_id += 1;
-                        let _ = pipe_session
-                            .send_stdin(
-                                acp::encode_request(
-                                    sid,
-                                    "session/new",
-                                    json!({"cwd": "/workspace", "mcpServers": []}),
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                        new_session_sent = true;
-                    } else if new_session_sent
-                        && !prompt_sent
-                        && message.get("result").is_some()
-                        && message["result"].get("sessionId").is_some()
-                    {
-                        let prompt_id = next_id;
-                        next_id += 1;
-                        pending_prompt_id = Some(prompt_id);
-                        let _ = pipe_session
-                            .send_stdin(
-                                acp::encode_request(
-                                    prompt_id,
-                                    "session/prompt",
-                                    json!({
-                                        "sessionId": message["result"]["sessionId"],
-                                        "prompt": [{"type": "text", "text":
-                                            "Create the file /workspace/hodei-probe.txt with the content 'written-by-mock-agent'"}],
-                                    }),
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                        prompt_sent = true;
-                    } else if pending_prompt_id == Some(id.unwrap_or(u64::MAX))
-                        && message.get("result").is_some()
-                    {
-                        prompt_answer = Some(message["result"].clone());
+                    if let Some(AcpAction::Write(out)) = dialogue.on_message(&message) {
+                        let _ = pipe_session.send_stdin(out.as_bytes()).await;
                     }
                 }
             }
@@ -743,23 +651,26 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
         }
 
         // Once the prompt finished, verify separation + cancel behaviour.
-        if prompt_sent && prompt_answer.is_some() && !cancel_sent {
+        if dialogue.prompt_answer().is_some() && !cancel_sent {
+            let answer = dialogue.prompt_answer().cloned().unwrap_or(Value::Null);
             checks.push(ProbeCheck {
                 name: "acp-prompt-response",
-                passed: prompt_answer
-                    .as_ref()
-                    .and_then(|r| r.get("stopReason"))
-                    .is_some(),
+                passed: answer.get("stopReason").is_some(),
                 detail: format!(
                     "stopReason={:?} agent_text_tail={:?}",
-                    prompt_answer.as_ref().and_then(|r| r.get("stopReason")),
-                    agent_text.chars().rev().take(400).collect::<String>()
+                    answer.get("stopReason"),
+                    dialogue
+                        .agent_text()
+                        .chars()
+                        .rev()
+                        .take(400)
+                        .collect::<String>()
                 ),
             });
             checks.push(ProbeCheck {
                 name: "structured-events",
-                passed: updates > 0,
-                detail: format!("{updates} session/update notifications"),
+                passed: dialogue.updates() > 0,
+                detail: format!("{} session/update notifications", dialogue.updates()),
             });
             checks.push(ProbeCheck {
                 name: "stdout-stderr-separation",
@@ -768,16 +679,8 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
                     "stdout={stdout_bytes}B stderr={stderr_bytes}B (ACP on stdout, logs on stderr)"
                 ),
             });
-            let _ = pipe_session
-                .send_stdin(
-                    acp::encode_request(
-                        next_id,
-                        "session/cancel",
-                        json!({"sessionId": "mock-session-1"}),
-                    )
-                    .as_bytes(),
-                )
-                .await;
+            let cancel = dialogue.cancel();
+            let _ = pipe_session.send_stdin(cancel.bytes()).await;
             let _ = pipe_session.send_signal("SIGTERM").await;
             cancel_sent = true;
             // Short grace for the exit frame.
@@ -804,6 +707,14 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
     }
 
     checks.push(ProbeCheck {
+        name: "acp-initialize",
+        passed: dialogue.protocol_version().is_some(),
+        detail: match dialogue.protocol_version() {
+            Some(version) => format!("agent protocol v{version}"),
+            None => "the agent never answered the handshake".to_string(),
+        },
+    });
+    checks.push(ProbeCheck {
         name: "connected-frame",
         passed: saw_connected,
         detail: format!("connected={saw_connected}"),
@@ -813,7 +724,7 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
         passed: saw_exit.is_some(),
         detail: format!(
             "exit_code observed: {saw_exit:?}; methods_count={}; stderr_tail={:?}",
-            acp_methods.len(),
+            dialogue.methods().len(),
             String::from_utf8_lossy(&stderr_sample)
         ),
     });

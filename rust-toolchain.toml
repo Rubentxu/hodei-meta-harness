@@ -1,0 +1,7 @@
+# The toolchain the product is built and verified with. The local gate and
+# the CI gate run the same compiler, so a green run here means a green run
+# there.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
