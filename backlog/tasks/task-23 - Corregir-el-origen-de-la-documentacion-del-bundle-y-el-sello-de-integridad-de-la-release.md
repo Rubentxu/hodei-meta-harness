@@ -3,11 +3,11 @@ id: TASK-23
 title: >-
   Corregir el origen de la documentacion del bundle y el sello de integridad de
   la release
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-11-18T11:38:00Z'
-updated_date: '2026-11-18T11:51:00Z'
+updated_date: '2026-11-18T12:11:00Z'
 labels: []
 dependencies:
   - TASK-22
@@ -41,4 +41,14 @@ D2 — sello de integridad. ANTES: el bundle no llevaba digests y su INSTALL.md 
 D3 — puntero de `--help`. ANTES: `documentation: docs/profiles.md`, ruta que no existe junto al binario instalado. AHORA: `crates/hodei-mh/src/main.rs` resuelve la ruta en tiempo de ejecucion. Medido: `/tmp/prefix23/bin/hodei-mh --help` -> `documentation: /tmp/prefix23/share/hodei-mh/docs/profiles.md`.
 
 AC1-AC5 comprobados. Tests nuevos: `digest::tests` (4), `docs::tests` (8) y `package::tests` (5); 23 en hodei-mh y 251 en el workspace, `cargo fmt --all` y `cargo clippy --workspace --all-targets -- -D warnings` limpios.
+
+**PUBLICADO EN v0.1.1.** El arreglo viaja en la release v0.1.1 (tag v0.1.1 -> commit `d444602`, assets publicados y verificados por un consumidor real). El bundle publicado lleva `SHA256SUMS` con el digest de los tres ficheros que embarca, su `INSTALL.md` explica la verificacion offline, el manifiesto declara `documentation.origin` y `documentation.sha256`, y `--help` nombra la documentacion del prefix instalado.
+
+**Un efecto colateral medido y corregido:** la sonda `multiproject-probe` afirmaba un conjunto de contenidos del bundle sin `SHA256SUMS`, asi que fallo con el bundle nuevo (mas completo que lo que la sonda esperaba). La sonda se corrigio (PR #30) para aceptar el sello y ADEMAS VERIFICARLO (`sha256sum -c SHA256SUMS` sobre los bytes desempaquetados, sin red), que es una comprobacion mas fuerte que la anterior. Como el binario publicado debe llevar la sonda correcta, el tag v0.1.1 se reapunto a `d444602` ANTES de que existiera la release (no se publico ningun asset de v0.1.1 antes de ese reapuntado); la v0.1.0 publicada no se toco.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+El bundle ahora se arma con la documentacion del PRODUCTO (la instalada junto al binario, o la del workspace marcado por crates/hodei-mh/Cargo.toml) y el empaquetado se RECHAZA con motivo cuando no hay fuente de confianza; el manifiesto declara el origen y el digest de la documentacion que viaja; el bundle lleva SHA256SUMS con el digest de cada fichero que embarca e INSTALL.md explica la verificacion offline; y --help resuelve la ruta de la documentacion en tiempo de ejecucion. 17 tests nuevos (digest, docs, package), 256 en el workspace, fmt y clippy limpios. publicado en v0.1.1.
+<!-- SECTION:FINAL_SUMMARY:END -->
