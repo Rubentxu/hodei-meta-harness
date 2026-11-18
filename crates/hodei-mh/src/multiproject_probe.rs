@@ -920,8 +920,21 @@ pub async fn run(args: &[String]) -> i32 {
                     || name.starts_with("./docs/")
                     || name == "./install.sh"
                     || name == "./INSTALL.md"
+                    // The bundle carries its own seal: the digests of
+                    // the files it ships.
+                    || name == "./SHA256SUMS"
             })
         })
+        .unwrap_or(false);
+    // The bundle's seal is VERIFIED, not merely tolerated: the probe
+    // checks the digests of the unpacked bytes with the standard tool,
+    // offline, exactly as a consumer would.
+    let checksums_ok = Command::new("sha256sum")
+        .args(["-c", "SHA256SUMS"])
+        .current_dir(&extract_dir)
+        .output()
+        .await
+        .map(|o| o.status.success())
         .unwrap_or(false);
     // The manifest's guarantees are ASSERTED, not printed: the manifest
     // reports what was scanned, and the probe checks it.
@@ -937,10 +950,11 @@ pub async fn run(args: &[String]) -> i32 {
             && install_code == 0
             && install_out.contains("PROCEED")
             && manifest_clean
+            && checksums_ok
             && yolo_false
             && no_undemonstrated,
         detail: format!(
-            "package built and extracted; the bundled binary ran doctor against the live API and PROCEEDED; manifest contains only bin/, docs/, install.sh, INSTALL.md; yolo_fallback={} (asserted false); undemonstrated_dependencies={} (asserted empty)",
+            "package built and extracted; the bundled binary ran doctor against the live API and PROCEEDED; manifest contains only bin/, docs/, install.sh, INSTALL.md and SHA256SUMS; the bundle's own digests verify offline (sha256sum -c)={checksums_ok}; yolo_fallback={} (asserted false); undemonstrated_dependencies={} (asserted empty)",
             pkg_record["guarantees"]["yolo_fallback"],
             pkg_record["guarantees"]["undemonstrated_dependencies"],
         ),
