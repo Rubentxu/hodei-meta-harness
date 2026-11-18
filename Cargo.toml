@@ -28,3 +28,6 @@ sha2 = "0.10"
 async-trait = "0.1"
 ratatui = "0.29"
 crossterm = "0.28"
+# `tower::ServiceExt::oneshot` calls an axum router in process: the HTTP
+# surface is exercised offline, with no daemon and no sleep.
+tower = { version = "0.5", features = ["util"] }

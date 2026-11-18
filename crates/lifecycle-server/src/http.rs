@@ -122,6 +122,165 @@ pub type EmptyQuery = Query<()>;
 mod tests {
     use super::*;
 
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    use crate::docker::DockerAdapter;
+    use crate::service::ServiceConfig;
+
+    /// A service that CANNOT talk to Docker: bollard accepts a socket path
+    /// that exists but is not a socket, so the connection is refused at once
+    /// and no daemon is ever reached. The failure paths of the HTTP surface
+    /// are therefore observable offline: no daemon, no image pull, no
+    /// container, no sleep — and a route that reaches the adapter by mistake
+    /// fails fast instead of touching the host.
+    fn service() -> SharedService {
+        let path = std::env::temp_dir().join("hodei-mh-offline-docker.sock");
+        std::fs::write(&path, b"this file is not a socket").expect("the placeholder socket");
+        let docker = bollard::Docker::connect_with_socket(
+            path.to_str().expect("socket path"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("the client is built without dialing");
+        Arc::new(LifecycleService::new(
+            DockerAdapter::connect(docker, "execd:local"),
+            ServiceConfig::default(),
+        ))
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(match body {
+                Some(body) => Body::from(body.to_string()),
+                None => Body::empty(),
+            })
+            .expect("request");
+        let response = app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn ping_and_ready_answer_without_touching_docker() {
+        let app = router(service());
+        let (status, body) = call(&app, "GET", "/ping", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "OK");
+
+        let (status, body) = call(&app, "GET", "/ready", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ready");
+    }
+
+    #[tokio::test]
+    async fn a_documented_endpoint_this_server_does_not_implement_answers_501() {
+        let app = router(service());
+        let (status, body) = call(&app, "GET", "/v1/sandboxes/abc/templates", None).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body.contains(error_codes::NOT_IMPLEMENTED),
+            "the refusal names the code: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_create_without_an_image_is_refused_with_400() {
+        let app = router(service());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/sandboxes",
+            Some(r#"{"entrypoint":["/bin/sh"]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(error_codes::INVALID_PARAMETER), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_create_without_an_entrypoint_is_refused_with_400() {
+        let app = router(service());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/sandboxes",
+            Some(r#"{"image":{"uri":"rust:1-bookworm"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(error_codes::INVALID_PARAMETER), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_negative_timeout_is_refused_with_400() {
+        let app = router(service());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/sandboxes",
+            Some(r#"{"image":{"uri":"rust:1-bookworm"},"entrypoint":["/bin/sh"],"timeout":-1}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(error_codes::INVALID_PARAMETER), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_metadata_key_that_collides_with_the_reserved_prefix_is_refused_with_400() {
+        let app = router(service());
+        let intruder = format!("{}intruder", crate::compose::RESERVED_LABEL_PREFIX);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/sandboxes",
+            Some(&format!(
+                r#"{{"image":{{"uri":"rust:1-bookworm"}},"entrypoint":["/bin/sh"],
+                    "metadata":{{"{intruder}":"x"}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(error_codes::INVALID_PARAMETER), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_create_that_passes_validation_fails_against_the_absent_daemon() {
+        // The other tests prove the refusals happen BEFORE the adapter is
+        // touched. This one proves the opposite side of the same edge: a
+        // request that passes validation reaches the adapter and fails
+        // there, against a client that cannot reach any daemon.
+        let app = router(service());
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/sandboxes",
+            Some(r#"{"image":{"uri":"rust:1-bookworm"},"entrypoint":["/bin/sh"]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !body.contains(error_codes::INVALID_PARAMETER),
+            "the refusal comes from the daemon, not from the validation: {body}"
+        );
+    }
+
     #[test]
     fn error_response_maps_codes_to_statuses() {
         let not_found = ServiceError::Contract {
