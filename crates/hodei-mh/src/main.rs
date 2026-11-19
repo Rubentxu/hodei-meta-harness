@@ -60,6 +60,11 @@ product:
                                        (--export-untracked ships the unversioned changes)
   supervisor --socket <path> --project <name>
                                        the single controller of a project
+  supervisor --rehearsal              the rehearsal runtime: a deterministic
+                                       run with no external effects. Without it
+                                       the controller has no runtime and refuses
+                                       to start, because a run nobody can
+                                       execute is not a run
   sup-status | sup-action | sup-events | attach-terminal | tui
                                        observe and drive the supervisor
   package                              build the installable bundle

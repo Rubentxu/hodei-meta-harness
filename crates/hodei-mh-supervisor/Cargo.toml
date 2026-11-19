@@ -15,3 +15,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
+
+[dev-dependencies]
+async-trait = { workspace = true }

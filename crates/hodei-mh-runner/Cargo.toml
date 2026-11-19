@@ -1,0 +1,23 @@
+[package]
+name = "hodei-mh-runner"
+description = "Application-level goal runner for hodei-meta-harness: work selection and objective execution through agent, verification and publication ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "runner"
+
+[dependencies]
+run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
+goal = { path = "../hodei-mh-goal", package = "hodei-mh-goal" }
+tracker = { path = "../hodei-mh-tracker", package = "hodei-mh-tracker" }
+verify = { path = "../hodei-mh-verify", package = "hodei-mh-verify" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+supervisor = { path = "../hodei-mh-supervisor", package = "hodei-mh-supervisor" }

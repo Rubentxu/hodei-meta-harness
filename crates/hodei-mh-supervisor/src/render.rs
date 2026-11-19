@@ -36,6 +36,22 @@ pub fn render_snapshot(snapshot: &Snapshot) -> Vec<String> {
         "revision: {}",
         escape_control(snapshot.revision.as_deref().unwrap_or("(none)"))
     ));
+    // The runtime's KIND is stated, never hidden: a rehearsal that looks
+    // like a live run is the one lie this surface must not tell.
+    lines.push(format!(
+        "runtime: {}",
+        match &snapshot.runtime {
+            Some(runtime) => escape_control(&runtime.label()),
+            None => "(none — no runtime is wired)".to_string(),
+        }
+    ));
+    lines.push(format!(
+        "objective: {}",
+        match &snapshot.objective {
+            Some(report) => escape_control(&report.outcome.describe()),
+            None => "(none yet)".to_string(),
+        }
+    ));
     lines.push(format!(
         "resources: {}",
         resources_label(&snapshot.resources)
@@ -109,6 +125,7 @@ pub fn render_event(event: &StructuredEvent) -> String {
 fn phase_label(phase: &run::run::Phase) -> String {
     match phase {
         run::run::Phase::Idle => "idle".to_string(),
+        run::run::Phase::Starting => "starting (awaiting the runtime's confirmation)".to_string(),
         run::run::Phase::Running => "running".to_string(),
         run::run::Phase::Stopping => "stopping".to_string(),
         run::run::Phase::Stopped => "stopped".to_string(),
@@ -150,6 +167,8 @@ mod tests {
             paused: false,
             ticket: None,
             revision: None,
+            runtime: None,
+            objective: None,
             resources: ResourceObservation::Unknown {
                 reason: "no cgroup path".into(),
             },
@@ -191,6 +210,8 @@ mod tests {
             paused: false,
             ticket: Some("TASK-1\nphase: running".into()),
             revision: None,
+            runtime: None,
+            objective: None,
             resources: ResourceObservation::Unknown {
                 reason: "none".into(),
             },
@@ -222,6 +243,8 @@ mod tests {
             paused: false,
             ticket: None,
             revision: None,
+            runtime: None,
+            objective: None,
             resources: ResourceObservation::Unknown {
                 reason: "none".into(),
             },

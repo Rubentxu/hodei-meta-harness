@@ -5,6 +5,7 @@
 
 use run::grant::Grant;
 use run::run::{Phase, RunState};
+use run::runtime::{ObjectiveOutcome, ObjectiveReport, RuntimeIdentity};
 
 use crate::protocol::{
     ActionOutcome, ResourceObservation, Snapshot, StructuredEvent, SupervisorAction,
@@ -15,6 +16,22 @@ use crate::provenance::{Provenance, redact};
 /// oldest events are dropped, the sequence numbers keep growing. A
 /// supervisor that ran for days must not grow without bound.
 pub const MAX_RETAINED_EVENTS: usize = 1000;
+
+/// Whether a transition the engine applies took effect. A refusal is a
+/// real answer with its reason, never a silent no-op.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transition {
+    Applied,
+    Refused { reason: String },
+}
+
+impl Transition {
+    fn refused(reason: impl Into<String>) -> Self {
+        Transition::Refused {
+            reason: reason.into(),
+        }
+    }
+}
 
 /// The supervisor's whole observable world. `run` reuses the run crate's
 /// state machine — the supervisor adds pause/wait semantics around it, it
@@ -27,6 +44,13 @@ pub struct SupervisorCore {
     pub paused: bool,
     pub ticket: Option<String>,
     pub revision: Option<String>,
+    /// The runtime that executes objectives. Set when the controller is
+    /// wired: it is what makes a rehearsal visible as a rehearsal, and
+    /// its absence is why a Start is refused instead of pretended.
+    pub runtime: Option<RuntimeIdentity>,
+    /// What the last objective did. The verdict of an objective is a
+    /// recorded fact, not a phase: the session outlives it.
+    pub objective: Option<ObjectiveReport>,
     pub resources: ResourceObservation,
     pub context_available: bool,
     pub ttl_remaining_seconds: Option<u64>,
@@ -53,6 +77,8 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         paused: false,
         ticket: None,
         revision: None,
+        runtime: None,
+        objective: None,
         resources: ResourceObservation::Unknown {
             reason: "no telemetry yet".into(),
         },
@@ -64,6 +90,15 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         epoch: 0,
         last_action: None,
         degraded: None,
+    }
+}
+
+/// A core wired to a runtime: the runtime's identity is known from the
+/// boot, so a client sees the kind of runtime before any objective runs.
+pub fn core_with_runtime(project: impl Into<String>, runtime: RuntimeIdentity) -> SupervisorCore {
+    SupervisorCore {
+        runtime: Some(runtime),
+        ..default_core(project)
     }
 }
 
@@ -183,34 +218,66 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                         core.project
                     ),
                 )
-            } else if core
-                .run
-                .as_ref()
-                .is_some_and(|run| run.phase == Phase::Running)
-            {
-                // One exclusive controller: a second Start is refused, not
-                // tolerated silently.
-                outcome(&action, false, "already running: not a second controller")
+            } else if core.runtime.is_none() {
+                // No runtime, no objective: the controller refuses instead
+                // of pretending that a run started.
+                outcome(
+                    &action,
+                    false,
+                    "no runtime is wired: this supervisor cannot execute an objective yet",
+                )
+            } else if core.run.as_ref().is_some_and(|run| {
+                // One exclusive controller: a run that is STARTING counts as
+                // in flight, or two controllers would share the state.
+                run.is_live()
+            }) {
+                outcome(
+                    &action,
+                    false,
+                    "a run is already in flight: not a second controller",
+                )
             } else {
                 core.epoch += 1;
                 let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
-                core.run = Some(RunState::start(grant, "supervisor-session"));
+                // The run is STARTING, not running: nothing has confirmed
+                // that the work began.
+                core.run = Some(RunState::pending(grant, "supervisor-session"));
                 core.ticket = ticket.clone();
                 core.revision = revision.clone();
                 core.paused = false;
+                // The verdict of the PREVIOUS objective is not this run's
+                // verdict: a snapshot in `starting` must not show it.
+                core.objective = None;
                 outcome(
                     &action,
                     true,
-                    format!("run started for {project} (epoch {})", core.epoch),
+                    format!(
+                        "starting for {project} (epoch {}); awaiting the runtime's confirmation",
+                        core.epoch
+                    ),
                 )
             }
         }
         SupervisorAction::Pause => {
             if core.paused {
                 outcome(&action, false, "already paused")
-            } else if core.run.as_ref().is_some_and(|r| r.phase == Phase::Running) {
+            } else if core
+                .run
+                .as_ref()
+                .is_some_and(|r| r.phase() == &Phase::Running)
+            {
                 core.paused = true;
                 outcome(&action, true, "prompt loop paused")
+            } else if core
+                .run
+                .as_ref()
+                .is_some_and(|r| r.phase() == &Phase::Starting)
+            {
+                outcome(
+                    &action,
+                    false,
+                    "the run has not started yet: there is no prompt loop to pause",
+                )
             } else {
                 outcome(&action, false, "no running run to pause")
             }
@@ -224,12 +291,21 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
             }
         }
         SupervisorAction::Stop => match core.run.as_mut() {
-            Some(run) if run.phase == Phase::Running => {
+            // A run that is still starting is stopped too: nobody is left
+            // waiting for a confirmation that will never arrive.
+            Some(run) if run.is_live() => {
+                let was_starting = *run.phase() == Phase::Starting;
                 let cancelled = run.stop();
                 core.paused = false;
                 let detail = format!(
-                    "stopped; cancelled_processes={:?}; irreversible={:?}",
-                    cancelled, run.initiated_irreversible
+                    "stopped{}; cancelled_processes={:?}; irreversible={:?}",
+                    if was_starting {
+                        " before the runtime confirmed"
+                    } else {
+                        ""
+                    },
+                    cancelled,
+                    run.initiated_irreversible
                 );
                 outcome(&action, true, detail)
             }
@@ -257,6 +333,119 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
     outcome
 }
 
+/// The runtime CONFIRMED the objective: the run is running now.
+///
+/// The confirmation carries the epoch of the run it belongs to: a late
+/// confirmation of a run that already ended can never confirm another
+/// one.
+pub fn confirm_runtime(
+    core: &mut SupervisorCore,
+    epoch: u64,
+    identity: &RuntimeIdentity,
+) -> Transition {
+    if core.epoch != epoch {
+        return Transition::refused(format!(
+            "the confirmation belongs to another run (epoch {epoch}; the current run is {})",
+            core.epoch
+        ));
+    }
+    // The confirmation must come from the runtime the snapshot NAMES. A
+    // run confirmed by a runtime nobody was told about would let a
+    // rehearsal be presented as a live run.
+    match &core.runtime {
+        None => {
+            return Transition::refused("no runtime is wired: nothing can confirm the objective");
+        }
+        Some(named) if named != identity => {
+            return Transition::refused(format!(
+                "the confirmation comes from '{}' but this controller serves '{}'",
+                identity.label(),
+                named.label()
+            ));
+        }
+        Some(_) => {}
+    }
+    let Some(run) = core.run.as_mut() else {
+        return Transition::refused("there is no run to confirm");
+    };
+    if !run.confirm() {
+        return Transition::refused(format!(
+            "the run is not starting (phase {:?}): it cannot be confirmed",
+            run.phase()
+        ));
+    }
+    emit_event(
+        core,
+        "objective/confirmed",
+        serde_json::Value::String(format!(
+            "the runtime confirmed the objective (epoch {epoch}; {})",
+            identity.label()
+        )),
+        // The confirmation comes from the runtime, not from a person.
+        Provenance::Automatic {
+            rule: "runtime-confirmation".into(),
+        },
+    );
+    Transition::Applied
+}
+
+/// The runtime reported how the objective ended.
+///
+/// The verdict is RECORDED, and every outcome has a transition: a
+/// confirmed objective leaves the session alive, a rejected or failed
+/// one ends it, and an idle objective returns the supervisor to waiting.
+pub fn record_outcome(
+    core: &mut SupervisorCore,
+    epoch: u64,
+    outcome: ObjectiveOutcome,
+) -> Transition {
+    if core.epoch != epoch {
+        return Transition::refused(format!(
+            "the outcome belongs to another run (epoch {epoch}; the current run is {})",
+            core.epoch
+        ));
+    }
+    // The outcome belongs to a LIVE run: a run that was stopped or
+    // dropped does not get a verdict afterwards.
+    let live = core.run.as_ref().is_some_and(|run| run.is_live());
+    if !live {
+        return Transition::refused("the run is no longer live: the outcome is not recorded");
+    }
+    let work_ref = match &outcome {
+        ObjectiveOutcome::Confirmed { work_ref, .. }
+        | ObjectiveOutcome::Rejected { work_ref, .. } => Some(work_ref.clone()),
+        ObjectiveOutcome::Failed { .. } | ObjectiveOutcome::Idle { .. } => None,
+    };
+    let detail = outcome.describe();
+    match outcome {
+        ObjectiveOutcome::Confirmed { .. } => {
+            // The objective held: the session continues.
+        }
+        ObjectiveOutcome::Rejected { .. } | ObjectiveOutcome::Failed { .. } => {
+            // The objective did not hold, or the execution failed: the
+            // session ends with the reason visible.
+            if let Some(run) = core.run.as_mut() {
+                run.stop();
+            }
+        }
+        ObjectiveOutcome::Idle { .. } => {
+            // Nothing to do: the supervisor waits, and a new objective can
+            // be started later.
+            core.run = None;
+        }
+    }
+    core.objective = Some(ObjectiveReport { work_ref, outcome });
+    emit_event(
+        core,
+        "objective/outcome",
+        serde_json::Value::String(detail),
+        Provenance::Automatic {
+            rule: "runtime-outcome".into(),
+        },
+    );
+    Transition::Applied
+}
+
 /// The snapshot both clients render — the SAME view for TUI and CLI.
 pub fn snapshot(core: &SupervisorCore) -> Snapshot {
     Snapshot {
@@ -264,11 +453,13 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
         phase: core
             .run
             .as_ref()
-            .map(|r| r.phase.clone())
+            .map(|r| r.phase().clone())
             .unwrap_or(Phase::Idle),
         paused: core.paused,
         ticket: core.ticket.clone(),
         revision: core.revision.clone(),
+        runtime: core.runtime.clone(),
+        objective: core.objective.clone(),
         resources: core.resources.clone(),
         context_available: core.context_available,
         wait_reason: core.paused.then(|| "paused by user".to_string()),
@@ -307,26 +498,35 @@ pub fn events_since(core: &SupervisorCore, since: u64) -> (Vec<StructuredEvent>,
 mod tests {
     use super::*;
 
-    #[test]
-    fn start_is_exclusive_and_pauses_and_resumes() {
-        let mut core = default_core("gc");
+    /// A core wired to a runtime: a controller that can execute.
+    fn wired(project: &str) -> SupervisorCore {
+        core_with_runtime(project, RuntimeIdentity::rehearsal("trial"))
+    }
+
+    /// Start the run and let the runtime confirm it. Returns the epoch.
+    fn started(core: &mut SupervisorCore) -> u64 {
+        let project = core.project.clone();
         let start = apply(
-            &mut core,
+            core,
             SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: Some("TASK-9".into()),
-                revision: Some("abc123".into()),
+                project,
+                ticket: None,
+                revision: None,
             },
         );
-        assert!(start.applied);
+        assert!(start.applied, "{}", start.detail);
+        let epoch = core.epoch;
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
-            Some(Phase::Running)
+            confirm_runtime(core, epoch, &RuntimeIdentity::rehearsal("trial")),
+            Transition::Applied
         );
-        assert_eq!(core.ticket.as_deref(), Some("TASK-9"));
+        epoch
+    }
 
-        // A second controller is refused with a real reason.
-        let second = apply(
+    #[test]
+    fn a_start_without_a_runtime_is_refused_instead_of_pretended() {
+        let mut core = default_core("gc");
+        let start = apply(
             &mut core,
             SupervisorAction::Start {
                 project: "gc".into(),
@@ -334,9 +534,188 @@ mod tests {
                 revision: None,
             },
         );
-        assert!(!second.applied);
-        assert!(second.detail.contains("second controller"));
+        assert!(!start.applied);
+        assert!(
+            start.detail.contains("no runtime is wired"),
+            "{}",
+            start.detail
+        );
+        assert!(core.run.is_none());
+    }
 
+    #[test]
+    fn a_run_is_running_only_after_the_runtime_confirms_it() {
+        let mut core = wired("gc");
+        let project = core.project.clone();
+        let start = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: Some("TASK-9".into()),
+                revision: Some("abc123".into()),
+            },
+        );
+        assert!(start.applied);
+        // STARTING: nothing has confirmed that the work began.
+        assert_eq!(
+            core.run.as_ref().map(|r| r.phase().clone()),
+            Some(Phase::Starting)
+        );
+        assert_eq!(core.ticket.as_deref(), Some("TASK-9"));
+
+        // The confirmation is what makes it running.
+        let epoch = core.epoch;
+        assert_eq!(
+            confirm_runtime(&mut core, epoch, &RuntimeIdentity::rehearsal("trial")),
+            Transition::Applied
+        );
+        assert_eq!(
+            core.run.as_ref().map(|r| r.phase().clone()),
+            Some(Phase::Running)
+        );
+    }
+
+    #[test]
+    fn a_confirmation_of_another_run_is_refused() {
+        let mut core = wired("gc");
+        started(&mut core);
+        // A late confirmation of a run that already ended must never
+        // confirm the next one.
+        assert!(matches!(
+            confirm_runtime(&mut core, 99, &RuntimeIdentity::rehearsal("trial")),
+            Transition::Refused { .. }
+        ));
+        assert_eq!(
+            core.run.as_ref().map(|r| r.phase().clone()),
+            Some(Phase::Running)
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_a_transition() {
+        // A confirmed objective leaves the session alive.
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        assert_eq!(
+            record_outcome(
+                &mut core,
+                epoch,
+                ObjectiveOutcome::Confirmed {
+                    work_ref: "TASK-1".into(),
+                    detail: "published".into(),
+                },
+            ),
+            Transition::Applied
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Running);
+        assert!(snapshot(&core).objective.is_some());
+
+        // A rejected one ends it.
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        record_outcome(
+            &mut core,
+            epoch,
+            ObjectiveOutcome::Rejected {
+                work_ref: "TASK-2".into(),
+                reason: "the evidence did not hold".into(),
+            },
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+
+        // A failed one ends it.
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        record_outcome(
+            &mut core,
+            epoch,
+            ObjectiveOutcome::Failed {
+                reason: "the sandbox could not be created".into(),
+            },
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+
+        // An idle one leaves the supervisor waiting, with no run.
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        record_outcome(
+            &mut core,
+            epoch,
+            ObjectiveOutcome::Idle {
+                reason: "no eligible work".into(),
+            },
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Idle);
+        assert!(core.run.is_none());
+    }
+
+    #[test]
+    fn an_outcome_of_a_stopped_run_is_not_recorded() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        apply(&mut core, SupervisorAction::Stop);
+        assert!(matches!(
+            record_outcome(
+                &mut core,
+                epoch,
+                ObjectiveOutcome::Confirmed {
+                    work_ref: "TASK-1".into(),
+                    detail: "published".into(),
+                },
+            ),
+            Transition::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn the_snapshot_states_the_runtime_kind() {
+        let core = wired("gc");
+        let snap = snapshot(&core);
+        let runtime = snap.runtime.expect("the wired runtime is visible");
+        assert_eq!(runtime.kind, run::runtime::RuntimeKind::Rehearsal);
+        // A rehearsal is never presented as a live execution.
+        assert!(runtime.label().starts_with("rehearsal"));
+    }
+
+    #[test]
+    fn start_is_exclusive_and_pauses_and_resumes() {
+        let mut core = wired("gc");
+        let project = core.project.clone();
+        let start = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: Some("TASK-9".into()),
+                revision: Some("abc123".into()),
+            },
+        );
+        assert!(start.applied);
+        assert_eq!(core.ticket.as_deref(), Some("TASK-9"));
+
+        // A second controller is refused with a real reason — also while
+        // the first run is still starting.
+        let project = core.project.clone();
+        let second = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(!second.applied);
+        assert!(
+            second.detail.contains("second controller"),
+            "{}",
+            second.detail
+        );
+
+        // A run that has not started has no prompt loop to pause.
+        let pause = apply(&mut core, SupervisorAction::Pause);
+        assert!(!pause.applied);
+
+        let epoch = core.epoch;
+        confirm_runtime(&mut core, epoch, &RuntimeIdentity::rehearsal("trial"));
         let pause = apply(&mut core, SupervisorAction::Pause);
         assert!(pause.applied);
         assert_eq!(
@@ -348,6 +727,32 @@ mod tests {
         let resume = apply(&mut core, SupervisorAction::Resume);
         assert!(resume.applied);
         assert!(!core.paused);
+    }
+
+    #[test]
+    fn a_run_that_is_starting_can_be_stopped() {
+        let mut core = wired("gc");
+        let project = core.project.clone();
+        apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: None,
+                revision: None,
+            },
+        );
+        // Nobody is left waiting for a confirmation that will not arrive.
+        let stop = apply(&mut core, SupervisorAction::Stop);
+        assert!(stop.applied);
+        assert!(
+            stop.detail.contains("before the runtime confirmed"),
+            "{}",
+            stop.detail
+        );
+        assert_eq!(
+            core.run.as_ref().map(|r| r.phase().clone()),
+            Some(Phase::Stopped)
+        );
     }
 
     #[test]
@@ -375,16 +780,8 @@ mod tests {
 
     #[test]
     fn the_epoch_advances_only_on_start_not_on_every_event() {
-        let mut core = default_core("gc");
-        let first = apply(
-            &mut core,
-            SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: None,
-                revision: None,
-            },
-        );
-        assert!(first.applied);
+        let mut core = wired("gc");
+        started(&mut core);
         let epoch_after_start = core.epoch;
         assert_eq!(epoch_after_start, 1);
         // Events (and other actions) do not move the epoch.
@@ -399,29 +796,15 @@ mod tests {
         assert_eq!(core.epoch, epoch_after_start);
         // A new run after a stop advances it again.
         apply(&mut core, SupervisorAction::Stop);
-        let second = apply(
-            &mut core,
-            SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: None,
-                revision: None,
-            },
-        );
-        assert!(second.applied);
+        let second = started(&mut core);
         assert_eq!(core.epoch, 2);
+        assert_eq!(second, 2);
     }
 
     #[test]
     fn the_snapshot_states_the_grant_scope_instead_of_implying_one() {
-        let mut core = default_core("gc");
-        apply(
-            &mut core,
-            SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: None,
-                revision: None,
-            },
-        );
+        let mut core = wired("gc");
+        started(&mut core);
         let snap = snapshot(&core);
         assert_eq!(snap.phase, Phase::Running);
         // The supervisor run authorizes no effect on its own — and says so.
@@ -454,19 +837,12 @@ mod tests {
 
     #[test]
     fn stop_reports_irreversibles_and_refusals_are_real_answers() {
-        let mut core = default_core("gc");
+        let mut core = wired("gc");
         let stop_without_run = apply(&mut core, SupervisorAction::Stop);
         assert!(!stop_without_run.applied);
         assert!(stop_without_run.detail.contains("no running run"));
 
-        let _ = apply(
-            &mut core,
-            SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: None,
-                revision: None,
-            },
-        );
+        started(&mut core);
         if let Some(run) = core.run.as_mut() {
             run.mark_initiated("git bundle written to staging");
         }
@@ -474,7 +850,7 @@ mod tests {
         assert!(stop.applied);
         assert!(stop.detail.contains("git bundle written to staging"));
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Stopped)
         );
     }
@@ -512,29 +888,23 @@ mod tests {
 
     #[test]
     fn viewer_disconnect_does_not_touch_the_run_and_events_replay_by_seq() {
-        let mut core = default_core("gc");
-        let _ = apply(
-            &mut core,
-            SupervisorAction::Start {
-                project: "gc".into(),
-                ticket: None,
-                revision: None,
-            },
-        );
+        let mut core = wired("gc");
+        started(&mut core);
         let _ = viewer_connected(&mut core);
         viewer_disconnected(&mut core);
         // The objective is untouched by the viewer leaving.
         assert_eq!(core.terminal_viewers, 0);
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Running)
         );
 
         let (all, next) = events_since(&core, 1);
-        assert_eq!(all.len(), 3);
-        assert_eq!(next, 4);
+        // The start and its confirmation are part of the history.
+        assert_eq!(all.len(), 4);
+        assert_eq!(next, 5);
         let (tail, _) = events_since(&core, 3);
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].seq, 3);
     }
 

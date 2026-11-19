@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use hodei_mh_coordinator::actor::CoordinatorActor;
 use hodei_mh_coordinator::core::ClaimResult;
 use hodei_mh_run::grant::{EffectKind, Grant};
-use hodei_mh_run::run::{EventIdentity, RunPlan, TaggedEvent};
+use hodei_mh_run::run::{EventIdentity, Phase, RunPlan, TaggedEvent};
 use opensandbox::acp::{self, AcpAssembler};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
@@ -187,7 +187,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
     };
 
-    let mut run_state = hodei_mh_run::run::RunState::start(grant, agent_session.session_id.clone());
+    // The run is REQUESTED: the session is bound to the grant, but nothing
+    // has answered yet that the work started. It becomes `Running` only
+    // when the agent answers the handshake.
+    let mut run_state =
+        hodei_mh_run::run::RunState::pending(grant, agent_session.session_id.clone());
     run_state.track_process(agent_session.session_id.clone());
     // Goal-less mock agent: finite prompt turns (no goal simulation).
     let plan = RunPlan::for_agent(
@@ -244,6 +248,10 @@ pub async fn run(server: &str, image: &str) -> i32 {
                     }
                     let id = message.get("id").and_then(|v| v.as_u64());
                     if id == Some(init_id) && message.get("result").is_some() {
+                        // The agent answered the handshake: THAT is the
+                        // runtime's confirmation. Before it, the run was
+                        // only STARTING.
+                        run_state.confirm();
                         let new_session = next_id;
                         next_id += 1;
                         let _ = pipe_session
@@ -317,6 +325,15 @@ pub async fn run(server: &str, image: &str) -> i32 {
         detail: format!(
             "{turn_index}/{} turns, answered={prompt_answered}",
             prompt_turns.len()
+        ),
+    });
+
+    checks.push(Check {
+        name: "the-run-is-running-only-after-the-agent-answered",
+        passed: run_state.phase() == &Phase::Running,
+        detail: format!(
+            "the run was STARTING until the agent answered the handshake; the phase after the real prompt turn is {:?}",
+            run_state.phase()
         ),
     });
 

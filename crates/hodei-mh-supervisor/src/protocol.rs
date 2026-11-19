@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use run::run::Phase;
+use run::runtime::{ObjectiveReport, RuntimeIdentity};
 
 /// What a client may ask the supervisor to do. These are the SAME actions
 /// the CLI documents; the TUI only renders keys for them.
@@ -95,6 +96,13 @@ pub struct Snapshot {
     pub paused: bool,
     pub ticket: Option<String>,
     pub revision: Option<String>,
+    /// The runtime that executes objectives. Its KIND is never hidden: a
+    /// rehearsal says so. Absent means no runtime is wired.
+    #[serde(default)]
+    pub runtime: Option<RuntimeIdentity>,
+    /// What the last objective did. Absent means none has run yet.
+    #[serde(default)]
+    pub objective: Option<ObjectiveReport>,
     pub resources: ResourceObservation,
     pub context_available: bool,
     pub wait_reason: Option<String>,
@@ -148,6 +156,8 @@ mod tests {
             paused: false,
             ticket: None,
             revision: None,
+            runtime: None,
+            objective: None,
             resources: ResourceObservation::Unknown {
                 reason: "no cgroup path".into(),
             },

@@ -11,6 +11,10 @@ use crate::grant::Grant;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Phase {
     Idle,
+    /// The objective was handed to the runtime, but no runtime has
+    /// CONFIRMED it yet. A run in this phase is not running: nothing has
+    /// answered that the work started.
+    Starting,
     Running,
     Stopping,
     Stopped,
@@ -51,11 +55,16 @@ pub struct PendingResponse {
     pub event_kind: String,
 }
 
+/// The run's state. Its phase is PRIVATE on purpose: `Running` is
+/// reachable only through `confirm`, and a public field would let any
+/// holder of the state declare a run running without a runtime having
+/// answered. The state is also NOT deserializable: a phase that arrived
+/// from the wire would be a phase nobody confirmed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     pub grant: Grant,
     pub session_id: String,
-    pub phase: Phase,
+    phase: Phase,
     /// Responses and effects awaiting delivery — invalidated by stop.
     pub pending: Vec<PendingResponse>,
     /// Effects already sent to the outside world; stop cannot undo these,
@@ -66,16 +75,40 @@ pub struct RunState {
 }
 
 impl RunState {
-    /// START: bind the session to the grant's identity and go Running.
-    pub fn start(grant: Grant, session_id: impl Into<String>) -> Self {
+    /// The phase the run is in.
+    pub fn phase(&self) -> &Phase {
+        &self.phase
+    }
+
+    /// Whether the run is still in flight: STARTING counts as in flight,
+    /// because a run that nobody confirmed yet still owns the session.
+    pub fn is_live(&self) -> bool {
+        matches!(self.phase, Phase::Starting | Phase::Running)
+    }
+
+    /// The run is REQUESTED: the session is bound to the grant's identity,
+    /// but no runtime has confirmed it yet. `Phase::Running` is reachable
+    /// ONLY through `confirm`.
+    pub fn pending(grant: Grant, session_id: impl Into<String>) -> Self {
         Self {
             grant,
             session_id: session_id.into(),
-            phase: Phase::Running,
+            phase: Phase::Starting,
             pending: Vec::new(),
             initiated_irreversible: Vec::new(),
             cancelled_processes: Vec::new(),
         }
+    }
+
+    /// The runtime CONFIRMED the run: it is running now. A run that is
+    /// not `Starting` cannot be confirmed — the confirmation is a
+    /// transition, not a state anybody may declare.
+    pub fn confirm(&mut self) -> bool {
+        if self.phase != Phase::Starting {
+            return false;
+        }
+        self.phase = Phase::Running;
+        true
     }
 
     fn identity(&self) -> EventIdentity {
@@ -97,7 +130,7 @@ impl RunState {
                 expected,
             })));
         }
-        if self.phase != Phase::Running {
+        if self.phase != Phase::Running && self.phase != Phase::Starting {
             // Late arrivals after stop started are invalidated, not applied.
             return Err(RunError::NotRunning(self.phase.clone()));
         }
@@ -117,10 +150,12 @@ impl RunState {
     }
 
     /// STOP: invalidate everything pending, cancel controlled processes,
-    /// report the irreversible actions already in flight.
+    /// report the irreversible actions already in flight. A run that has
+    /// not been confirmed yet is stopped too: nobody is left waiting for
+    /// a confirmation that will never arrive.
     pub fn stop(&mut self) -> Vec<String> {
         self.pending.clear();
-        if self.phase == Phase::Running {
+        if self.phase == Phase::Running || self.phase == Phase::Starting {
             self.phase = Phase::Stopping;
         }
         let cancelled = self.cancelled_processes.clone();
@@ -169,7 +204,9 @@ mod tests {
 
     fn running() -> RunState {
         let grant = Grant::new("proj", "run-7", 3, vec![]);
-        RunState::start(grant, "sess-9")
+        let mut run = RunState::pending(grant, "sess-9");
+        assert!(run.confirm(), "a runtime confirms the pending run");
+        run
     }
 
     fn event(kind: &str, identity: EventIdentity) -> TaggedEvent {
@@ -178,6 +215,46 @@ mod tests {
             kind: kind.into(),
             payload: json!({}),
         }
+    }
+
+    #[test]
+    fn a_run_is_running_only_after_a_runtime_confirms_it() {
+        let grant = Grant::new("proj", "run-7", 3, vec![]);
+        let mut run = RunState::pending(grant, "sess-9");
+        // Nothing answered that the work started: the run is not running.
+        assert_eq!(run.phase, Phase::Starting);
+        assert!(run.confirm(), "the confirmation is what starts the run");
+        assert_eq!(run.phase, Phase::Running);
+        // A second confirmation is not a transition: it changes nothing.
+        assert!(!run.confirm());
+        assert_eq!(run.phase, Phase::Running);
+    }
+
+    #[test]
+    fn events_are_accepted_while_the_run_starts() {
+        let grant = Grant::new("proj", "run-7", 3, vec![]);
+        let mut run = RunState::pending(grant, "sess-9");
+        let identity = EventIdentity {
+            run_id: "run-7".into(),
+            session_id: "sess-9".into(),
+            epoch: 3,
+        };
+        // The runtime may answer while the run is still starting: those
+        // events are part of the run, not late arrivals.
+        assert!(run.receive(event("session/update", identity)).is_ok());
+        assert_eq!(run.pending.len(), 1);
+    }
+
+    #[test]
+    fn a_run_that_is_not_confirmed_can_be_stopped() {
+        let grant = Grant::new("proj", "run-7", 3, vec![]);
+        let mut run = RunState::pending(grant, "sess-9");
+        run.track_process("pty-1");
+        // Nobody is left waiting for a confirmation that will not arrive.
+        let cancelled = run.stop();
+        assert_eq!(cancelled, vec!["pty-1".to_string()]);
+        assert_eq!(run.phase, Phase::Stopped);
+        assert!(!run.confirm(), "a stopped run cannot be confirmed");
     }
 
     #[test]

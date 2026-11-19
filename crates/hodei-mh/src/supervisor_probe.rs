@@ -41,6 +41,9 @@ fn spawn_supervisor(bin: &std::path::Path, socket: &str, log_path: &std::path::P
             socket,
             "--project",
             "probe-project",
+            // The rehearsal runtime: the probe exercises the real flow
+            // without Docker, network or a model.
+            "--rehearsal",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -105,6 +108,19 @@ pub async fn run() -> i32 {
         ),
     });
 
+    // ---- the rehearsal NAMES ITSELF: it is never presented as a live run
+    checks.push(Check {
+        name: "the-runtime-kind-is-visible-and-never-hidden",
+        passed: first_status.contains("runtime: rehearsal"),
+        detail: format!(
+            "the snapshot states the kind of runtime it has; a rehearsal says 'rehearsal' and never passes for a live run: {}",
+            first_status
+                .lines()
+                .find(|line| line.starts_with("runtime:"))
+                .unwrap_or("(no runtime line in the snapshot)")
+        ),
+    });
+
     let (pause_code, pause_out, _) =
         run_capture(&bin, &["sup-action", "pause", "--socket", &socket]).await;
     let (start_code, start_out, _) = run_capture(
@@ -135,7 +151,12 @@ pub async fn run() -> i32 {
                     stdout.contains("ticket: TASK-9") && stdout.contains("revision: deadbeef")
                 }),
         detail: format!(
-            "pause without run: refused (exit {pause_code}, no fake success); start: applied (exit {start_code}); real snapshot afterwards shows the applied state",
+            "pause without run: refused (exit {pause_code}, no fake success); start: applied (exit {start_code}); the run reached 'running' only AFTER the runtime confirmed it{}",
+            if running_status.is_some() {
+                ""
+            } else {
+                " — IT NEVER REACHED 'running': the confirmation never happened"
+            },
         ),
     });
 
@@ -189,6 +210,32 @@ pub async fn run() -> i32 {
         detail: format!(
             "ratatui TUI ran a real local session against the socket (frames=2, exit {tui_code}); stderr: {}",
             tui_err.trim().chars().take(120).collect::<String>()
+        ),
+    });
+
+    // ---- AC-1: the CLI and the TUI observe the SAME state machine -----
+    // Both render the SAME snapshot contract, so a state the CLI shows
+    // and the TUI does not (or the other way round) means the two
+    // surfaces drifted apart.
+    let cli_normalized = running_status
+        .as_ref()
+        .map(|(stdout, _)| normalize(stdout))
+        .unwrap_or_default();
+    let same_state = !cli_normalized.is_empty()
+        && cli_normalized.contains("phase:running")
+        && tui_normalized.contains("phase:running")
+        && cli_normalized.contains("ticket:TASK-9")
+        && tui_normalized.contains("ticket:TASK-9")
+        && cli_normalized.contains("runtime:rehearsal")
+        && tui_normalized.contains("runtime:rehearsal");
+    checks.push(Check {
+        name: "the-cli-and-the-tui-observe-the-same-state-machine",
+        passed: same_state,
+        detail: format!(
+            "the CLI reports phase/ticket/runtime and the TUI renders the same ones from the same snapshot contract (CLI: phase={}, ticket={}, runtime={})",
+            cli_normalized.contains("phase:running"),
+            cli_normalized.contains("ticket:TASK-9"),
+            cli_normalized.contains("runtime:rehearsal"),
         ),
     });
 
@@ -299,6 +346,11 @@ pub async fn run() -> i32 {
     }
 }
 
+/// Wait until the supervisor's own CLI reports `needle`.
+///
+/// A deadline that expires returns `None`: the state was NOT reached. The
+/// last answer seen is not evidence of anything, and returning it as if
+/// it were would turn a missed state into a silent pass.
 async fn wait_ready_contains(
     bin: &std::path::Path,
     socket: &str,
@@ -311,7 +363,7 @@ async fn wait_ready_contains(
             return Some((stdout, stderr));
         }
         if Instant::now() >= deadline {
-            return Some((stdout, stderr));
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
