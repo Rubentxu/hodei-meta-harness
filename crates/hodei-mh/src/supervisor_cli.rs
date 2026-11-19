@@ -60,9 +60,10 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // Ownership of the socket file: only OUR file is removed on exit, so a
-    // successor supervisor that already replaced it keeps its socket.
-    let owned_socket = server::identity_of(std::path::Path::new(&socket));
+    // The socket file belongs to the CONTROLLER: the bound socket removes
+    // it when the controller stops, and only if it is still the same file.
+    // The CLI does not unlink it: that would be the same fact in two
+    // places, and the two could disagree.
     let runtime: Option<Arc<dyn ObjectiveRuntime>> = if rehearsal {
         Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
     } else {
@@ -148,9 +149,6 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // Serving without it would accept the Start and leave the run in
     // `Starting` forever.
     let served = server::serve(bound, core, runtime, server::Limits::default()).await;
-    if let Some(identity) = owned_socket {
-        server::unlink_if_owned(std::path::Path::new(&socket), identity);
-    }
     if served.is_err() {
         return 1;
     }
