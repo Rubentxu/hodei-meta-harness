@@ -6,7 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "workspace"
+name = "hodei_mh_workspace"
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }

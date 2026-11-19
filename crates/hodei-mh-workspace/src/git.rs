@@ -24,6 +24,30 @@ fn run_raw(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result
     run_raw_env(operation, args, cwd, &[])
 }
 
+/// Raw stdout bytes. The NUL-separated plumbing (`ls-files -z`) must not go
+/// through a lossy `String`: a non-UTF-8 path replaced to U+FFFD would be
+/// handed to `tar` as a name that does not exist, and an export that
+/// silently misses files is worse than one that fails.
+fn run_bytes(
+    operation: &'static str,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> Result<Vec<u8>, GitError> {
+    let mut command = Command::new("git");
+    command.args(args);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let output = command.output().map_err(GitError::Unavailable)?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            operation,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output.stdout)
+}
+
 /// `run_raw` with an explicit environment for the child process.
 fn run_raw_env(
     operation: &'static str,
@@ -218,6 +242,103 @@ pub fn inspect_bundle(
         Some(dest),
     )?;
     Ok((head, changed.lines().map(str::to_string).collect()))
+}
+
+/// The tracked files of `repo_dir` (the index), as repository-root-relative
+/// paths. `-z` is not a style choice: git C-quotes any path with unusual
+/// bytes unless asked not to, and a line-split of quoted paths yields names
+/// that do not exist. An empty repo yields an empty list, not an error.
+pub fn ls_tracked(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes("ls-files", &["ls-files", "-z"], Some(repo_dir))?;
+    Ok(split_nul(&stdout))
+}
+
+/// The untracked, not-gitignored files of `repo_dir`. `--exclude-standard`
+/// is the ONLY place gitignore is trusted — for untracked files that is
+/// literally its job; tracked files never rely on it (a committed secret is
+/// still a secret).
+pub fn ls_untracked(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes(
+        "ls-files --others",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        Some(repo_dir),
+    )?;
+    Ok(split_nul(&stdout))
+}
+
+/// The paths whose WORKING TREE content differs from `HEAD`: the staged
+/// changes and the unstaged ones, and the files deleted from the tree.
+///
+/// This is the comparison that decides what is versioned: a file that
+/// differs from the last commit carries an unversioned change, and an
+/// unversioned change only leaves the host under an explicit policy.
+pub fn ls_changed(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes(
+        "diff HEAD",
+        &["diff", "--name-only", "-z", "HEAD", "--"],
+        Some(repo_dir),
+    )?;
+    Ok(split_nul(&stdout))
+}
+
+/// Whether the repository has at least one commit. A repository without
+/// commits has no versioned content at all: everything in it is a change.
+pub fn has_head(repo_dir: &Path) -> bool {
+    run_raw(
+        "rev-parse HEAD",
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        Some(repo_dir),
+    )
+    .is_ok()
+}
+
+/// The root of the working tree that contains `dir`.
+///
+/// `git ls-files` walks UP to the repository root: run in a subdirectory of
+/// a repository, it lists the files of the WHOLE repository. The caller
+/// needs to know that, because the paths it gets back are relative to the
+/// repository root and not to the directory it asked about.
+pub fn toplevel(dir: &Path) -> Option<std::path::PathBuf> {
+    let out = run_raw(
+        "rev-parse --show-toplevel",
+        &["rev-parse", "--show-toplevel"],
+        Some(dir),
+    )
+    .ok()?;
+    let top = std::path::PathBuf::from(out.trim());
+    if top.as_os_str().is_empty() {
+        None
+    } else {
+        Some(top)
+    }
+}
+
+/// Whether `dir` IS the root of a working tree — not a subdirectory of one.
+///
+/// The paths of a working tree are relative to its root, so only the root
+/// itself can be classified with them.
+pub fn is_worktree_root(dir: &Path) -> bool {
+    let Some(top) = toplevel(dir) else {
+        return false;
+    };
+    let top = top.canonicalize().unwrap_or(top);
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    top == dir
+}
+
+/// Whether `dir` is inside a git working tree.
+pub fn is_git_repo(dir: &Path) -> bool {
+    run_raw("rev-parse", &["rev-parse", "--git-dir"], Some(dir))
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn split_nul(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
 }
 
 /// Create a bundle of the current branch HEAD in `repo_dir` (host-side test
