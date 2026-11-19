@@ -17,12 +17,20 @@ use supervisor::client::{self, SupervisorClient};
 use supervisor::protocol::{Snapshot, SupervisorAction};
 use supervisor::render::{render_event, render_snapshot};
 
+/// How many event lines the panel keeps. The tail is what matters: the
+/// list is bounded so a long run does not grow the panel without limit.
+const MAX_EVENT_LINES: usize = 200;
+
 struct TuiState {
     snapshot: Option<Snapshot>,
     events: Vec<String>,
     banner: Option<String>,
     simulated: bool,
     quit: bool,
+    /// The CURSOR of the event history: the sequence the next poll asks
+    /// for. The supervisor bounds every page, so a client that always
+    /// asks for the same beginning would show the SAME events forever.
+    cursor: u64,
 }
 
 impl TuiState {
@@ -33,6 +41,7 @@ impl TuiState {
             banner: None,
             simulated,
             quit: false,
+            cursor: 0,
         }
     }
 }
@@ -72,9 +81,20 @@ async fn observe(client: &mut Option<SupervisorClient>, socket: &str, state: &mu
         }
     }
     if let Some(open_client) = client.as_mut() {
-        match open_client.events(1).await {
-            Ok((events, _)) => {
-                state.events = events.iter().map(render_event).collect();
+        // The CURSOR says where to continue: the page the supervisor
+        // sends is BOUNDED, and asking for the same beginning again
+        // would show the same events forever.
+        match open_client.events(state.cursor, None).await {
+            Ok(page) => {
+                state.cursor = page.next_seq;
+                for event in &page.events {
+                    state.events.push(render_event(event));
+                }
+                // The panel keeps the TAIL: the list is bounded.
+                if state.events.len() > MAX_EVENT_LINES {
+                    let excess = state.events.len() - MAX_EVENT_LINES;
+                    state.events.drain(0..excess);
+                }
             }
             Err(e) => {
                 *client = None;

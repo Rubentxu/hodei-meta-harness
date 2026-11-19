@@ -8,14 +8,27 @@ use run::run::{Phase, RunState};
 use run::runtime::{ObjectiveOutcome, ObjectiveReport, RuntimeIdentity};
 
 use crate::protocol::{
-    ActionOutcome, ResourceObservation, Snapshot, StructuredEvent, SupervisorAction,
+    ActionOutcome, EventPage, PROTOCOL_VERSION, ResourceObservation, Snapshot, StructuredEvent,
+    SupervisorAction,
 };
-use crate::provenance::{Provenance, redact};
+use crate::provenance::{Provenance, redact_value};
 
 /// Upper bound on the retained event history. The log is a RING: the
 /// oldest events are dropped, the sequence numbers keep growing. A
 /// supervisor that ran for days must not grow without bound.
 pub const MAX_RETAINED_EVENTS: usize = 1000;
+
+/// How many events one page of the history carries at most. The client
+/// asks for the next page with the cursor the page returns.
+pub const MAX_EVENTS_PER_PAGE: usize = 256;
+
+/// How many bytes the body of one event may weigh. A body that does not
+/// fit is REPLACED by a marker that says so: it is never quietly cut.
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 4 * 1024;
+
+/// The ceiling of the TTL of a managed environment. A renewal that would
+/// go beyond it is refused with its reason.
+pub const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// Whether a transition the engine applies took effect. A refusal is a
 /// real answer with its reason, never a silent no-op.
@@ -104,6 +117,12 @@ pub fn core_with_runtime(project: impl Into<String>, runtime: RuntimeIdentity) -
 
 /// Record a structured event with provenance; credential-bearing text is
 /// redacted BEFORE it enters the record (AC-4).
+///
+/// The body keeps its STRUCTURE: it is a typed value, redacted as a
+/// tree, and it carries the epoch of the run it belongs to. A body that
+/// would weigh more than [`MAX_EVENT_PAYLOAD_BYTES`] is replaced by a
+/// marker that states its size: the truncation is announced, never
+/// hidden.
 pub fn emit_event(
     core: &mut SupervisorCore,
     kind: impl Into<String>,
@@ -112,12 +131,17 @@ pub fn emit_event(
 ) -> StructuredEvent {
     let seq = core.next_seq;
     core.next_seq += 1;
+    let redacted = redact_value(&payload);
+    let payload = match serde_json::to_string(&redacted) {
+        Ok(encoded) if encoded.len() <= MAX_EVENT_PAYLOAD_BYTES => redacted,
+        Ok(encoded) => oversized_payload(encoded.len()),
+        Err(_) => oversized_payload(0),
+    };
     let event = StructuredEvent {
         seq,
+        epoch: core.epoch,
         kind: kind.into(),
-        payload: serde_json::Value::String(redact(
-            payload.as_str().unwrap_or(&payload.to_string()),
-        )),
+        payload,
         provenance,
     };
     core.events.push(event.clone());
@@ -127,6 +151,15 @@ pub fn emit_event(
         core.events.drain(0..excess);
     }
     event
+}
+
+/// The body that replaces one too large to carry.
+fn oversized_payload(bytes: usize) -> serde_json::Value {
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": bytes,
+        "note": "the body exceeded the per-event limit and was not carried",
+    })
 }
 
 /// Mark the core as degraded after recovering from a poisoned lock. The
@@ -139,7 +172,7 @@ pub fn mark_degraded(core: &mut SupervisorCore, reason: &str) {
     emit_event(
         core,
         "supervisor/degraded",
-        serde_json::Value::String(reason.to_string()),
+        serde_json::json!({ "reason": reason }),
         Provenance::Automatic {
             rule: "poison-recovery".into(),
         },
@@ -154,16 +187,20 @@ pub fn ingest_telemetry(
     observation: ResourceObservation,
 ) -> StructuredEvent {
     core.resources = observation.clone();
-    let (unknown, reason) = match &observation {
-        ResourceObservation::Measured { cpus, memory_gib } => {
-            (false, format!("cpus={cpus} memory_gib={memory_gib}"))
-        }
-        ResourceObservation::Unknown { reason } => (true, reason.clone()),
+    let (unknown, payload) = match &observation {
+        ResourceObservation::Measured { cpus, memory_gib } => (
+            false,
+            serde_json::json!({ "cpus": cpus, "memory_gib": memory_gib }),
+        ),
+        ResourceObservation::Unknown { reason } => (
+            true,
+            serde_json::json!({ "unknown": true, "reason": reason }),
+        ),
     };
     emit_event(
         core,
         "telemetry/resources",
-        serde_json::Value::String(reason),
+        payload,
         Provenance::Telemetry { unknown },
     )
 }
@@ -175,7 +212,7 @@ pub fn viewer_connected(core: &mut SupervisorCore) -> StructuredEvent {
     emit_event(
         core,
         "viewer/connected",
-        serde_json::Value::String(format!("viewers={}", core.terminal_viewers)),
+        serde_json::json!({ "viewers": core.terminal_viewers }),
         Provenance::Human,
     )
 }
@@ -185,7 +222,7 @@ pub fn viewer_disconnected(core: &mut SupervisorCore) -> StructuredEvent {
     emit_event(
         core,
         "viewer/disconnected",
-        serde_json::Value::String(format!("viewers={}", core.terminal_viewers)),
+        serde_json::json!({ "viewers": core.terminal_viewers }),
         Provenance::Human,
     )
 }
@@ -313,8 +350,27 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
         },
         SupervisorAction::Renew { added_seconds } => match core.ttl_remaining_seconds {
             Some(remaining) => {
-                core.ttl_remaining_seconds = Some(remaining + added_seconds);
-                outcome(&action, true, format!("ttl extended by {added_seconds}s"))
+                // The addition is CHECKED: an unchecked one overflows (and
+                // a debug build panics on it), and the result is bounded:
+                // a renewal cannot push the environment past its ceiling.
+                match remaining.checked_add(*added_seconds) {
+                    None => outcome(
+                        &action,
+                        false,
+                        "the ttl cannot be extended: it would overflow",
+                    ),
+                    Some(extended) if extended > MAX_TTL_SECONDS => outcome(
+                        &action,
+                        false,
+                        format!(
+                            "the ttl cannot be extended: {extended}s is beyond the ceiling of {MAX_TTL_SECONDS}s"
+                        ),
+                    ),
+                    Some(extended) => {
+                        core.ttl_remaining_seconds = Some(extended);
+                        outcome(&action, true, format!("ttl extended by {added_seconds}s"))
+                    }
+                }
             }
             None => outcome(&action, false, "no managed environment ttl to renew"),
         },
@@ -325,9 +381,11 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
     emit_event(
         core,
         "supervisor/action",
-        serde_json::Value::String(format!(
-            "{action:?} applied={applied} detail={event_detail}"
-        )),
+        serde_json::json!({
+            "action": action,
+            "applied": applied,
+            "detail": event_detail,
+        }),
         Provenance::Human,
     );
     outcome
@@ -377,10 +435,11 @@ pub fn confirm_runtime(
     emit_event(
         core,
         "objective/confirmed",
-        serde_json::Value::String(format!(
-            "the runtime confirmed the objective (epoch {epoch}; {})",
-            identity.label()
-        )),
+        serde_json::json!({
+            "epoch": epoch,
+            "runtime": identity.label(),
+            "detail": "the runtime confirmed the objective",
+        }),
         // The confirmation comes from the runtime, not from a person.
         Provenance::Automatic {
             rule: "runtime-confirmation".into(),
@@ -416,7 +475,28 @@ pub fn record_outcome(
         | ObjectiveOutcome::Rejected { work_ref, .. } => Some(work_ref.clone()),
         ObjectiveOutcome::Failed { .. } | ObjectiveOutcome::Idle { .. } => None,
     };
-    let detail = outcome.describe();
+    // The body keeps the shape of the outcome: what happened, to what,
+    // and why. A client reads the fields; it does not parse a sentence.
+    let payload = match &outcome {
+        ObjectiveOutcome::Confirmed { work_ref, detail } => serde_json::json!({
+            "outcome": "confirmed",
+            "work_ref": work_ref,
+            "detail": detail,
+        }),
+        ObjectiveOutcome::Rejected { work_ref, reason } => serde_json::json!({
+            "outcome": "rejected",
+            "work_ref": work_ref,
+            "reason": reason,
+        }),
+        ObjectiveOutcome::Failed { reason } => serde_json::json!({
+            "outcome": "failed",
+            "reason": reason,
+        }),
+        ObjectiveOutcome::Idle { reason } => serde_json::json!({
+            "outcome": "idle",
+            "reason": reason,
+        }),
+    };
     match outcome {
         ObjectiveOutcome::Confirmed { .. } => {
             // The objective held: the session continues.
@@ -438,7 +518,7 @@ pub fn record_outcome(
     emit_event(
         core,
         "objective/outcome",
-        serde_json::Value::String(detail),
+        payload,
         Provenance::Automatic {
             rule: "runtime-outcome".into(),
         },
@@ -449,6 +529,7 @@ pub fn record_outcome(
 /// The snapshot both clients render — the SAME view for TUI and CLI.
 pub fn snapshot(core: &SupervisorCore) -> Snapshot {
     Snapshot {
+        protocol_version: PROTOCOL_VERSION,
         project: core.project.clone(),
         phase: core
             .run
@@ -483,15 +564,38 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
     }
 }
 
-pub fn events_since(core: &SupervisorCore, since: u64) -> (Vec<StructuredEvent>, u64) {
-    let next_seq = core.next_seq;
-    let events = core
+/// The events with sequence number >= `since`, at most `limit` of them.
+///
+/// The limit is the client's to lower; the page never exceeds
+/// [`MAX_EVENTS_PER_PAGE`] whatever the client asks for.
+pub fn events_since(core: &SupervisorCore, since: u64, limit: Option<u32>) -> EventPage {
+    let limit = limit
+        .map(|asked| asked.clamp(1, MAX_EVENTS_PER_PAGE as u32) as usize)
+        .unwrap_or(MAX_EVENTS_PER_PAGE);
+    let oldest_seq = core.events.first().map(|event| event.seq).unwrap_or(0);
+    let events: Vec<StructuredEvent> = core
         .events
         .iter()
-        .filter(|e| e.seq >= since)
+        .filter(|event| event.seq >= since)
+        .take(limit)
         .cloned()
         .collect();
-    (events, next_seq)
+    // The cursor never goes backwards: a client that asked for events
+    // that do not exist yet keeps its own position.
+    let next_seq = match events.last() {
+        Some(last) => last.seq + 1,
+        None => since.max(core.next_seq),
+    };
+    // The events the client wanted that the ring already dropped. The
+    // first sequence number is 1, so a client that asks from 0 wants
+    // everything still retained.
+    let history_lost = oldest_seq > since.max(1);
+    EventPage {
+        events,
+        next_seq,
+        oldest_seq,
+        history_lost,
+    }
 }
 
 #[cfg(test)]
@@ -830,9 +934,68 @@ mod tests {
         // The oldest events fell off, but the sequence never restarted.
         assert_eq!(core.events.first().map(|e| e.seq), Some(51));
         assert_eq!(core.next_seq, MAX_RETAINED_EVENTS as u64 + 51);
-        let (events, next_seq) = events_since(&core, 1);
-        assert_eq!(events.len(), MAX_RETAINED_EVENTS);
-        assert_eq!(next_seq, MAX_RETAINED_EVENTS as u64 + 51);
+        // A page is bounded, and its CURSOR says where to continue. The
+        // page starts at the oldest event that is still retained.
+        let page = events_since(&core, 1, None);
+        assert_eq!(page.events.len(), MAX_EVENTS_PER_PAGE);
+        assert_eq!(page.next_seq, 51 + MAX_EVENTS_PER_PAGE as u64);
+        // The client asked for events that the ring already dropped: it
+        // is TOLD that its history has a hole.
+        assert!(page.history_lost, "the lost history must be announced");
+        assert_eq!(page.oldest_seq, 51);
+    }
+
+    #[test]
+    fn a_page_never_exceeds_what_the_client_asked_for() {
+        let mut core = default_core("gc");
+        for index in 0..10 {
+            emit_event(
+                &mut core,
+                "test/event",
+                serde_json::Value::String(format!("event {index}")),
+                Provenance::Human,
+            );
+        }
+        let page = events_since(&core, 1, Some(3));
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.next_seq, 4);
+        // A client cannot ask for MORE than the page the answer allows.
+        let greedy = events_since(&core, 1, Some(100_000));
+        assert_eq!(greedy.events.len(), MAX_EVENTS_PER_PAGE.min(10));
+    }
+
+    #[test]
+    fn the_cursor_never_goes_backwards() {
+        let mut core = default_core("gc");
+        emit_event(
+            &mut core,
+            "test/event",
+            serde_json::Value::String("one".into()),
+            Provenance::Human,
+        );
+        // A client that asks for events that do not exist yet keeps its
+        // own position: the answer must not send it backwards.
+        let page = events_since(&core, 99, None);
+        assert!(page.events.is_empty());
+        assert_eq!(page.next_seq, 99);
+        assert!(!page.history_lost, "nothing the client wanted was lost");
+    }
+
+    #[test]
+    fn a_whole_history_is_announced_as_whole() {
+        let mut core = default_core("gc");
+        emit_event(
+            &mut core,
+            "test/event",
+            serde_json::Value::String("one".into()),
+            Provenance::Human,
+        );
+        let page = events_since(&core, 0, None);
+        assert_eq!(page.events.len(), 1);
+        assert!(
+            !page.history_lost,
+            "a client that asks from the beginning has the whole history"
+        );
     }
 
     #[test]
@@ -864,6 +1027,25 @@ mod tests {
         let renew = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
         assert!(renew.applied);
         assert_eq!(core.ttl_remaining_seconds, Some(420));
+    }
+
+    #[test]
+    fn a_renewal_that_would_overflow_or_pass_the_ceiling_is_refused() {
+        let mut core = default_core("gc");
+        // The addition is CHECKED: an unchecked one overflows, and a
+        // debug build panics on it.
+        core.ttl_remaining_seconds = Some(u64::MAX - 10);
+        let overflow = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
+        assert!(!overflow.applied);
+        assert!(overflow.detail.contains("overflow"), "{}", overflow.detail);
+        assert_eq!(core.ttl_remaining_seconds, Some(u64::MAX - 10));
+        // The renewal is bounded: it cannot push the environment past
+        // its ceiling.
+        core.ttl_remaining_seconds = Some(MAX_TTL_SECONDS - 10);
+        let beyond = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
+        assert!(!beyond.applied);
+        assert!(beyond.detail.contains("ceiling"), "{}", beyond.detail);
+        assert_eq!(core.ttl_remaining_seconds, Some(MAX_TTL_SECONDS - 10));
     }
 
     #[test]
@@ -899,13 +1081,45 @@ mod tests {
             Some(Phase::Running)
         );
 
-        let (all, next) = events_since(&core, 1);
+        let page = events_since(&core, 1, None);
         // The start and its confirmation are part of the history.
-        assert_eq!(all.len(), 4);
-        assert_eq!(next, 5);
-        let (tail, _) = events_since(&core, 3);
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].seq, 3);
+        assert_eq!(page.events.len(), 4);
+        assert_eq!(page.next_seq, 5);
+        let tail = events_since(&core, 3, None);
+        assert_eq!(tail.events.len(), 2);
+        assert_eq!(tail.events[0].seq, 3);
+    }
+
+    #[test]
+    fn an_event_keeps_its_structure_and_the_epoch_of_its_run() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        let event = core.events.last().expect("the confirmation event");
+        // The body is a TYPED value: the reader does not have to parse a
+        // sentence to know what the event said.
+        assert!(event.payload.is_object(), "{:?}", event.payload);
+        assert_eq!(event.payload["epoch"], serde_json::json!(epoch));
+        assert_eq!(event.epoch, epoch, "the event says which run it is from");
+    }
+
+    #[test]
+    fn a_body_too_large_is_replaced_by_a_marker_that_says_so() {
+        let mut core = default_core("gc");
+        let huge = "x".repeat(MAX_EVENT_PAYLOAD_BYTES * 2);
+        emit_event(
+            &mut core,
+            "test/event",
+            serde_json::json!({ "blob": huge }),
+            Provenance::Human,
+        );
+        let recorded = core.events.last().expect("event");
+        assert_eq!(recorded.payload["truncated"], serde_json::json!(true));
+        assert!(
+            recorded.payload["original_bytes"].as_u64().unwrap_or(0)
+                > MAX_EVENT_PAYLOAD_BYTES as u64,
+            "the marker states the size it refused: {:?}",
+            recorded.payload
+        );
     }
 
     #[test]

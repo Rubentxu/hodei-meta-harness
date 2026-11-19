@@ -2,11 +2,20 @@
 //! socket. BOTH clients — the TUI and the CLI — speak exactly this
 //! contract; neither can boot a second controller because starting the
 //! supervisor is NOT part of the protocol.
+//!
+//! The contract is VERSIONED. Version 2 changed the shape of the event
+//! page and of the event itself: a client that does not check the
+//! version would read a hole in the history as if it were the whole
+//! history, so every response carries the version it was produced with.
 
 use serde::{Deserialize, Serialize};
 
 use run::run::Phase;
 use run::runtime::{ObjectiveReport, RuntimeIdentity};
+
+/// The version of this contract. A client that reads a different
+/// version refuses the answer instead of guessing what it means.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What a client may ask the supervisor to do. These are the SAME actions
 /// the CLI documents; the TUI only renders keys for them.
@@ -33,8 +42,14 @@ pub enum Request {
     Snapshot,
     /// Events with sequence number >= `since` (poll model: reconnecting
     /// clients replay from their last seen sequence).
+    ///
+    /// `limit` asks for a smaller page. It is optional: a client that
+    /// does not send one gets the default page, and the page it gets is
+    /// never larger than the answer the supervisor is willing to send.
     Events {
         since: u64,
+        #[serde(default)]
+        limit: Option<u32>,
     },
     Action {
         action: SupervisorAction,
@@ -55,20 +70,73 @@ pub struct ActionOutcome {
 pub enum Response {
     Snapshot(Box<Snapshot>),
     Events {
+        protocol_version: u32,
         events: Vec<StructuredEvent>,
+        /// The CURSOR: the sequence number the client asks for to
+        /// continue. It never goes backwards.
         next_seq: u64,
+        /// The sequence number of the oldest event still retained.
+        oldest_seq: u64,
+        /// TRUE when the client asked for events that are no longer
+        /// retained: its history has a hole and the hole is announced.
+        history_lost: bool,
     },
-    Action(ActionOutcome),
+    Action {
+        protocol_version: u32,
+        outcome: ActionOutcome,
+    },
     Error {
+        protocol_version: u32,
         message: String,
     },
+}
+
+impl Response {
+    /// The version of the contract this answer was produced with.
+    pub fn protocol_version(&self) -> u32 {
+        match self {
+            Response::Snapshot(snapshot) => snapshot.protocol_version,
+            Response::Events {
+                protocol_version, ..
+            } => *protocol_version,
+            Response::Action {
+                protocol_version, ..
+            } => *protocol_version,
+            Response::Error {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+}
+
+/// One page of the event history, as it travels on the wire.
+///
+/// The page carries the CURSOR (`next_seq`), the oldest sequence still
+/// retained (`oldest_seq`) and whether the client asked for events that
+/// are gone (`history_lost`). A client that reconnects with an old
+/// cursor is TOLD that its history has a hole: a shorter answer with no
+/// notice is a lie about the log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventPage {
+    pub events: Vec<StructuredEvent>,
+    /// The sequence number the client asks for to continue.
+    pub next_seq: u64,
+    /// The sequence number of the oldest event still retained.
+    pub oldest_seq: u64,
+    /// TRUE when the events the client asked for are no longer retained.
+    pub history_lost: bool,
 }
 
 /// Structured ACP-derived event with provenance and a monotonic sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredEvent {
     pub seq: u64,
+    /// The run this event belongs to. The sequence says WHEN; the epoch
+    /// says to WHICH run.
+    pub epoch: u64,
     pub kind: String,
+    /// The typed body of the event. It keeps its structure: a client does
+    /// not have to parse text to know what the event said.
     pub payload: serde_json::Value,
     pub provenance: crate::provenance::Provenance,
 }
@@ -89,6 +157,8 @@ pub enum ResourceObservation {
 /// action confirmation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// The version of the contract this projection belongs to.
+    pub protocol_version: u32,
     pub project: String,
     pub phase: Phase,
     /// Whether the supervisor loop is paused (Start/Stop are run-level;
@@ -149,8 +219,52 @@ mod tests {
     }
 
     #[test]
+    fn an_events_request_without_a_limit_is_accepted() {
+        // A client of the previous version does not send a limit: the
+        // answer is still an answer.
+        let request: Request =
+            serde_json::from_str(r#"{"req":"events","since":3}"#).expect("parse");
+        assert_eq!(
+            request,
+            Request::Events {
+                since: 3,
+                limit: None
+            }
+        );
+    }
+
+    #[test]
+    fn every_response_states_the_version_of_the_contract() {
+        let responses = vec![
+            Response::Events {
+                protocol_version: PROTOCOL_VERSION,
+                events: Vec::new(),
+                next_seq: 1,
+                oldest_seq: 0,
+                history_lost: false,
+            },
+            Response::Action {
+                protocol_version: PROTOCOL_VERSION,
+                outcome: ActionOutcome {
+                    action: SupervisorAction::Pause,
+                    applied: true,
+                    detail: "paused".into(),
+                },
+            },
+            Response::Error {
+                protocol_version: PROTOCOL_VERSION,
+                message: "boom".into(),
+            },
+        ];
+        for response in responses {
+            assert_eq!(response.protocol_version(), PROTOCOL_VERSION);
+        }
+    }
+
+    #[test]
     fn unknown_telemetry_survives_the_wire_as_unknown() {
         let snapshot = Snapshot {
+            protocol_version: PROTOCOL_VERSION,
             project: "gc".into(),
             phase: Phase::Running,
             paused: false,

@@ -95,13 +95,10 @@ impl Controller {
     async fn start(tag: &str, rehearsal: bool) -> Self {
         let socket = socket_path(tag);
         let mut command = Command::new(BIN);
-        command.args([
-            "supervisor",
-            "--socket",
-            &socket,
-            "--project",
-            "cli-project",
-        ]);
+        // The project is the IDENTITY of the controller: one per project.
+        // The tests run concurrently, so each one owns its own.
+        let project = format!("cli-{tag}");
+        command.args(["supervisor", "--socket", &socket, "--project", &project]);
         if rehearsal {
             command.arg("--rehearsal");
         }
@@ -206,7 +203,7 @@ async fn every_public_supervisor_command_still_answers() {
 
     let (code, stdout, stderr) = capture(&["sup-status", "--socket", &socket]).await;
     assert_eq!(code, 0, "sup-status answers: {stdout}{stderr}");
-    assert!(stdout.contains("project: cli-project"), "{stdout}");
+    assert!(stdout.contains("project: cli-surface"), "{stdout}");
 
     let (code, stdout, stderr) = capture(&["sup-action", "start", "--socket", &socket]).await;
     assert_eq!(code, 0, "sup-action start answers: {stdout}{stderr}");

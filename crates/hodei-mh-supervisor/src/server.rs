@@ -3,9 +3,14 @@
 //!
 //! Ownership is ENFORCED, not documented:
 //! - A LIVE supervisor owns its socket: a second supervisor NEVER steals
-//!   it. `bind` refuses with [`ServerError::AlreadyRunning`].
+//!   it. The decision is an EXCLUSIVE LOCK taken by the kernel, not a
+//!   probe that races with the binding.
+//! - A LIVE supervisor owns its PROJECT identity: a second controller for
+//!   the same project is refused even if it uses another socket.
 //! - A STALE socket file (left by a crashed supervisor) is removed and
-//!   reused, so a crash never blocks a restart.
+//!   reused, so a crash never blocks a restart. A file at the socket
+//!   path that is NOT a socket is never removed: the controller refuses
+//!   to start instead of deleting what the operator put there.
 //! - The socket file is removed on shutdown ONLY if it is still the file
 //!   this process bound (device+inode identity), so a supervisor that
 //!   exits never deletes a successor's socket.
@@ -15,16 +20,81 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 
 use crate::engine::{self, SupervisorCore};
-use crate::protocol::{Request, Response, SupervisorAction};
+use crate::lock::{IdentityLock, LockError};
+use crate::paths;
+use crate::protocol::{PROTOCOL_VERSION, Request, Response, SupervisorAction};
 
 /// How long a runtime has to CONFIRM an objective it accepted. A runtime
 /// that never answers would leave the run in `Starting` forever; the
 /// deadline turns that into an explicit, visible failure.
 pub const CONFIRMATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How many bytes one request line may weigh. A client that never ends
+/// its line is cut off here instead of filling the memory of the host.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// How many bytes one answer may weigh. An answer that does not fit is
+/// cut down to what fits, and the cursor says where to continue.
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// How long the supervisor waits for a client to read its answer. A
+/// client that never reads is dropped: it must not hold the others.
+pub const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a connection may stay silent. A client that connects and
+/// says nothing does not keep a task alive forever.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How many clients may be connected at the same time.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How many times the request limit the supervisor is willing to
+/// discard before it gives up on a client that does not stop sending.
+const DRAIN_FACTOR: usize = 4;
+
+/// How long the supervisor waits for the rest of an abusive request.
+///
+/// The refusal has ALREADY been written; this window only exists so the
+/// client can read it. A socket closed while data is still unread in
+/// its queue is RESET, and the client would lose the answer that says
+/// why it was refused.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+/// The bounds of the control surface.
+///
+/// They are explicit so a caller (and a test) can see what it is
+/// accepting: the product uses [`Limits::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// How many bytes one request line may weigh.
+    pub max_request_bytes: usize,
+    /// How many bytes one answer may weigh.
+    pub max_response_bytes: usize,
+    /// How long the supervisor waits for a client to read its answer.
+    pub write_deadline: Duration,
+    /// How long a connection may stay silent.
+    pub idle_timeout: Duration,
+    /// How many clients may be connected at the same time.
+    pub max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: MAX_REQUEST_BYTES,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            write_deadline: WRITE_DEADLINE,
+            idle_timeout: IDLE_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
 
 /// The in-flight execution, so a Stop can cancel it.
 type Pending = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
@@ -56,8 +126,18 @@ pub enum ServerError {
         path: String,
         source: std::io::Error,
     },
-    #[error("a supervisor is already listening on {path}: refusing to start a second controller")]
-    AlreadyRunning { path: String },
+    #[error(
+        "a supervisor is already listening on {path}: refusing to start a second controller{holder}"
+    )]
+    AlreadyRunning { path: String, holder: String },
+    #[error(
+        "another controller already serves the project '{project}': refusing to start a second controller{detail}"
+    )]
+    ProjectBusy { project: String, detail: String },
+    #[error("{path} is not a socket: refusing to remove it and to start")]
+    SocketPathOccupied { path: String },
+    #[error("cannot lock {path}: {detail}")]
+    Lock { path: String, detail: String },
 }
 
 pub type SharedCore = Arc<Mutex<SupervisorCore>>;
@@ -89,24 +169,152 @@ pub fn unlink_if_owned(path: &Path, ours: FileIdentity) -> bool {
     }
 }
 
-/// Bind the control socket.
+/// A socket that is BOUND and OWNED: the listener, the identity of the
+/// project it serves and the two locks that make that ownership atomic.
 ///
-/// A socket file that nobody listens on is stale garbage and is removed.
-/// A socket file that IS being listened on belongs to a live supervisor:
-/// binding is REFUSED (a second controller would split the state).
-pub async fn bind(path: &str) -> Result<UnixListener, ServerError> {
-    let socket_path = PathBuf::from(path);
-    if socket_path.exists() && supervisor_is_alive(&socket_path).await {
-        return Err(ServerError::AlreadyRunning {
-            path: path.to_string(),
-        });
+/// The locks live as long as this value: dropping it releases them, and
+/// the kernel releases them when the process dies.
+#[derive(Debug)]
+pub struct BoundSocket {
+    listener: UnixListener,
+    socket_path: PathBuf,
+    project: String,
+    /// The file this controller bound, as it was when it bound it. The
+    /// identity is RECORDED, not looked up when the controller stops:
+    /// by then the file at the path may be a successor's socket.
+    identity: Option<FileIdentity>,
+    _project_lock: IdentityLock,
+    _socket_lock: IdentityLock,
+}
+
+impl Drop for BoundSocket {
+    /// Remove the socket file ONLY if it is still the one this
+    /// controller bound.
+    ///
+    /// A clean shutdown leaves no name behind. A crash leaves the file
+    /// (nobody runs this code) and the next controller takes it over. A
+    /// successor that already replaced the file keeps its own socket: the
+    /// identity says whose file it is.
+    fn drop(&mut self) {
+        let Some(ours) = self.identity else {
+            return;
+        };
+        let _ = unlink_if_owned(&self.socket_path, ours);
     }
-    // Stale file from a crashed supervisor: remove it and take over.
-    let _ = std::fs::remove_file(&socket_path);
-    UnixListener::bind(&socket_path).map_err(|source| ServerError::Bind {
-        path: path.to_string(),
+}
+
+impl BoundSocket {
+    /// The path this controller serves.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// The project this controller serves.
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// The listener, for the rare caller that needs it.
+    pub fn listener(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
+/// Bind the control socket for `project`.
+///
+/// OWNERSHIP is decided by EXCLUSIVE LOCKS, not by the presence of a
+/// name:
+///
+/// - the PROJECT lock makes "one controller per project" an atomic fact;
+/// - the SOCKET lock makes "one owner of this path" an atomic fact.
+///
+/// A socket file that nobody listens on is stale garbage and is reused.
+/// A file at the path that is NOT a socket is refused and NEVER removed:
+/// deleting what the operator put there is not this controller's
+/// decision.
+pub async fn bind(socket: &str, project: &str) -> Result<BoundSocket, ServerError> {
+    let socket_path = PathBuf::from(socket);
+    // The private runtime directory exists BEFORE any lock is taken: a
+    // lock file in a directory that somebody else could write to would
+    // not be an ownership at all.
+    paths::ensure_runtime_dirs().map_err(|source| ServerError::Lock {
+        path: paths::runtime_root().display().to_string(),
+        detail: source.to_string(),
+    })?;
+    // The locks live in the PRIVATE runtime directory of the user, never
+    // next to the socket: the socket may be in a shared directory.
+    let project_lock =
+        IdentityLock::acquire(&paths::project_lock(project), project).map_err(|error| {
+            ServerError::ProjectBusy {
+                project: project.to_string(),
+                detail: holder_detail(&error),
+            }
+        })?;
+    let socket_lock =
+        IdentityLock::acquire(&paths::socket_lock(&socket_path), project).map_err(|error| {
+            match error {
+                LockError::Held { holder, .. } => ServerError::AlreadyRunning {
+                    path: socket.to_string(),
+                    holder,
+                },
+                other => ServerError::Lock {
+                    path: socket.to_string(),
+                    detail: other.to_string(),
+                },
+            }
+        })?;
+    // Only now that the ownership is ours may the path be touched.
+    if socket_path.exists() {
+        if !is_socket(&socket_path) {
+            return Err(ServerError::SocketPathOccupied {
+                path: socket.to_string(),
+            });
+        }
+        if supervisor_is_alive(&socket_path).await {
+            return Err(ServerError::AlreadyRunning {
+                path: socket.to_string(),
+                holder: String::new(),
+            });
+        }
+        // Stale file from a crashed supervisor: remove it and take over.
+        // Only a SOCKET is ever removed here.
+        let _ = std::fs::remove_file(&socket_path);
+    }
+    let listener = UnixListener::bind(&socket_path).map_err(|source| ServerError::Bind {
+        path: socket.to_string(),
         source,
+    })?;
+    // The socket is readable and writable by its owner only: the mode of
+    // the file is the first layer of the trust boundary.
+    let _ = std::fs::set_permissions(
+        &socket_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    );
+    let identity = identity_of(&socket_path);
+    Ok(BoundSocket {
+        listener,
+        socket_path,
+        project: project.to_string(),
+        identity,
+        _project_lock: project_lock,
+        _socket_lock: socket_lock,
     })
+}
+
+/// Whether the file at `path` is a socket.
+fn is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    std::fs::metadata(path)
+        .map(|meta| meta.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+/// What the lock file says about its holder, for a refusal that names it.
+fn holder_detail(error: &LockError) -> String {
+    match error {
+        LockError::Held { holder, .. } => holder.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// A supervisor is alive when its socket ACCEPTS a connection. A socket
@@ -133,27 +341,46 @@ async fn supervisor_is_alive(path: &Path) -> bool {
 /// the controller still serves its surface, but a Start is refused: the
 /// engine refuses it, because a run that nobody can execute is not a run.
 pub async fn serve(
-    listener: UnixListener,
+    bound: BoundSocket,
     core: SharedCore,
     runtime: Option<Arc<dyn ObjectiveRuntime>>,
+    limits: Limits,
 ) -> std::io::Result<()> {
     // The runtime the controller SERVES is the runtime its snapshot
     // NAMES: one writer, one fact. A core that claimed one runtime while
     // the server served another would accept a Start and never run it.
+    // The PROJECT is the same kind of fact: the identity the controller
+    // took the lock for is the project it serves.
     {
         let mut guard = lock_core(&core);
+        guard.project = bound.project().to_string();
         guard.runtime = runtime.as_ref().map(|runtime| runtime.identity());
     }
     let pending: Pending = Arc::new(Mutex::new(None));
+    let connections = Arc::new(Semaphore::new(limits.max_connections));
     let mut consecutive_errors = 0u32;
     loop {
-        match listener.accept().await {
+        match bound.listener.accept().await {
             Ok((stream, _addr)) => {
                 consecutive_errors = 0;
                 let core = core.clone();
                 let runtime = runtime.clone();
                 let pending = pending.clone();
-                tokio::spawn(handle_connection(stream, core, runtime, pending));
+                let connections = connections.clone();
+                tokio::spawn(async move {
+                    // The number of clients is bounded: a client that
+                    // opens thousands of connections does not make the
+                    // supervisor serve thousands of tasks.
+                    let permit = match connections.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let _ = refuse(stream, "too many clients are connected").await;
+                            return;
+                        }
+                    };
+                    let _permit = permit;
+                    let _ = handle_connection(stream, core, runtime, pending, limits).await;
+                });
             }
             Err(e) => {
                 // A transient accept failure (fd exhaustion, EINTR) must not
@@ -169,22 +396,124 @@ pub async fn serve(
     }
 }
 
+/// Tell a client that it may not stay, and close the connection.
+async fn refuse(stream: UnixStream, message: &str) -> std::io::Result<()> {
+    let response = Response::Error {
+        protocol_version: PROTOCOL_VERSION,
+        message: message.to_string(),
+    };
+    let mut payload = serde_json::to_string(&response).unwrap_or_default();
+    payload.push('\n');
+    let (_reader, mut writer) = stream.into_split();
+    writer.write_all(payload.as_bytes()).await
+}
+
+/// What one read of a connection produced.
+enum LineOutcome {
+    /// A complete line.
+    Line(String),
+    /// The client closed the connection.
+    Closed,
+    /// The line does not fit in the limit.
+    TooLong,
+}
+
+/// Read ONE line, refusing a line that does not fit in `limit`.
+///
+/// The buffer never grows past the limit: a client that sends an endless
+/// line is cut off instead of filling the memory of the host.
+async fn read_bounded_line(
+    reader: &mut BufReader<OwnedReadHalf>,
+    limit: usize,
+) -> std::io::Result<LineOutcome> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let (chunk, consumed, eof) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (Vec::new(), 0usize, true)
+            } else {
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(index) => (available[..index].to_vec(), index + 1, false),
+                    None => (available.to_vec(), available.len(), false),
+                }
+            }
+        };
+        if eof {
+            if line.is_empty() {
+                return Ok(LineOutcome::Closed);
+            }
+            return Ok(LineOutcome::Line(
+                String::from_utf8_lossy(&line).into_owned(),
+            ));
+        }
+        if line.len() + chunk.len() > limit {
+            return Ok(LineOutcome::TooLong);
+        }
+        let complete = consumed > chunk.len();
+        line.extend_from_slice(&chunk);
+        reader.consume(consumed);
+        if complete {
+            return Ok(LineOutcome::Line(
+                String::from_utf8_lossy(&line).into_owned(),
+            ));
+        }
+    }
+}
+
 async fn handle_connection(
     stream: UnixStream,
     core: SharedCore,
     runtime: Option<Arc<dyn ObjectiveRuntime>>,
     pending: Pending,
+    limits: Limits,
 ) -> std::io::Result<()> {
+    // The peer is authenticated BEFORE the stream is split: the
+    // credentials of a peer only live in the socket itself.
+    if !peer_is_ours(&stream) {
+        return Ok(());
+    }
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let line = match tokio::time::timeout(
+            limits.idle_timeout,
+            read_bounded_line(&mut reader, limits.max_request_bytes),
+        )
+        .await
+        {
+            Ok(Ok(LineOutcome::Line(line))) => line,
+            // The client said nothing for too long: the task ends.
+            Ok(Ok(LineOutcome::Closed)) | Err(_) => break,
+            Ok(Ok(LineOutcome::TooLong)) => {
+                let response = Response::Error {
+                    protocol_version: PROTOCOL_VERSION,
+                    message: format!(
+                        "the request exceeds the limit of {} bytes: refusing it",
+                        limits.max_request_bytes
+                    ),
+                };
+                write_answer(&mut writer, &response, limits).await?;
+                // The refusal is written; what the client keeps sending is
+                // discarded so the connection can be closed CLEANLY. A
+                // close with data still unread in the queue resets the
+                // socket, and the client would lose the answer that
+                // says why it was refused.
+                drain_input(
+                    &mut reader,
+                    limits.max_request_bytes.saturating_mul(DRAIN_FACTOR),
+                    DRAIN_GRACE,
+                )
+                .await;
+                break;
+            }
+            Ok(Err(error)) => return Err(error),
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let handled = respond_to_line(&core, &line);
-        let mut payload = serde_json::to_string(&handled.response).expect("response serializes");
-        payload.push('\n');
-        writer.write_all(payload.as_bytes()).await?;
+        let handled = respond_to_line(&core, &line, limits);
+        write_answer(&mut writer, &handled.response, limits).await?;
         // The runtime runs OUTSIDE the lock: the core is never held
         // across an await.
         match handled.follow_up {
@@ -202,6 +531,72 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Read and DISCARD what an abusive client keeps sending.
+///
+/// The answer has already been written. This only empties the pipe so
+/// the connection can be closed without resetting the socket: a reset
+/// takes the answer away from the client that is waiting for it.
+///
+/// The wait is bounded twice: by the number of bytes that are thrown
+/// away and by the silence of the client. A client that never stops
+/// sending is cut down; a client that stops is let go at once.
+async fn drain_input(reader: &mut BufReader<OwnedReadHalf>, limit: usize, grace: Duration) {
+    let mut discarded = 0usize;
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        match tokio::time::timeout(grace, reader.read(&mut buffer)).await {
+            // The client closed the connection: there is nothing left.
+            Ok(Ok(0)) => return,
+            Ok(Ok(count)) => {
+                discarded += count;
+                if discarded >= limit {
+                    return;
+                }
+            }
+            Ok(Err(_)) => return,
+            // The client stopped sending.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Write one answer, within the deadline and within the size limit.
+async fn write_answer(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+    limits: Limits,
+) -> std::io::Result<()> {
+    let mut payload = serde_json::to_string(response).unwrap_or_default();
+    payload.push('\n');
+    // A client that never reads must not hold the connection forever.
+    match tokio::time::timeout(limits.write_deadline, writer.write_all(payload.as_bytes())).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the client did not read the answer",
+        )),
+    }
+}
+
+/// Whether the peer of `stream` is the user this controller runs as.
+///
+/// On Linux the kernel reports the credentials of the peer; a peer that
+/// is somebody else is not served. On platforms without peer credentials
+/// the permissions of the socket file are the only layer.
+#[cfg(target_os = "linux")]
+fn peer_is_ours(stream: &UnixStream) -> bool {
+    match stream.peer_cred() {
+        Ok(credentials) => credentials.uid() == paths::current_uid(),
+        // The credentials could not be read: the peer is not served.
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_is_ours(_stream: &UnixStream) -> bool {
+    true
 }
 
 /// Hand the objective to the runtime and apply what it reports.
@@ -280,11 +675,12 @@ fn cancel_execution(pending: &Pending) {
 
 /// Turn one NDJSON line into its response. An unparseable line is an
 /// ERROR response, never a silent snapshot.
-fn respond_to_line(core: &SharedCore, line: &str) -> Handled {
+fn respond_to_line(core: &SharedCore, line: &str, limits: Limits) -> Handled {
     match serde_json::from_str::<Request>(line) {
-        Ok(request) => respond(core, request),
+        Ok(request) => respond(core, request, limits),
         Err(e) => Handled {
             response: Response::Error {
+                protocol_version: PROTOCOL_VERSION,
                 message: format!("unparseable request: {e}"),
             },
             follow_up: FollowUp::Nothing,
@@ -311,20 +707,17 @@ fn lock_core(core: &SharedCore) -> MutexGuard<'_, SupervisorCore> {
 
 /// Answer one request against the shared core. The mutex lock is scoped
 /// tightly: pure decisions happen inside, only serialization outside.
-fn respond(core: &SharedCore, request: Request) -> Handled {
+fn respond(core: &SharedCore, request: Request, limits: Limits) -> Handled {
     let mut guard = lock_core(core);
     match request {
         Request::Snapshot => Handled {
             response: Response::Snapshot(Box::new(engine::snapshot(&guard))),
             follow_up: FollowUp::Nothing,
         },
-        Request::Events { since } => {
-            let (events, next_seq) = engine::events_since(&guard, since);
-            Handled {
-                response: Response::Events { events, next_seq },
-                follow_up: FollowUp::Nothing,
-            }
-        }
+        Request::Events { since, limit } => Handled {
+            response: events_response(&guard, since, limit, limits),
+            follow_up: FollowUp::Nothing,
+        },
         Request::Action { action } => {
             let starts = matches!(&action, SupervisorAction::Start { .. });
             let stops = matches!(&action, SupervisorAction::Stop);
@@ -345,10 +738,59 @@ fn respond(core: &SharedCore, request: Request) -> Handled {
                 FollowUp::Nothing
             };
             Handled {
-                response: Response::Action(outcome),
+                response: Response::Action {
+                    protocol_version: PROTOCOL_VERSION,
+                    outcome,
+                },
                 follow_up,
             }
         }
+    }
+}
+
+/// The page of events, cut down to what one answer may carry.
+///
+/// The page keeps its CURSOR: when events are dropped to fit, the cursor
+/// points at the first one that did NOT fit, so the client continues
+/// where the answer stopped instead of losing the middle of the log.
+fn events_response(
+    core: &SupervisorCore,
+    since: u64,
+    limit: Option<u32>,
+    limits: Limits,
+) -> Response {
+    let mut page = engine::events_since(core, since, limit);
+    loop {
+        let response = Response::Events {
+            protocol_version: PROTOCOL_VERSION,
+            events: page.events.clone(),
+            next_seq: page.next_seq,
+            oldest_seq: page.oldest_seq,
+            history_lost: page.history_lost,
+        };
+        let encoded = serde_json::to_string(&response).unwrap_or_default();
+        if encoded.len() <= limits.max_response_bytes {
+            return response;
+        }
+        if page.events.is_empty() {
+            // Even an empty page does not fit: the answer is an explicit
+            // refusal, never a silent truncation.
+            return Response::Error {
+                protocol_version: PROTOCOL_VERSION,
+                message: format!(
+                    "the answer does not fit in the limit of {} bytes",
+                    limits.max_response_bytes
+                ),
+            };
+        }
+        // Cut the page in half and try again: the cursor moves with it.
+        let keep = page.events.len() / 2;
+        page.events.truncate(keep);
+        page.next_seq = page
+            .events
+            .last()
+            .map(|event| event.seq + 1)
+            .unwrap_or(page.next_seq);
     }
 }
 
@@ -361,9 +803,9 @@ mod tests {
     #[test]
     fn unparseable_requests_get_error_not_silence() {
         let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
-        let handled = respond_to_line(&core, "garbage");
+        let handled = respond_to_line(&core, "garbage", Limits::default());
         match handled.response {
-            Response::Error { message } => assert!(
+            Response::Error { message, .. } => assert!(
                 message.contains("unparseable request"),
                 "real error expected, got {message}"
             ),
@@ -374,8 +816,25 @@ mod tests {
     #[test]
     fn a_valid_line_is_answered_with_its_response() {
         let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
-        let handled = respond_to_line(&core, r#"{"req":"snapshot"}"#);
+        let handled = respond_to_line(&core, r#"{"req":"snapshot"}"#, Limits::default());
         assert!(matches!(handled.response, Response::Snapshot(_)));
+    }
+
+    #[test]
+    fn every_answer_states_the_version_of_the_contract() {
+        let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
+        for line in [
+            r#"{"req":"snapshot"}"#,
+            r#"{"req":"events","since":0}"#,
+            r#"{"req":"action","action":{"action":"pause"}}"#,
+        ] {
+            let handled = respond_to_line(&core, line, Limits::default());
+            assert_eq!(
+                handled.response.protocol_version(),
+                PROTOCOL_VERSION,
+                "the answer of {line} states its version"
+            );
+        }
     }
 
     #[test]
@@ -388,9 +847,9 @@ mod tests {
                 revision: None,
             },
         };
-        let handled = respond(&core, request);
+        let handled = respond(&core, request, Limits::default());
         match handled.response {
-            Response::Action(outcome) => {
+            Response::Action { outcome, .. } => {
                 assert!(!outcome.applied, "a run nobody can execute is not a run");
                 assert!(
                     outcome.detail.contains("no runtime is wired"),
@@ -416,9 +875,9 @@ mod tests {
                 revision: None,
             },
         };
-        let handled = respond(&core, request);
+        let handled = respond(&core, request, Limits::default());
         match &handled.response {
-            Response::Action(outcome) => assert!(outcome.applied),
+            Response::Action { outcome, .. } => assert!(outcome.applied),
             other => panic!("expected action outcome, got {other:?}"),
         }
         // The run is STARTING: nothing has confirmed it yet.
@@ -443,7 +902,7 @@ mod tests {
             panic!("simulated panic while the lock was held");
         }));
         assert!(poisoned.is_err(), "the simulated panic must have happened");
-        let handled = respond(&core, Request::Snapshot);
+        let handled = respond(&core, Request::Snapshot, Limits::default());
         match handled.response {
             Response::Snapshot(snapshot) => assert!(
                 snapshot.degraded.is_some(),
