@@ -1,9 +1,11 @@
 ---
 id: TASK-38
 title: El run-probe no entrega la credencial del execd y su pipe-attach falla con 401
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@rubentxu'
 created_date: '2026-11-18T22:13:00Z'
+updated_date: '2026-11-19T22:56:00Z'
 labels:
   - descubrimiento
   - bug

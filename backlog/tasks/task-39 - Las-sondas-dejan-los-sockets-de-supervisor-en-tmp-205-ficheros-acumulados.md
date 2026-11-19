@@ -1,9 +1,11 @@
 ---
 id: TASK-39
 title: 'Las sondas dejan los sockets de supervisor en /tmp: 205 ficheros acumulados'
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@rubentxu'
 created_date: '2026-11-19T02:16:00Z'
+updated_date: '2026-11-19T22:56:00Z'
 labels:
   - descubrimiento
   - bug
