@@ -229,7 +229,7 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
             } else if core.run.as_ref().is_some_and(|run| {
                 // One exclusive controller: a run that is STARTING counts as
                 // in flight, or two controllers would share the state.
-                matches!(run.phase, Phase::Starting | Phase::Running)
+                run.is_live()
             }) {
                 outcome(
                     &action,
@@ -245,6 +245,9 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                 core.ticket = ticket.clone();
                 core.revision = revision.clone();
                 core.paused = false;
+                // The verdict of the PREVIOUS objective is not this run's
+                // verdict: a snapshot in `starting` must not show it.
+                core.objective = None;
                 outcome(
                     &action,
                     true,
@@ -258,13 +261,17 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
         SupervisorAction::Pause => {
             if core.paused {
                 outcome(&action, false, "already paused")
-            } else if core.run.as_ref().is_some_and(|r| r.phase == Phase::Running) {
+            } else if core
+                .run
+                .as_ref()
+                .is_some_and(|r| r.phase() == &Phase::Running)
+            {
                 core.paused = true;
                 outcome(&action, true, "prompt loop paused")
             } else if core
                 .run
                 .as_ref()
-                .is_some_and(|r| r.phase == Phase::Starting)
+                .is_some_and(|r| r.phase() == &Phase::Starting)
             {
                 outcome(
                     &action,
@@ -286,8 +293,8 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
         SupervisorAction::Stop => match core.run.as_mut() {
             // A run that is still starting is stopped too: nobody is left
             // waiting for a confirmation that will never arrive.
-            Some(run) if matches!(run.phase, Phase::Running | Phase::Starting) => {
-                let was_starting = run.phase == Phase::Starting;
+            Some(run) if run.is_live() => {
+                let was_starting = *run.phase() == Phase::Starting;
                 let cancelled = run.stop();
                 core.paused = false;
                 let detail = format!(
@@ -331,12 +338,32 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
 /// The confirmation carries the epoch of the run it belongs to: a late
 /// confirmation of a run that already ended can never confirm another
 /// one.
-pub fn confirm_runtime(core: &mut SupervisorCore, epoch: u64) -> Transition {
+pub fn confirm_runtime(
+    core: &mut SupervisorCore,
+    epoch: u64,
+    identity: &RuntimeIdentity,
+) -> Transition {
     if core.epoch != epoch {
         return Transition::refused(format!(
             "the confirmation belongs to another run (epoch {epoch}; the current run is {})",
             core.epoch
         ));
+    }
+    // The confirmation must come from the runtime the snapshot NAMES. A
+    // run confirmed by a runtime nobody was told about would let a
+    // rehearsal be presented as a live run.
+    match &core.runtime {
+        None => {
+            return Transition::refused("no runtime is wired: nothing can confirm the objective");
+        }
+        Some(named) if named != identity => {
+            return Transition::refused(format!(
+                "the confirmation comes from '{}' but this controller serves '{}'",
+                identity.label(),
+                named.label()
+            ));
+        }
+        Some(_) => {}
     }
     let Some(run) = core.run.as_mut() else {
         return Transition::refused("there is no run to confirm");
@@ -344,14 +371,15 @@ pub fn confirm_runtime(core: &mut SupervisorCore, epoch: u64) -> Transition {
     if !run.confirm() {
         return Transition::refused(format!(
             "the run is not starting (phase {:?}): it cannot be confirmed",
-            run.phase
+            run.phase()
         ));
     }
     emit_event(
         core,
         "objective/confirmed",
         serde_json::Value::String(format!(
-            "the runtime confirmed the objective (epoch {epoch})"
+            "the runtime confirmed the objective (epoch {epoch}; {})",
+            identity.label()
         )),
         // The confirmation comes from the runtime, not from a person.
         Provenance::Automatic {
@@ -379,10 +407,7 @@ pub fn record_outcome(
     }
     // The outcome belongs to a LIVE run: a run that was stopped or
     // dropped does not get a verdict afterwards.
-    let live = core
-        .run
-        .as_ref()
-        .is_some_and(|run| matches!(run.phase, Phase::Starting | Phase::Running));
+    let live = core.run.as_ref().is_some_and(|run| run.is_live());
     if !live {
         return Transition::refused("the run is no longer live: the outcome is not recorded");
     }
@@ -428,7 +453,7 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
         phase: core
             .run
             .as_ref()
-            .map(|r| r.phase.clone())
+            .map(|r| r.phase().clone())
             .unwrap_or(Phase::Idle),
         paused: core.paused,
         ticket: core.ticket.clone(),
@@ -491,7 +516,10 @@ mod tests {
         );
         assert!(start.applied, "{}", start.detail);
         let epoch = core.epoch;
-        assert_eq!(confirm_runtime(core, epoch), Transition::Applied);
+        assert_eq!(
+            confirm_runtime(core, epoch, &RuntimeIdentity::rehearsal("trial")),
+            Transition::Applied
+        );
         epoch
     }
 
@@ -530,16 +558,19 @@ mod tests {
         assert!(start.applied);
         // STARTING: nothing has confirmed that the work began.
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Starting)
         );
         assert_eq!(core.ticket.as_deref(), Some("TASK-9"));
 
         // The confirmation is what makes it running.
         let epoch = core.epoch;
-        assert_eq!(confirm_runtime(&mut core, epoch), Transition::Applied);
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            confirm_runtime(&mut core, epoch, &RuntimeIdentity::rehearsal("trial")),
+            Transition::Applied
+        );
+        assert_eq!(
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Running)
         );
     }
@@ -551,11 +582,11 @@ mod tests {
         // A late confirmation of a run that already ended must never
         // confirm the next one.
         assert!(matches!(
-            confirm_runtime(&mut core, 99),
+            confirm_runtime(&mut core, 99, &RuntimeIdentity::rehearsal("trial")),
             Transition::Refused { .. }
         ));
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Running)
         );
     }
@@ -684,7 +715,7 @@ mod tests {
         assert!(!pause.applied);
 
         let epoch = core.epoch;
-        confirm_runtime(&mut core, epoch);
+        confirm_runtime(&mut core, epoch, &RuntimeIdentity::rehearsal("trial"));
         let pause = apply(&mut core, SupervisorAction::Pause);
         assert!(pause.applied);
         assert_eq!(
@@ -719,7 +750,7 @@ mod tests {
             stop.detail
         );
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Stopped)
         );
     }
@@ -819,7 +850,7 @@ mod tests {
         assert!(stop.applied);
         assert!(stop.detail.contains("git bundle written to staging"));
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Stopped)
         );
     }
@@ -864,7 +895,7 @@ mod tests {
         // The objective is untouched by the viewer leaving.
         assert_eq!(core.terminal_viewers, 0);
         assert_eq!(
-            core.run.as_ref().map(|r| r.phase.clone()),
+            core.run.as_ref().map(|r| r.phase().clone()),
             Some(Phase::Running)
         );
 

@@ -137,6 +137,28 @@ moves. A `Start` without a ticket lets the rehearsal pick the next
 eligible work from its scenario, in the same reproducible order the
 tracker uses.
 
+### What changed for the clients
+
+The command names and their flags are unchanged (`supervisor`,
+`sup-status`, `sup-action start|pause|resume|stop|renew`, `sup-events`,
+`attach-terminal`, `tui`), but what they ANSWER changed, and a client that
+matches on the old answers has to be told:
+
+- **A `Start` no longer means `running`.** The run is `starting (awaiting
+  the runtime's confirmation)` until the runtime confirms it, and only
+  then `running`. A controller without a runtime never confirms anything:
+  its `Start` is refused with `no runtime is wired` and the command exits
+  with 1, where it used to report a running run.
+- **The snapshot's phase vocabulary gained `starting`**, and the snapshot
+  gained two additive fields: `runtime` (which runtime the controller
+  has, and its kind) and `objective` (the verdict of the last objective).
+  Both are optional on the wire: an older snapshot still parses.
+- **Two answers were reworded.** `sup-action` now says `the supervisor
+  applied it` where it said `confirmation is real`, and a refused second
+  `Start` now says `a run is already in flight: not a second controller`
+  where it said `already running: not a second controller`. The refusal
+  is still a refusal: the command exits with 1 and nothing was executed.
+
 ## The trust boundary
 
 Every sandbox runs in a network of its own, and the boundary is verified

@@ -55,11 +55,16 @@ pub struct PendingResponse {
     pub event_kind: String,
 }
 
+/// The run's state. Its phase is PRIVATE on purpose: `Running` is
+/// reachable only through `confirm`, and a public field would let any
+/// holder of the state declare a run running without a runtime having
+/// answered. The state is also NOT deserializable: a phase that arrived
+/// from the wire would be a phase nobody confirmed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunState {
     pub grant: Grant,
     pub session_id: String,
-    pub phase: Phase,
+    phase: Phase,
     /// Responses and effects awaiting delivery — invalidated by stop.
     pub pending: Vec<PendingResponse>,
     /// Effects already sent to the outside world; stop cannot undo these,
@@ -70,6 +75,17 @@ pub struct RunState {
 }
 
 impl RunState {
+    /// The phase the run is in.
+    pub fn phase(&self) -> &Phase {
+        &self.phase
+    }
+
+    /// Whether the run is still in flight: STARTING counts as in flight,
+    /// because a run that nobody confirmed yet still owns the session.
+    pub fn is_live(&self) -> bool {
+        matches!(self.phase, Phase::Starting | Phase::Running)
+    }
+
     /// The run is REQUESTED: the session is bound to the grant's identity,
     /// but no runtime has confirmed it yet. `Phase::Running` is reachable
     /// ONLY through `confirm`.

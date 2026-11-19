@@ -17,11 +17,14 @@ const BIN: &str = env!("CARGO_BIN_EXE_hodei-mh");
 
 /// A socket path of this test's own: two runs never share one.
 fn socket_path(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
     std::env::temp_dir()
         .join(format!(
-            "hodei-cli-{tag}-{}-{}.sock",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            "hodei-cli-{tag}-{}-{nanos}.sock",
+            std::process::id()
         ))
         .to_string_lossy()
         .to_string()
@@ -61,6 +64,26 @@ async fn wait_for(socket: &str, needle: &str) -> String {
     }
 }
 
+/// Wait until the supervisor's event log contains `needle`.
+///
+/// The verdict of an objective is recorded after its confirmation, so a
+/// test that reads the log the moment the run is `running` would be
+/// racing. This waits for the event itself.
+async fn wait_for_event(socket: &str, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (code, stdout, stderr) = capture(&["sup-events", "--socket", socket]).await;
+        if code == 0 && stdout.contains(needle) {
+            return stdout;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor never recorded '{needle}'; last answer was: {stdout}{stderr}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// The controller under test. It is killed when the test ends, however
 /// it ends: a controller left running would own its socket forever.
 struct Controller {
@@ -69,17 +92,20 @@ struct Controller {
 }
 
 impl Controller {
-    async fn start(tag: &str) -> Self {
+    async fn start(tag: &str, rehearsal: bool) -> Self {
         let socket = socket_path(tag);
-        let child = Command::new(BIN)
-            .args([
-                "supervisor",
-                "--socket",
-                &socket,
-                "--project",
-                "cli-project",
-                "--rehearsal",
-            ])
+        let mut command = Command::new(BIN);
+        command.args([
+            "supervisor",
+            "--socket",
+            &socket,
+            "--project",
+            "cli-project",
+        ]);
+        if rehearsal {
+            command.arg("--rehearsal");
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -99,7 +125,7 @@ impl Drop for Controller {
 
 #[tokio::test]
 async fn the_cli_reaches_running_only_through_the_runtime_confirmation() {
-    let controller = Controller::start("flow").await;
+    let controller = Controller::start("flow", true).await;
     let socket = controller.socket.clone();
 
     // The controller says WHICH runtime it has before anything runs: a
@@ -138,11 +164,13 @@ async fn the_cli_reaches_running_only_through_the_runtime_confirmation() {
         "a rehearsal never passes for a live run: {running}"
     );
 
-    // And the rehearsal closed nothing: the objective says so.
-    let (_, objective_out, _) = capture(&["sup-events", "--socket", &socket]).await;
+    // And the rehearsal closed nothing: the objective says so. The
+    // verdict is recorded AFTER the confirmation, so the test waits for
+    // the event instead of racing it.
+    let events = wait_for_event(&socket, "objective/outcome").await;
     assert!(
-        objective_out.contains("nothing was closed"),
-        "the rehearsal publishes nothing: {objective_out}"
+        events.contains("nothing was closed"),
+        "the rehearsal publishes nothing: {events}"
     );
 }
 
@@ -151,25 +179,8 @@ async fn a_controller_without_a_runtime_refuses_to_start_instead_of_pretending()
     // Without `--rehearsal` there is NO runtime: the real ACP runtime
     // arrives with the ACP slice. The controller must refuse the Start
     // rather than pretend a run began.
-    let socket = socket_path("noruntime");
-    let child = Command::new(BIN)
-        .args([
-            "supervisor",
-            "--socket",
-            &socket,
-            "--project",
-            "cli-project",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn the supervisor");
-    let controller = Controller {
-        child,
-        socket: socket.clone(),
-    };
+    let controller = Controller::start("noruntime", false).await;
+    let socket = controller.socket.clone();
 
     let idle = wait_for(&socket, "phase: idle").await;
     assert!(
@@ -183,5 +194,57 @@ async fn a_controller_without_a_runtime_refuses_to_start_instead_of_pretending()
         stdout.contains("refused") && stdout.contains("no runtime is wired"),
         "the refusal names its reason: {stdout}{stderr}"
     );
-    drop(controller);
+}
+
+/// Every public command of the supervisor still answers (AC-4: the
+/// public surface is preserved, or the migration is documented).
+#[tokio::test]
+async fn every_public_supervisor_command_still_answers() {
+    let controller = Controller::start("surface", true).await;
+    let socket = controller.socket.clone();
+    wait_for(&socket, "phase: idle").await;
+
+    let (code, stdout, stderr) = capture(&["sup-status", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-status answers: {stdout}{stderr}");
+    assert!(stdout.contains("project: cli-project"), "{stdout}");
+
+    let (code, stdout, stderr) = capture(&["sup-action", "start", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-action start answers: {stdout}{stderr}");
+    wait_for(&socket, "phase: running").await;
+
+    let (code, stdout, stderr) = capture(&["sup-action", "pause", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-action pause answers: {stdout}{stderr}");
+    assert!(stdout.contains("applied"), "{stdout}");
+
+    let (code, stdout, stderr) = capture(&["sup-action", "resume", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-action resume answers: {stdout}{stderr}");
+    assert!(stdout.contains("applied"), "{stdout}");
+
+    let (code, stdout, stderr) = capture(&["sup-events", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-events answers: {stdout}{stderr}");
+    assert!(stdout.contains("supervisor/action"), "{stdout}");
+
+    let (code, stdout, stderr) = capture(&[
+        "attach-terminal",
+        "--socket",
+        &socket,
+        "--exit-after-events",
+        "1",
+        "--deadline-seconds",
+        "30",
+    ])
+    .await;
+    assert_eq!(code, 0, "attach-terminal answers: {stdout}{stderr}");
+    assert!(stdout.contains("[viewer]"), "{stdout}");
+
+    let (code, stdout, stderr) = capture(&["tui", "--socket", &socket, "--frames", "2"]).await;
+    assert_eq!(code, 0, "tui answers: {stdout}{stderr}");
+    assert!(
+        stdout.contains("phase:"),
+        "the TUI renders the state: {stdout}"
+    );
+
+    let (code, stdout, stderr) = capture(&["sup-action", "stop", "--socket", &socket]).await;
+    assert_eq!(code, 0, "sup-action stop answers: {stdout}{stderr}");
+    assert!(stdout.contains("applied"), "{stdout}");
 }

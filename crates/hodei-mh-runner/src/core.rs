@@ -92,9 +92,16 @@ impl GoalRunner {
     /// Execute one objective: the agent works, the verifier judges, and
     /// only a verified candidate is published.
     ///
-    /// The gate is here, not in the ports: an objective whose evidence
-    /// does not cover every required check is NOT published, whatever the
+    /// The gate is here, not in the ports: an objective whose verification
+    /// does not cover EVERY required check is NOT published, whatever the
     /// publisher would have done with it.
+    ///
+    /// The gate is about the CHECKS, not about the evidence set: the
+    /// rehearsal's verifier states a verdict without measuring anything —
+    /// it has no evidence to show, and it says so — but the verdict is
+    /// still a verdict. The evidence-bound gate, where a check counts
+    /// only when valid and passing evidence exists for it, belongs to the
+    /// live verifier of MH-A06, which really observes the work.
     pub async fn execute(&self, objective: &Objective) -> ObjectiveOutcome {
         let candidate = match self.agent.execute(objective).await {
             Ok(candidate) => candidate,
@@ -114,7 +121,8 @@ impl GoalRunner {
         };
         let required = objective.required();
         if !verification.covers(&required) {
-            // No evidence, no effect: the objective did not hold.
+            // A check that did not hold: the objective is rejected and
+            // the publisher is never called.
             return ObjectiveOutcome::Rejected {
                 work_ref: objective.work_ref.clone(),
                 reason: format!(

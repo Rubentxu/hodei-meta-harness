@@ -58,10 +58,10 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
         None
     };
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new({
-        let mut core = match &runtime {
-            Some(runtime) => engine::core_with_runtime(project.clone(), runtime.identity()),
-            None => engine::default_core(project.clone()),
-        };
+        // The runtime is NOT declared here: the server that serves it
+        // writes it into the core, so the runtime the snapshot names and
+        // the runtime that executes are the same fact, not two.
+        let mut core = engine::default_core(project.clone());
         // The boot decision is the supervisor's own: logged with automatic
         // provenance (AC-4: automatic decisions state their rule).
         engine::emit_event(
@@ -362,9 +362,10 @@ pub fn simulated_snapshot() -> Snapshot {
         paused: false,
         ticket: Some("TASK-17".into()),
         revision: Some("0f3e91c".into()),
-        resources: ResourceObservation::Measured {
-            cpus: 1.5,
-            memory_gib: 2.0,
+        // The simulated state measured nothing: it says UNKNOWN, the
+        // same way a real supervisor says it when it has no telemetry.
+        resources: ResourceObservation::Unknown {
+            reason: "the simulated state measured nothing".into(),
         },
         context_available: true,
         wait_reason: None,
@@ -391,8 +392,8 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
         StructuredEvent {
             seq: 2,
             kind: "telemetry/resources".into(),
-            payload: serde_json::Value::String("cpus=1.5 memory_gib=2".into()),
-            provenance: supervisor::protocol::Provenance::Telemetry { unknown: false },
+            payload: serde_json::Value::String("the simulated state measured nothing".into()),
+            provenance: supervisor::protocol::Provenance::Telemetry { unknown: true },
         },
         StructuredEvent {
             seq: 3,

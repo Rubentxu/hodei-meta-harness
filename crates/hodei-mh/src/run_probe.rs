@@ -330,10 +330,10 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
     checks.push(Check {
         name: "the-run-is-running-only-after-the-agent-answered",
-        passed: run_state.phase == Phase::Running,
+        passed: run_state.phase() == &Phase::Running,
         detail: format!(
             "the run was STARTING until the agent answered the handshake; the phase after the real prompt turn is {:?}",
-            run_state.phase
+            run_state.phase()
         ),
     });
 

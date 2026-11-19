@@ -137,6 +137,13 @@ pub async fn serve(
     core: SharedCore,
     runtime: Option<Arc<dyn ObjectiveRuntime>>,
 ) -> std::io::Result<()> {
+    // The runtime the controller SERVES is the runtime its snapshot
+    // NAMES: one writer, one fact. A core that claimed one runtime while
+    // the server served another would accept a Start and never run it.
+    {
+        let mut guard = lock_core(&core);
+        guard.runtime = runtime.as_ref().map(|runtime| runtime.identity());
+    }
     let pending: Pending = Arc::new(Mutex::new(None));
     let mut consecutive_errors = 0u32;
     loop {
@@ -219,7 +226,7 @@ fn spawn_execution(
             Ok(Ok(objective)) => {
                 {
                     let mut guard = lock_core(&core);
-                    engine::confirm_runtime(&mut guard, epoch);
+                    engine::confirm_runtime(&mut guard, epoch, &runtime.identity());
                 }
                 // The objective ends on its own time; its verdict is
                 // recorded when it does.

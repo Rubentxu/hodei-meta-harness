@@ -187,12 +187,65 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The ERROR case of the objective itself, over the same real socket:
+/// a verification that does not hold rejects the objective, nothing is
+/// published, and the session ends with the reason visible.
+#[tokio::test]
+async fn an_objective_whose_verification_does_not_hold_is_rejected_and_ends_the_session() {
+    let path = temp_socket_path("rejected");
+    let listener = server::bind(&path).await.expect("bind");
+    let runtime = TrialRuntime::rejecting();
+    let recorder = runtime.recorder();
+    let core: Arc<Mutex<engine::SupervisorCore>> =
+        Arc::new(Mutex::new(engine::default_core("trial-project")));
+    let server_task = tokio::spawn(server::serve(
+        listener,
+        core.clone(),
+        Some(Arc::new(runtime)),
+    ));
+
+    let mut client = client::connect(&path).await.expect("connect");
+    let start = client
+        .action(SupervisorAction::Start {
+            project: "trial-project".into(),
+            ticket: None,
+            revision: None,
+        })
+        .await
+        .expect("start");
+    assert!(start.applied, "{}", start.detail);
+
+    // The verdict arrives: the objective did NOT hold.
+    let outcome = wait_for_objective(&mut client).await;
+    assert!(
+        matches!(outcome, ObjectiveOutcome::Rejected { .. }),
+        "{outcome:?}"
+    );
+    // A rejected objective ends the session, and the reason is visible.
+    wait_for_phase(&mut client, Phase::Stopped).await;
+    let snapshot = client.snapshot().await.expect("snapshot");
+    assert!(
+        snapshot
+            .objective
+            .as_ref()
+            .is_some_and(|report| matches!(report.outcome, ObjectiveOutcome::Rejected { .. })),
+        "the verdict is recorded: {:?}",
+        snapshot.objective
+    );
+    // Nothing was published: the gate held.
+    assert!(recorder.publications().is_empty());
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The rehearsal has no path to promote or to close a ticket.
 ///
-/// Its crate does not depend on ANY crate that can write outside this
-/// process — the promoter, the releaser or the workspace exporter — so
-/// there is no route from the rehearsal to a real effect. Its publisher
-/// holds no writer at all: it can only record.
+/// This crate declares no dependency on any crate that writes outside
+/// this process — the promoter, the releaser or the workspace exporter —
+/// and the rehearsal's publisher holds no writer at all: it can only
+/// record. The route to an effect does not exist because the ports that
+/// could carry one are declared HERE, and the tracker port is read-only.
 #[test]
 fn the_rehearsal_cannot_reach_the_promoter() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
