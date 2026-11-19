@@ -812,7 +812,9 @@ dependencies = [
 name = "hodei-mh-promote"
 version = "0.1.1"
 dependencies = [
+ "hodei-mh-coordinator",
  "hodei-mh-verify",
+ "hodei-mh-workspace",
  "serde",
  "serde_json",
  "thiserror",

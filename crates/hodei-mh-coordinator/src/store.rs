@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS effects (
     ticket_id TEXT NOT NULL,
     epoch INTEGER NOT NULL,
     description TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    payload TEXT,
+    outcome TEXT
 );";
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +74,7 @@ impl CoordinatorStore {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch(SCHEMA)?;
+        migrate_intent_columns(&conn)?;
         let store = Self {
             conn,
             project: project.to_string(),
@@ -162,6 +165,25 @@ impl CoordinatorStore {
     }
 }
 
+/// Add the columns an intent gained to the effects table of a database
+/// that was created before it carried facts and an outcome.
+///
+/// The schema of an existing file is NOT rewritten: the columns are added
+/// to it, and the rows that were there keep the facts they had (none).
+fn migrate_intent_columns(conn: &Connection) -> Result<(), StoreError> {
+    let columns: Vec<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(effects)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.flatten().collect()
+    };
+    for column in ["payload", "outcome"] {
+        if !columns.iter().any(|existing| existing == column) {
+            conn.execute(&format!("ALTER TABLE effects ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Read the committed state of a project.
 fn load_state(conn: &Connection, project: &str) -> Result<CoordinatorState, StoreError> {
     let mut state = CoordinatorState::new(project);
@@ -185,16 +207,21 @@ fn load_state(conn: &Connection, project: &str) -> Result<CoordinatorState, Stor
         let (ticket, epoch) = row?;
         state.epochs.insert(ticket, epoch);
     }
-    let mut stmt =
-        conn.prepare("SELECT effect_id, ticket_id, epoch, description, status FROM effects")?;
+    let mut stmt = conn.prepare(
+        "SELECT effect_id, ticket_id, epoch, description, status, payload, outcome FROM effects",
+    )?;
     let rows = stmt.query_map([], |row| {
         let status: String = row.get(4)?;
+        let payload: Option<String> = row.get(5)?;
+        let outcome: Option<String> = row.get(6)?;
         Ok(EffectIntent {
             effect_id: row.get(0)?,
             ticket_id: row.get(1)?,
             epoch: row.get::<_, i64>(2)? as u64,
             description: row.get(3)?,
             status: status_from_text(&status),
+            payload,
+            outcome,
         })
     })?;
     for effect in rows {
@@ -240,14 +267,16 @@ fn persist_delta(
     for (effect_id, effect) in &after.effects {
         if before.effects.get(effect_id) != Some(effect) {
             tx.execute(
-                "INSERT OR REPLACE INTO effects (effect_id, ticket_id, epoch, description, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO effects (effect_id, ticket_id, epoch, description, status, payload, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     effect.effect_id,
                     effect.ticket_id,
                     effect.epoch as i64,
                     effect.description,
-                    status_to_text(&effect.status)
+                    status_to_text(&effect.status),
+                    effect.payload,
+                    effect.outcome
                 ],
             )?;
         }
@@ -357,6 +386,70 @@ mod tests {
             store.uncertain_effects().unwrap(),
             vec!["e-pending".to_string()]
         );
+    }
+
+    #[test]
+    fn the_facts_of_an_intent_survive_the_crash() {
+        let db = temp_db("payload");
+        {
+            let mut store = CoordinatorStore::open("alpha", &db).unwrap();
+            let epoch = claim(&mut store, "T1", "client-a");
+            store
+                .transact(|state| {
+                    state
+                        .record_effect_with_payload(
+                            "promote:T1:1:abc",
+                            "T1",
+                            epoch,
+                            "promote the candidate",
+                            Some("{\"candidate\":\"abc\"}"),
+                        )
+                        .map(|r| r.may_run)
+                })
+                .unwrap();
+        } // "crash": the store is dropped
+
+        let mut store = CoordinatorStore::open("alpha", &db).unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(
+            state.effects["promote:T1:1:abc"].payload.as_deref(),
+            Some("{\"candidate\":\"abc\"}"),
+            "the facts of the intent are durable"
+        );
+        store
+            .transact(|state| Ok(state.settle_effect("promote:T1:1:abc", None, true)))
+            .unwrap();
+        let settled = store.load().unwrap();
+        assert_eq!(
+            settled.effects["promote:T1:1:abc"].status,
+            EffectStatus::Applied
+        );
+    }
+
+    #[test]
+    fn a_database_created_before_the_payload_survives_the_migration() {
+        let db = temp_db("migration");
+        // A database of the previous shape: the effects table has no
+        // payload column.
+        {
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE effects (
+                        effect_id TEXT PRIMARY KEY,
+                        ticket_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        description TEXT NOT NULL,
+                        status TEXT NOT NULL
+                    );
+                    INSERT INTO effects VALUES ('e1', 'T1', 1, 'write file', 'pending');",
+                )
+                .unwrap();
+        }
+        let store = CoordinatorStore::open("alpha", &db).unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.effects["e1"].payload, None);
+        assert_eq!(state.effects["e1"].description, "write file");
     }
 
     #[test]
