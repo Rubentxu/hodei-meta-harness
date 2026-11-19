@@ -870,8 +870,10 @@ dependencies = [
  "async-trait",
  "futures-util",
  "hodei-mh-run",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
 ]

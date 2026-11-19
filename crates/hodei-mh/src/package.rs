@@ -65,8 +65,8 @@ restricted-egress proxy for sandboxes (see docs/profiles.md).
     PORT=8081 hodei-mh-lifecycle-server &
     hodei-mh doctor --profile rust          # read-only checks + gate
     hodei-mh profile-run --profile rust --project /path/to/project
-    hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock &
-    hodei-mh sup-status && hodei-mh tui     # observe and drive
+    hodei-mh supervisor &                   # the control socket lives in
+    hodei-mh sup-status && hodei-mh tui     # the private runtime dir
 
 No other components are required: no Continuum, no Herdr, no native
 plugins. Everything above is demonstrated by the repository's E2E probes.

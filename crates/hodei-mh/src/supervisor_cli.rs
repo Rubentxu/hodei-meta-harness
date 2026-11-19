@@ -9,11 +9,19 @@ use std::time::Duration;
 use hodei_mh_run::runtime::ObjectiveRuntime;
 use supervisor::client;
 use supervisor::engine;
+use supervisor::paths;
 use supervisor::protocol::{ResourceObservation, Snapshot, StructuredEvent, SupervisorAction};
 use supervisor::render::{render_event, render_snapshot};
 use supervisor::server;
 
-pub const DEFAULT_SOCKET: &str = "/tmp/hodei-mh-supervisor.sock";
+/// The control socket a client uses when the caller names none.
+///
+/// It lives in the PRIVATE runtime directory of the user, not in the
+/// shared temporary directory: the path of the old default could be
+/// taken over by any local user.
+pub fn default_socket() -> String {
+    paths::default_socket().to_string_lossy().into_owned()
+}
 
 fn flag(args: &[String], name: &str, default: &str) -> String {
     args.iter()
@@ -39,11 +47,14 @@ fn opt_flag(args: &[String], name: &str) -> Option<String> {
 /// controller has NO runtime and refuses to start, because a run nobody
 /// can execute is not a run.
 pub async fn run_supervisor(args: &[String]) -> i32 {
-    let socket = flag(args, "--socket", DEFAULT_SOCKET);
+    let socket = flag(args, "--socket", &default_socket());
     let project = flag(args, "--project", "hodei-mh");
     let rehearsal = args.iter().any(|a| a == "--rehearsal");
-    let listener = match server::bind(&socket).await {
-        Ok(listener) => listener,
+    // The identity of this controller is the project it serves, and the
+    // path it serves: both are taken as EXCLUSIVE locks, so a second
+    // controller can never assume either of them.
+    let bound = match server::bind(&socket, &project).await {
+        Ok(bound) => bound,
         Err(e) => {
             eprintln!("cannot bind supervisor socket: {e}");
             return 1;
@@ -136,7 +147,7 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // to it, and its confirmation is what moves the run to `Running`.
     // Serving without it would accept the Start and leave the run in
     // `Starting` forever.
-    let served = server::serve(listener, core, runtime).await;
+    let served = server::serve(bound, core, runtime, server::Limits::default()).await;
     if let Some(identity) = owned_socket {
         server::unlink_if_owned(std::path::Path::new(&socket), identity);
     }
@@ -175,7 +186,7 @@ fn parse_action(args: &[String], name: &str) -> Option<SupervisorAction> {
 /// `hodei-mh sup-status`: the CLI view of the SAME render contract the TUI
 /// uses.
 pub async fn run_status(args: &[String]) -> i32 {
-    let socket = flag(args, "--socket", DEFAULT_SOCKET);
+    let socket = flag(args, "--socket", &default_socket());
     let mut client = match client::connect(&socket).await {
         Ok(client) => client,
         // Honest failure: the supervisor is not reachable; a client never
@@ -210,7 +221,7 @@ pub async fn run_action(args: &[String]) -> i32 {
         eprintln!("unknown action {name}; expected start|pause|resume|stop|renew");
         return 2;
     };
-    let socket = flag(&args[1..], "--socket", DEFAULT_SOCKET);
+    let socket = flag(&args[1..], "--socket", &default_socket());
     let mut client = match client::connect(&socket).await {
         Ok(client) => client,
         Err(e) => {
@@ -264,9 +275,39 @@ pub async fn run_action(args: &[String]) -> i32 {
     }
 }
 
+/// Read the whole history from `since`, following the CURSOR of every
+/// page.
+///
+/// The supervisor bounds every page: a client that reads one page and
+/// ignores the cursor would present a TRUNCATED history as if it were
+/// the whole one. The events that are gone are announced, never hidden.
+async fn read_history(
+    client: &mut client::SupervisorClient,
+    since: u64,
+) -> Result<(Vec<StructuredEvent>, Option<u64>), client::ClientError> {
+    let mut events: Vec<StructuredEvent> = Vec::new();
+    let mut cursor = since;
+    let mut oldest_lost: Option<u64> = None;
+    loop {
+        let page = client.events(cursor, None).await?;
+        if page.history_lost {
+            oldest_lost = Some(page.oldest_seq);
+        }
+        let last_seq = page.events.last().map(|event| event.seq);
+        events.extend(page.events);
+        match last_seq {
+            // The page was the last one: there is nothing more to read.
+            Some(last) if page.next_seq <= last => break,
+            None => break,
+            Some(_) => cursor = page.next_seq,
+        }
+    }
+    Ok((events, oldest_lost))
+}
+
 /// `hodei-mh sup-events`: replay structured events from a sequence.
 pub async fn run_events(args: &[String]) -> i32 {
-    let socket = flag(args, "--socket", DEFAULT_SOCKET);
+    let socket = flag(args, "--socket", &default_socket());
     let since: u64 = flag(args, "--since", "0").parse().unwrap_or(0);
     let mut client = match client::connect(&socket).await {
         Ok(client) => client,
@@ -275,8 +316,13 @@ pub async fn run_events(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match client.events(since).await {
-        Ok((events, _next)) => {
+    match read_history(&mut client, since).await {
+        Ok((events, oldest_lost)) => {
+            if let Some(oldest) = oldest_lost {
+                // The history the client asked for had a hole: it is said
+                // out loud, not papered over.
+                println!("history lost: the events before #{oldest} are no longer retained");
+            }
             for event in &events {
                 println!(
                     "[{}] {}",
@@ -297,7 +343,7 @@ pub async fn run_events(args: &[String]) -> i32 {
 /// polls structured events and NEVER touches the ACP conversation;
 /// disconnecting it changes nothing for the supervisor.
 pub async fn run_attach_terminal(args: &[String]) -> i32 {
-    let socket = flag(args, "--socket", DEFAULT_SOCKET);
+    let socket = flag(args, "--socket", &default_socket());
     let max_events: u64 = flag(args, "--exit-after-events", "0").parse().unwrap_or(0);
     // A viewer whose supervisor never answers must NOT hang forever: the
     // deadline turns a dead supervisor into an explicit failure.
@@ -311,11 +357,17 @@ pub async fn run_attach_terminal(args: &[String]) -> i32 {
     loop {
         match client::connect(&socket).await {
             Ok(mut client) => {
-                let result = client.events(seen).await;
+                let result = client.events(seen, None).await;
                 drop(client);
                 match result {
-                    Ok((events, _next)) => {
-                        for event in events {
+                    Ok(page) => {
+                        if page.history_lost {
+                            println!(
+                                "[viewer] history lost: the events before #{} are no longer retained",
+                                page.oldest_seq
+                            );
+                        }
+                        for event in page.events {
                             println!("[viewer] {}", render_event(&event));
                             seen = event.seq + 1;
                             delivered += 1;
@@ -348,7 +400,7 @@ pub async fn run_attach_terminal(args: &[String]) -> i32 {
 /// presented as real); `--frames N` renders N frames non-interactively so
 /// the TUI surface can be exercised in a real local session.
 pub async fn run_tui(args: &[String]) -> i32 {
-    let socket = flag(args, "--socket", DEFAULT_SOCKET);
+    let socket = flag(args, "--socket", &default_socket());
     let simulated = args.iter().any(|a| a == "--simulated");
     let frames: usize = flag(args, "--frames", "0").parse().unwrap_or(0);
     crate::tui::tui_main(&socket, simulated, frames).await
@@ -357,6 +409,7 @@ pub async fn run_tui(args: &[String]) -> i32 {
 /// Simulated state for DoD #1 (TUI exercised without a supervisor).
 pub fn simulated_snapshot() -> Snapshot {
     Snapshot {
+        protocol_version: supervisor::protocol::PROTOCOL_VERSION,
         project: "simulated-project".into(),
         phase: hodei_mh_run::run::Phase::Running,
         paused: false,
@@ -385,20 +438,33 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
     vec![
         StructuredEvent {
             seq: 1,
+            epoch: 1,
             kind: "supervisor/action".into(),
-            payload: serde_json::Value::String("Start applied=true".into()),
+            payload: serde_json::json!({
+                "action": "start",
+                "applied": true,
+                "detail": "the simulated state applied a start",
+            }),
             provenance: supervisor::protocol::Provenance::Human,
         },
         StructuredEvent {
             seq: 2,
+            epoch: 1,
             kind: "telemetry/resources".into(),
-            payload: serde_json::Value::String("the simulated state measured nothing".into()),
+            payload: serde_json::json!({
+                "unknown": true,
+                "reason": "the simulated state measured nothing",
+            }),
             provenance: supervisor::protocol::Provenance::Telemetry { unknown: true },
         },
         StructuredEvent {
             seq: 3,
+            epoch: 1,
             kind: "telemetry/resources".into(),
-            payload: serde_json::Value::String("cgroup unavailable".into()),
+            payload: serde_json::json!({
+                "unknown": true,
+                "reason": "cgroup unavailable",
+            }),
             provenance: supervisor::protocol::Provenance::Telemetry { unknown: true },
         },
     ]

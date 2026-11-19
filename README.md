@@ -128,9 +128,13 @@ measured fact instead of asserting it.
 PORT=8081 hodei-mh-lifecycle-server &              # the control plane
 hodei-mh doctor --profile rust                    # read-only checks + gate
 hodei-mh profile-run --profile rust --project .   # a real build in a sandbox
-hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock --project hodei-mh &
-hodei-mh sup-status && hodei-mh tui               # observe and drive
+hodei-mh supervisor --project hodei-mh &          # the control socket lives
+hodei-mh sup-status && hodei-mh tui               # in the private runtime dir
 ```
+
+The control surface — where the socket lives, who may talk to it and what
+every exchange is bounded by — is documented in
+[docs/supervisor-protocol.md](docs/supervisor-protocol.md).
 
 ## Build from source
 

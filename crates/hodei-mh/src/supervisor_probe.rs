@@ -186,7 +186,7 @@ pub async fn run() -> i32 {
         .unwrap_or(false);
     let second_died = second_refused
         && second_exited
-        && (dup_out.contains("project:") || dup_err.contains("already listening"));
+        && (dup_out.contains("project:") || dup_err.contains("already"));
     checks.push(Check {
         name: "a-second-supervisor-process-cannot-steal-a-live-socket",
         passed: second_died,

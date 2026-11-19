@@ -6,7 +6,9 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::protocol::{Request, Response, Snapshot, SupervisorAction};
+use crate::protocol::{
+    ActionOutcome, EventPage, PROTOCOL_VERSION, Request, Response, Snapshot, SupervisorAction,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -57,36 +59,59 @@ impl SupervisorClient {
                 "supervisor closed the connection".into(),
             ));
         }
-        serde_json::from_str::<Response>(line.trim())
-            .map_err(|e| ClientError::Protocol(format!("bad response: {e}")))
+        let response = serde_json::from_str::<Response>(line.trim())
+            .map_err(|e| ClientError::Protocol(format!("bad response: {e}")))?;
+        // The contract is VERSIONED: an answer of another version is not
+        // read as if it were this one. A client that guessed would read a
+        // hole in the history as if it were the whole history.
+        if response.protocol_version() != PROTOCOL_VERSION {
+            return Err(ClientError::Protocol(format!(
+                "the supervisor speaks the protocol version {}; this client speaks {PROTOCOL_VERSION}",
+                response.protocol_version()
+            )));
+        }
+        Ok(response)
     }
 
     pub async fn snapshot(&mut self) -> Result<Snapshot, ClientError> {
         match self.roundtrip(Request::Snapshot).await? {
             Response::Snapshot(snapshot) => Ok(*snapshot),
-            Response::Error { message } => Err(ClientError::Protocol(message)),
+            Response::Error { message, .. } => Err(ClientError::Protocol(message)),
             _ => Err(ClientError::Protocol("expected snapshot response".into())),
         }
     }
 
-    pub async fn action(
-        &mut self,
-        action: SupervisorAction,
-    ) -> Result<crate::protocol::ActionOutcome, ClientError> {
+    pub async fn action(&mut self, action: SupervisorAction) -> Result<ActionOutcome, ClientError> {
         match self.roundtrip(Request::Action { action }).await? {
-            Response::Action(outcome) => Ok(outcome),
-            Response::Error { message } => Err(ClientError::Protocol(message)),
+            Response::Action { outcome, .. } => Ok(outcome),
+            Response::Error { message, .. } => Err(ClientError::Protocol(message)),
             _ => Err(ClientError::Protocol("expected action response".into())),
         }
     }
 
+    /// One page of the event history, from `since`.
+    ///
+    /// The page carries the cursor to continue with and says whether the
+    /// history the client asked for had a hole.
     pub async fn events(
         &mut self,
         since: u64,
-    ) -> Result<(Vec<crate::protocol::StructuredEvent>, u64), ClientError> {
-        match self.roundtrip(Request::Events { since }).await? {
-            Response::Events { events, next_seq } => Ok((events, next_seq)),
-            Response::Error { message } => Err(ClientError::Protocol(message)),
+        limit: Option<u32>,
+    ) -> Result<EventPage, ClientError> {
+        match self.roundtrip(Request::Events { since, limit }).await? {
+            Response::Events {
+                events,
+                next_seq,
+                oldest_seq,
+                history_lost,
+                ..
+            } => Ok(EventPage {
+                events,
+                next_seq,
+                oldest_seq,
+                history_lost,
+            }),
+            Response::Error { message, .. } => Err(ClientError::Protocol(message)),
             _ => Err(ClientError::Protocol("expected events response".into())),
         }
     }

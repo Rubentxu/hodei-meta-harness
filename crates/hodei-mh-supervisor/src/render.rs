@@ -115,11 +115,37 @@ pub fn render_event(event: &StructuredEvent) -> String {
         }
     };
     format!(
-        "#{} [{provenance}] {} {}",
+        "#{} [{provenance}] {} (epoch {}) {}",
         event.seq,
         escape_control(&event.kind),
-        escape_control(&event.payload.to_string())
+        event.epoch,
+        render_payload(&event.payload)
     )
+}
+
+/// Render the body of an event for a human.
+///
+/// The body is a TYPED value: an object is rendered as its fields, so
+/// the reader sees what the event said instead of a flat sentence that
+/// has to be parsed.
+fn render_payload(payload: &serde_json::Value) -> String {
+    match payload {
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| format!("{}={}", escape_control(key), render_scalar(value)))
+            .collect::<Vec<String>>()
+            .join(" "),
+        other => escape_control(&other.to_string()),
+    }
+}
+
+/// Render one value of a body.
+fn render_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => escape_control(text),
+        serde_json::Value::Null => "null".to_string(),
+        other => escape_control(&other.to_string()),
+    }
 }
 
 fn phase_label(phase: &run::run::Phase) -> String {
@@ -162,6 +188,7 @@ mod tests {
     #[test]
     fn unknown_telemetry_is_shown_as_unknown_not_as_a_measurement() {
         let snapshot = Snapshot {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             project: "gc".into(),
             phase: run::run::Phase::Running,
             paused: false,
@@ -193,18 +220,23 @@ mod tests {
     fn events_render_provenance_and_unknown_telemetry_flag() {
         let event = StructuredEvent {
             seq: 7,
+            epoch: 2,
             kind: "telemetry/resources".into(),
-            payload: serde_json::Value::String("missing".into()),
+            payload: serde_json::json!({"unknown": true, "reason": "missing"}),
             provenance: crate::provenance::Provenance::Telemetry { unknown: true },
         };
         let line = render_event(&event);
         assert!(line.contains("telemetry(UNKNOWN)"));
         assert!(line.contains("#7"));
+        // The body keeps its structure: the reader sees the fields.
+        assert!(line.contains("reason=missing"), "{line}");
+        assert!(line.contains("epoch 2"), "{line}");
     }
 
     #[test]
     fn control_characters_in_client_data_cannot_forge_output_lines() {
         let snapshot = Snapshot {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             project: "gc".into(),
             phase: run::run::Phase::Idle,
             paused: false,
@@ -238,6 +270,7 @@ mod tests {
     #[test]
     fn the_declared_grant_scope_and_a_degraded_core_are_visible() {
         let snapshot = Snapshot {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             project: "gc".into(),
             phase: run::run::Phase::Running,
             paused: false,

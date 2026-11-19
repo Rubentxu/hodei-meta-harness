@@ -34,6 +34,50 @@ pub const SECRET_KEYS: &[&str] = &[
 /// The visible part of a redacted value.
 const PLACEHOLDER: &str = "[redacted]";
 
+/// Whether a NAME is one of the credential names, whatever its case.
+pub fn is_secret_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEYS
+        .iter()
+        .any(|secret| secret.to_ascii_lowercase() == lower)
+}
+
+/// Redact credentials from a JSON value, KEEPING ITS STRUCTURE.
+///
+/// The text redactor above works on a flat line. An event carries a
+/// typed body, so the redaction has to walk it: an object, an array or a
+/// string, at any depth. A credential whose NAME is a secret key loses
+/// its value; a credential that travels inside a text loses its value
+/// too.
+///
+/// The structure survives: a redacted object is still an object with the
+/// same keys, so a client does not have to parse the result to know what
+/// it is reading.
+pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    if is_secret_key(key) {
+                        (
+                            key.clone(),
+                            serde_json::Value::String(PLACEHOLDER.to_string()),
+                        )
+                    } else {
+                        (key.clone(), redact_value(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_value).collect())
+        }
+        serde_json::Value::String(text) => serde_json::Value::String(redact(text)),
+        other => other.clone(),
+    }
+}
+
 /// Redact credentials from a line.
 ///
 /// Covered shapes (all of them are real ways a secret travels):
@@ -211,5 +255,34 @@ mod tests {
         let prov = Provenance::Telemetry { unknown: true };
         let encoded = serde_json::to_string(&prov).expect("encode");
         assert!(encoded.contains("\"unknown\":true"));
+    }
+
+    #[test]
+    fn a_credential_nested_in_the_body_is_redacted() {
+        // The body of an event is a TREE: a secret at any depth must not
+        // reach the wire, and the tree must survive the redaction.
+        let body = serde_json::json!({
+            "ticket": "TASK-9",
+            "credentials": {"ANTHROPIC_AUTH_TOKEN": "sk-nested-secret"},
+            "steps": [{"note": "ok"}, {"api_key": "sk-in-an-array"}],
+            "message": "Authorization: Bearer sk-bearer-secret",
+        });
+        let safe = redact_value(&body);
+        let encoded = safe.to_string();
+        assert!(!encoded.contains("sk-nested-secret"), "{encoded}");
+        assert!(!encoded.contains("sk-in-an-array"), "{encoded}");
+        assert!(!encoded.contains("sk-bearer-secret"), "{encoded}");
+        // The structure is intact: the client still knows it was an
+        // object with those fields.
+        assert_eq!(safe["ticket"], serde_json::json!("TASK-9"));
+        assert_eq!(safe["credentials"]["ANTHROPIC_AUTH_TOKEN"], "[redacted]");
+        assert_eq!(safe["steps"][1]["api_key"], "[redacted]");
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_secret_is_left_alone() {
+        let body = serde_json::json!({"tokens_total": 9, "tokenizer": "gpt"});
+        let safe = redact_value(&body);
+        assert_eq!(safe, body);
     }
 }

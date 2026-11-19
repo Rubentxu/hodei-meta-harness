@@ -96,7 +96,7 @@ export HODEI_MH_EGRESS_PROXY_CONTAINER="your-proxy-container"
 export HODEI_MH_PROXY_URL="http://hodei-proxy:8888"
 export HODEI_MH_PROXY_CHECK_URL="http://127.0.0.1:8888"
 PORT=8081 $BIN/hodei-mh-lifecycle-server &
-$BIN/hodei-mh supervisor --socket /tmp/hodei-mh-supervisor.sock --project hodei-mh &
+$BIN/hodei-mh supervisor --project hodei-mh &
 ```
 
 The lifecycle HTTP listener accepts loopback hosts only; do not expose its

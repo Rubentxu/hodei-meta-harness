@@ -68,7 +68,7 @@ fn temp_socket_path(tag: &str) -> String {
 #[tokio::test]
 async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
     let path = temp_socket_path("flow");
-    let listener = server::bind(&path).await.expect("bind");
+    let listener = server::bind(&path, "trial-project").await.expect("bind");
     let (runtime, gates) = TrialRuntime::gated();
     let recorder = runtime.recorder();
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new(engine::core_with_runtime(
@@ -79,6 +79,7 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
         listener,
         core.clone(),
         Some(Arc::new(runtime)),
+        server::Limits::default(),
     ));
 
     let mut client = client::connect(&path).await.expect("connect");
@@ -193,21 +194,24 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
 #[tokio::test]
 async fn an_objective_whose_verification_does_not_hold_is_rejected_and_ends_the_session() {
     let path = temp_socket_path("rejected");
-    let listener = server::bind(&path).await.expect("bind");
+    let listener = server::bind(&path, "trial-project-rejected")
+        .await
+        .expect("bind");
     let runtime = TrialRuntime::rejecting();
     let recorder = runtime.recorder();
     let core: Arc<Mutex<engine::SupervisorCore>> =
-        Arc::new(Mutex::new(engine::default_core("trial-project")));
+        Arc::new(Mutex::new(engine::default_core("trial-project-rejected")));
     let server_task = tokio::spawn(server::serve(
         listener,
         core.clone(),
         Some(Arc::new(runtime)),
+        server::Limits::default(),
     ));
 
     let mut client = client::connect(&path).await.expect("connect");
     let start = client
         .action(SupervisorAction::Start {
-            project: "trial-project".into(),
+            project: "trial-project-rejected".into(),
             ticket: None,
             revision: None,
         })
