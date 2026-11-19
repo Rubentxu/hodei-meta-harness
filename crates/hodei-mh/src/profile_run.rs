@@ -5,9 +5,9 @@
 //! Credentials only ever travel as process env and never appear in
 //! commands, logs or the run record.
 
-use std::path::Path;
 use std::time::Duration;
 
+use hodei_mh_workspace::export::{self, ExportPolicy};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use profiles::build_plan::{self, BuildPlan};
@@ -28,6 +28,39 @@ pub const DEFAULT_PROXY_URL: &str = "http://hodei-proxy:8888";
 /// Bounded wait for the sandbox's execd to start answering. A sandbox
 /// that never becomes usable is a FAILURE, not an infinite wait.
 const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How much of a build output the record keeps. The output is REDACTED
+/// before it is cut: the tail of a build that printed a credential must
+/// not keep it.
+const OUTPUT_TAIL_LIMIT: usize = 400;
+
+/// The last `limit` characters of a text, cut on a character boundary.
+fn tail(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_string();
+    }
+    text.chars().skip(count - limit).collect()
+}
+
+/// The record of one executed command.
+///
+/// The command and the output are REDACTED before they reach the record,
+/// and the output is redacted BEFORE it is truncated: a build that printed
+/// a credential must not keep it in the tail it persists.
+fn command_record(
+    raw_command: &str,
+    exit_code: Option<i32>,
+    succeeded: bool,
+    raw_output: &str,
+) -> Value {
+    json!({
+        "command": credentials::redact_output(raw_command),
+        "exit_code": exit_code,
+        "succeeded": succeeded,
+        "output_tail": tail(&credentials::redact_output(raw_output), OUTPUT_TAIL_LIMIT),
+    })
+}
 
 fn flag(args: &[String], name: &str, default: &str) -> String {
     args.iter()
@@ -56,6 +89,11 @@ pub fn spec_for(args: &[String]) -> Result<(ProfileSpec, SubscriptionNote), Stri
         ),
     };
     if let Some(user_image) = opt_flag(args, "--image") {
+        // The reference travels to the daemon and to the record: a
+        // credential inside it would travel with it.
+        if credentials::reference_carries_credentials(&user_image) {
+            return Err("the image reference must not carry credentials".to_string());
+        }
         let name = flag(args, "--profile", "user");
         let (spec, note) = profile::user_profile(name, ImagePin::user(user_image), "user-provided");
         // The honest note about the missing pin travels with the spec.
@@ -235,20 +273,6 @@ pub async fn run_doctor_cli(args: &[String]) -> i32 {
     }
 }
 
-fn tar_project(project_dir: &Path, dest: &Path) -> bool {
-    std::process::Command::new("tar")
-        .args([
-            "czf",
-            dest.to_string_lossy().as_ref(),
-            "-C",
-            project_dir.to_string_lossy().as_ref(),
-            ".",
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 /// `hodei-mh profile-run --profile rust --project DIR`: doctor → gate →
 /// sandbox (pinned image + requested limits) → observe effective limits →
 /// run the build plan → record SHA, commands, outputs. Refuses without a
@@ -311,7 +335,32 @@ pub async fn run_profile(args: &[String]) -> i32 {
         return 1;
     }
 
-    // 2. Sandbox with the PINNED image and REQUESTED limits.
+    // 2. The EXPORT: the explicit list of files that leave the host.
+    //
+    // It is decided BEFORE the sandbox exists: a refusal here leaves
+    // nothing to clean up, and the private directory that holds the
+    // packed bytes is removed when the value is dropped.
+    let policy = if args.iter().any(|argument| argument == "--export-untracked") {
+        ExportPolicy::WithUntracked
+    } else {
+        ExportPolicy::TrackedOnly
+    };
+    let staged = match export::stage_project(&project_dir, policy) {
+        Ok(staged) => staged,
+        Err(error) => {
+            eprintln!("project export refused: {error}");
+            return 1;
+        }
+    };
+    let export_bytes = match staged.bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("project export failed: {error}");
+            return 1;
+        }
+    };
+
+    // 3. Sandbox with the PINNED image and REQUESTED limits.
     //
     // The create carries a REQUEST TAG: if the response is lost, the
     // effect is findable and is ADOPTED, never duplicated.
@@ -474,7 +523,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         return 1;
     }
 
-    // 3. OBSERVED limits from inside the container (cgroups) AND the
+    // 4. OBSERVED limits from inside the container (cgroups) AND the
     // sandbox's OWN network reachability (measured from inside, not from
     // the host: a host-side TCP check proves nothing about the sandbox).
     let observed = opensandbox::execd::oneshot::run(
@@ -513,7 +562,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         return 1;
     }
 
-    // 4. Ship the project (pack host-side, upload, extract — no egress).
+    // 5. Ship the project (upload the packed export, extract — no egress).
     // The directory name is SANITIZED: it is interpolated into a shell
     // command inside the sandbox.
     let project_name = build_plan::sanitize_dir_name(
@@ -523,24 +572,18 @@ pub async fn run_profile(args: &[String]) -> i32 {
             .unwrap_or_else(|| "project".into()),
     );
     let sandbox_root = format!("/workspace/{project_name}");
-    let tgz_path = std::env::temp_dir().join(format!("hodei-profile-{}.tgz", std::process::id()));
-    let packed = tar_project(&project_dir, &tgz_path);
     let mut uploaded = false;
-    if packed {
-        // The execd connection can refuse the first attempts right after
-        // the sandbox starts: bounded retries, never an unbounded wait.
-        let bytes = std::fs::read(&tgz_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&tgz_path);
-        for _ in 0..3 {
-            if opensandbox::execd::api::upload_file(&execd, bytes.clone(), "/tmp/project.tgz")
-                .await
-                .is_ok()
-            {
-                uploaded = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    // The execd connection can refuse the first attempts right after
+    // the sandbox starts: bounded retries, never an unbounded wait.
+    for _ in 0..3 {
+        if opensandbox::execd::api::upload_file(&execd, export_bytes.clone(), "/tmp/project.tgz")
+            .await
+            .is_ok()
+        {
+            uploaded = true;
+            break;
         }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let staged_ok = if uploaded {
         // The root is a SANITIZED name, quoted for the shell.
@@ -556,18 +599,16 @@ pub async fn run_profile(args: &[String]) -> i32 {
     } else {
         false
     };
-    if !packed || !uploaded || !staged_ok {
+    if !uploaded || !staged_ok {
         let _ = client
             .delete(&ControlPlane::sandbox_path(&sid))
             .send()
             .await;
-        eprintln!(
-            "project staging failed: packed={packed} uploaded={uploaded} staged_ok={staged_ok}"
-        );
+        eprintln!("project staging failed: uploaded={uploaded} staged_ok={staged_ok}");
         return 1;
     }
 
-    // 5. Run the build plan. The egress proxy is the ONLY authorized
+    // 6. Run the build plan. The egress proxy is the ONLY authorized
     // network path; credentials NEVER enter commands (builds need none).
     //
     // The cache token is derived from the CANONICAL absolute path: two
@@ -579,23 +620,26 @@ pub async fn run_profile(args: &[String]) -> i32 {
     let plan: BuildPlan =
         build_plan::plan(&spec, &canonical_project.to_string_lossy(), &sandbox_root);
     let mut command_outputs: Vec<Value> = Vec::new();
+    // The RAW strings are kept for the leak check ONLY: they are never
+    // persisted. A detector that reads the redacted record would be
+    // blinded by the very redaction it has to notice.
+    let mut executed: Vec<String> = Vec::new();
     let mut all_ok = observed.succeeded();
     for command in &plan.commands {
         let proxied = format!("HTTPS_PROXY={proxy_url} HTTP_PROXY={proxy_url} {command}");
         let outcome =
             opensandbox::execd::oneshot::run(&execd, &proxied, Duration::from_secs(600)).await;
         all_ok = all_ok && outcome.succeeded();
-        command_outputs.push(json!({
-            "command": proxied,
-            "exit_code": outcome.exit_code,
-            "succeeded": outcome.succeeded(),
-            // The output is SCRUBBED before it reaches the record: a build
-            // that prints a credential must not persist it.
-            "output_tail": credentials::redact_output(&outcome.output.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()),
-        }));
+        executed.push(proxied.clone());
+        command_outputs.push(command_record(
+            &proxied,
+            outcome.exit_code,
+            outcome.succeeded(),
+            &outcome.output,
+        ));
     }
 
-    // 6. The record: SHA, commands, limits — no secrets by construction.
+    // 7. The record: SHA, commands, limits — no secrets by construction.
     let env_sample: Vec<(String, String)> = vec![
         ("HTTPS_PROXY".to_string(), proxy_url.clone()),
         (
@@ -606,14 +650,10 @@ pub async fn run_profile(args: &[String]) -> i32 {
     let scrubbed =
         credentials::scrub_for_log(env_sample.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     // The leak check runs over the EXACT strings that were executed, not
-    // over the plan's templates.
-    let executed: Vec<String> = command_outputs
-        .iter()
-        .filter_map(|c| c["command"].as_str().map(str::to_string))
-        .collect();
+    // over the plan's templates and not over the redacted record.
     let leaks = credentials::secret_leak_positions(&executed);
 
-    // 7. Release the environment through the IDLE GATE. The gate — not
+    // 8. Release the environment through the IDLE GATE. The gate — not
     //    the caller — decides whether the environment may be released:
     //    only a CONFIRMED durable export permits it. The candidate is
     //    written to durable storage and READ BACK; the digest comes from
@@ -624,6 +664,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         "profile": spec.name,
         "project": canonical_project.to_string_lossy(),
         "sandbox_id": sid,
+        "project_export": staged.report(),
         "commands": command_outputs,
     });
     let exported = std::fs::create_dir_all(&export_dir).is_ok()
@@ -679,6 +720,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
             "raw": egress.output.trim(),
         },
         "cache_dir": plan.cache_dir,
+        "project_export": staged.report(),
         "commands": command_outputs,
         "all_succeeded": all_ok,
         "cleanup": cleanup,
@@ -701,7 +743,11 @@ pub async fn run_profile(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{network_observation_ok, proxy_address};
+    use super::{command_record, network_observation_ok, proxy_address, spec_for, tail};
+
+    /// A synthetic credential: it has the shape of a provider token and
+    /// it is not one.
+    const SYNTHETIC_SECRET: &str = "sk-ant-synthetic-profile-run-0123456789";
 
     #[test]
     fn network_policy_requires_both_observations_and_a_successful_probe() {
@@ -734,5 +780,81 @@ mod tests {
         ] {
             assert!(proxy_address(url).is_err(), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn an_image_reference_with_credentials_is_refused() {
+        // The reference travels to the daemon and to the record.
+        let args = vec![
+            "--image".to_string(),
+            "user:pass@registry.local/team/image:tag".to_string(),
+        ];
+        let error = spec_for(&args).expect_err("the reference carries a credential");
+        assert!(error.contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn a_digest_reference_is_not_a_credential() {
+        // `name@sha256:<digest>` is the pinned form, not a userinfo.
+        let args = vec![
+            "--image".to_string(),
+            "rust@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea"
+                .to_string(),
+        ];
+        assert!(spec_for(&args).is_ok());
+    }
+
+    #[test]
+    fn the_output_is_redacted_before_it_is_truncated() {
+        // The credential sits at the very end: truncating FIRST would keep
+        // it in the window that is persisted.
+        let output = format!("{}\nbuilding...\n{SYNTHETIC_SECRET}\n", "x".repeat(600));
+        let record = command_record("cargo build", Some(0), true, &output);
+        let tail = record["output_tail"].as_str().expect("the tail");
+        assert!(!tail.contains(SYNTHETIC_SECRET), "{tail}");
+        assert!(tail.contains("[redacted]"), "{tail}");
+        assert!(tail.len() <= 400, "the tail is bounded");
+    }
+
+    #[test]
+    fn the_record_keeps_its_structure_after_the_redaction() {
+        let record = command_record(
+            "curl https://user:pass@example.com/repo",
+            Some(0),
+            true,
+            "downloading\n",
+        );
+        assert_eq!(record["exit_code"], 0);
+        assert_eq!(record["succeeded"], true);
+        assert!(record["command"].is_string());
+        assert!(record["output_tail"].is_string());
+        let encoded = serde_json::to_string(&record).expect("the record serializes");
+        assert!(!encoded.contains("user:pass"), "{encoded}");
+    }
+
+    #[test]
+    fn the_leak_check_reads_the_raw_command_and_not_the_redacted_record() {
+        // A detector that read the record would be blinded by the very
+        // redaction it has to notice.
+        let raw = format!("curl -H 'Authorization: Bearer {SYNTHETIC_SECRET}'");
+        let record = command_record(&raw, Some(0), true, "");
+        assert!(
+            !record["command"]
+                .as_str()
+                .expect("the command")
+                .contains(SYNTHETIC_SECRET)
+        );
+        let executed = vec![raw];
+        assert_eq!(
+            super::credentials::secret_leak_positions(&executed),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn the_tail_cuts_on_a_character_boundary() {
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("abc", 10), "abc");
+        assert_eq!(tail("áéíóú", 2), "óú");
     }
 }

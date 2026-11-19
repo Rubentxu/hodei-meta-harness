@@ -33,8 +33,11 @@ pub const EXPORT_DENYLIST: &[&str] = &[
     "*.p12",
     "id_rsa",
     "id_ed25519",
+    ".ssh/",
     "credentials",
+    "credentials/",
     "secrets",
+    "secrets/",
     "backlog/",
     ".claude/",
     "target/",
@@ -106,11 +109,11 @@ pub fn select_files_for_export(
     for path in tracked {
         consider(path);
     }
-    if policy == ExportPolicy::WithUntracked {
-        if let Some(paths) = untracked {
-            for path in paths {
-                consider(path);
-            }
+    if policy == ExportPolicy::WithUntracked
+        && let Some(paths) = untracked
+    {
+        for path in paths {
+            consider(path);
         }
     }
     files.sort();
@@ -330,7 +333,12 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
-        let sel = select_files_for_export(&tracked, None, ExportPolicy::WithUntracked, &export_denylist());
+        let sel = select_files_for_export(
+            &tracked,
+            None,
+            ExportPolicy::WithUntracked,
+            &export_denylist(),
+        );
         assert_eq!(sel.files, vec!["app.py".to_string()]);
     }
 
@@ -345,7 +353,10 @@ mod tests {
             &export_denylist(),
         );
         assert_eq!(off.files, vec!["src/main.rs".to_string()]);
-        assert!(off.denied.is_empty(), "untracked files are not even inspected");
+        assert!(
+            off.denied.is_empty(),
+            "untracked files are not even inspected"
+        );
         let on = select_files_for_export(
             &tracked,
             Some(&untracked),
@@ -378,7 +389,11 @@ mod tests {
     #[test]
     fn every_denial_carries_the_rule_that_denied_it() {
         let sel = select_files_for_export(
-            &["secrets".to_string(), "host.pem".to_string(), ".git/config".to_string()],
+            &[
+                "secrets".to_string(),
+                "host.pem".to_string(),
+                ".git/config".to_string(),
+            ],
             None,
             ExportPolicy::TrackedOnly,
             &export_denylist(),

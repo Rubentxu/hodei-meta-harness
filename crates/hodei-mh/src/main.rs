@@ -57,6 +57,7 @@ usage: hodei-mh <command> [options]
 product:
   doctor --profile <name>              read-only checks and the release gate
   profile-run --profile <name>         run a project inside a pinned sandbox
+                                       (--export-untracked ships the unversioned changes)
   supervisor --socket <path> --project <name>
                                        the single controller of a project
   sup-status | sup-action | sup-events | attach-terminal | tui

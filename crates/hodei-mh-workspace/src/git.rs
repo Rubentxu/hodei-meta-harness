@@ -28,7 +28,11 @@ fn run_raw(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result
 /// through a lossy `String`: a non-UTF-8 path replaced to U+FFFD would be
 /// handed to `tar` as a name that does not exist, and an export that
 /// silently misses files is worse than one that fails.
-fn run_bytes(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>, GitError> {
+fn run_bytes(
+    operation: &'static str,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> Result<Vec<u8>, GitError> {
     let mut command = Command::new("git");
     command.args(args);
     if let Some(dir) = cwd {
@@ -262,15 +266,71 @@ pub fn ls_untracked(repo_dir: &Path) -> Result<Vec<String>, GitError> {
     Ok(split_nul(&stdout))
 }
 
-/// Whether `dir` is inside a git working tree.
-pub fn is_git_repo(dir: &Path) -> bool {
+/// The paths whose WORKING TREE content differs from `HEAD`: the staged
+/// changes and the unstaged ones, and the files deleted from the tree.
+///
+/// This is the comparison that decides what is versioned: a file that
+/// differs from the last commit carries an unversioned change, and an
+/// unversioned change only leaves the host under an explicit policy.
+pub fn ls_changed(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes(
+        "diff HEAD",
+        &["diff", "--name-only", "-z", "HEAD", "--"],
+        Some(repo_dir),
+    )?;
+    Ok(split_nul(&stdout))
+}
+
+/// Whether the repository has at least one commit. A repository without
+/// commits has no versioned content at all: everything in it is a change.
+pub fn has_head(repo_dir: &Path) -> bool {
     run_raw(
-        "rev-parse",
-        &["rev-parse", "--git-dir"],
+        "rev-parse HEAD",
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        Some(repo_dir),
+    )
+    .is_ok()
+}
+
+/// The root of the working tree that contains `dir`.
+///
+/// `git ls-files` walks UP to the repository root: run in a subdirectory of
+/// a repository, it lists the files of the WHOLE repository. The caller
+/// needs to know that, because the paths it gets back are relative to the
+/// repository root and not to the directory it asked about.
+pub fn toplevel(dir: &Path) -> Option<std::path::PathBuf> {
+    let out = run_raw(
+        "rev-parse --show-toplevel",
+        &["rev-parse", "--show-toplevel"],
         Some(dir),
     )
-    .map(|out| !out.trim().is_empty())
-    .unwrap_or(false)
+    .ok()?;
+    let top = std::path::PathBuf::from(out.trim());
+    if top.as_os_str().is_empty() {
+        None
+    } else {
+        Some(top)
+    }
+}
+
+/// Whether `dir` IS the root of a working tree — not a subdirectory of one.
+///
+/// The paths of a working tree are relative to its root, so only the root
+/// itself can be classified with them.
+pub fn is_worktree_root(dir: &Path) -> bool {
+    let Some(top) = toplevel(dir) else {
+        return false;
+    };
+    let top = top.canonicalize().unwrap_or(top);
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    top == dir
+}
+
+/// Whether `dir` is inside a git working tree.
+pub fn is_git_repo(dir: &Path) -> bool {
+    run_raw("rev-parse", &["rev-parse", "--git-dir"], Some(dir))
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn split_nul(bytes: &[u8]) -> Vec<String> {
