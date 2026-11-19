@@ -134,20 +134,26 @@ fn ui(f: &mut Frame, state: &TuiState) {
         ])
         .split(f.area());
 
-    let mut state_lines: Vec<Line> = state
-        .snapshot
-        .as_ref()
-        .map(|snapshot| {
-            render_snapshot(snapshot)
-                .into_iter()
-                .map(Line::from)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![Line::from("(no snapshot yet — waiting for the supervisor)")]);
+    // The banner goes FIRST: a warning at the bottom of the panel is
+    // clipped by a short terminal, and a clipped warning is a lie — a
+    // simulated state that says nothing looks exactly like a live one.
+    let mut state_lines: Vec<Line> = Vec::new();
     if let Some(banner) = &state.banner {
-        state_lines.push(Line::from(String::new()));
         state_lines.push(Line::from(format!("!! {banner}")));
+        state_lines.push(Line::from(String::new()));
     }
+    state_lines.extend(
+        state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                render_snapshot(snapshot)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Line::from("(no snapshot yet — waiting for the supervisor)")]),
+    );
     let state_panel = Paragraph::new(state_lines)
         .block(
             Block::default()

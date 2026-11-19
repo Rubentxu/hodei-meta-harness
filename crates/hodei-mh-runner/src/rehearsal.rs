@@ -52,6 +52,28 @@ pub fn scenario() -> Vec<WorkItem> {
     ]
 }
 
+/// The scenario with the work the CALLER NAMED added to it.
+///
+/// The rehearsal rehearses the work it is given: a name its fixed
+/// scenario does not know is not an error, it is work the rehearsal
+/// performs with its scripted adapters. The item lives in this process
+/// and in no other: nothing is created outside it.
+fn scenario_with(work_ref: Option<&str>) -> Vec<WorkItem> {
+    let mut items = scenario();
+    if let Some(work_ref) = work_ref
+        && !items.iter().any(|item| item.id == work_ref)
+    {
+        items.push(WorkItem {
+            id: work_ref.into(),
+            title: format!("the named work of the rehearsal ({work_ref})"),
+            status: WorkStatus::Open,
+            provider_ready: Some(true),
+            dependencies: Vec::new(),
+        });
+    }
+    items
+}
+
 /// The requirements the rehearsal states for a work item: one check per
 /// item, so the flow has something to judge.
 struct ScriptedRequirements;
@@ -200,11 +222,13 @@ impl Gates {
 /// The rehearsal runtime: it names itself a rehearsal, it selects work
 /// from a fixed scenario and it publishes nothing.
 pub struct TrialRuntime {
-    runner: Arc<GoalRunner>,
     identity: RuntimeIdentity,
     accept: Option<Arc<Notify>>,
     finish: Option<Arc<Notify>>,
     publisher: Arc<RecordingPublisher>,
+    /// Whether the scripted verifier holds the objective. The rehearsal
+    /// that does not hold is the one that publishes nothing.
+    holds: bool,
 }
 
 impl TrialRuntime {
@@ -221,20 +245,28 @@ impl TrialRuntime {
 
     fn with_verifier(holds: bool) -> Self {
         let publisher = Arc::new(RecordingPublisher::new());
-        let runner = Arc::new(GoalRunner::new(
-            Arc::new(tracker::fake::FakeTracker::with_items(scenario())),
-            Arc::new(ScriptedRequirements),
-            Arc::new(ScriptedAgent),
-            Arc::new(ScriptedVerifier { holds }),
-            publisher.clone(),
-        ));
         Self {
-            runner,
             identity: RuntimeIdentity::rehearsal("trial-default"),
             accept: None,
             finish: None,
             publisher,
+            holds,
         }
+    }
+
+    /// The runner of ONE objective: the scenario plus the work the
+    /// caller named. The publisher is shared across objectives, so the
+    /// rehearsal records them all.
+    fn runner_for(&self, work_ref: Option<&str>) -> Arc<GoalRunner> {
+        Arc::new(GoalRunner::new(
+            Arc::new(tracker::fake::FakeTracker::with_items(scenario_with(
+                work_ref,
+            ))),
+            Arc::new(ScriptedRequirements),
+            Arc::new(ScriptedAgent),
+            Arc::new(ScriptedVerifier { holds: self.holds }),
+            self.publisher.clone(),
+        ))
     }
 
     /// The rehearsal with gates: the runtime waits for the confirmation
@@ -277,8 +309,8 @@ impl ObjectiveRuntime for TrialRuntime {
         if let Some(accept) = &self.accept {
             accept.notified().await;
         }
-        let selected = self
-            .runner
+        let runner = self.runner_for(request.work_ref.as_deref());
+        let selected = runner
             .select(request.work_ref.as_deref())
             .await
             .map_err(|error| RuntimeError(error.to_string()))?;
@@ -287,11 +319,9 @@ impl ObjectiveRuntime for TrialRuntime {
                 reason: "no eligible work".into(),
             }));
         };
-        let objective = self
-            .runner
+        let objective = runner
             .objective_of(&item)
             .map_err(|error| RuntimeError(error.to_string()))?;
-        let runner = self.runner.clone();
         let finish = self.finish.clone();
         Ok(ObjectiveHandle::new(async move {
             // The work gate: the objective happens when the test says so.
@@ -349,12 +379,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_rehearsal_answers_a_work_that_does_not_exist_instead_of_hanging() {
+    async fn the_rehearsal_rehearses_the_work_the_client_names_and_never_hangs() {
         let runtime = TrialRuntime::new();
-        // A named work that is not in the scenario is a REFUSAL with a
-        // reason. The runtime must answer: a runtime that hangs leaves
-        // the run in `Starting` forever, and a silent hang is the worst
-        // kind of failure.
+        // The runtime must ANSWER: a runtime that hangs leaves the run
+        // in `Starting` forever, and a silent hang is the worst kind of
+        // failure. The work the client names is rehearsed even when the
+        // fixed scenario does not know it: that is the work it was asked
+        // for, and the rehearsal is where it is rehearsed.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             runtime.start(ObjectiveRequest {
@@ -363,13 +394,18 @@ mod tests {
             }),
         )
         .await;
-        let started = answered.expect("the runtime answers instead of hanging");
+        let handle = answered
+            .expect("the runtime answers instead of hanging")
+            .expect("the named work is rehearsed, not refused");
+        let outcome = handle.completion().await;
         assert!(
-            started.is_err(),
-            "a work that is not in the scenario is refused: {started:?}"
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "TASK-9"),
+            "{outcome:?}"
         );
-        // Nothing was published: the objective never started.
-        assert!(runtime.publications().is_empty());
+        // The rehearsal still closed nothing: the recording says so.
+        let recorded = runtime.publications();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].closed);
     }
 
     #[tokio::test]

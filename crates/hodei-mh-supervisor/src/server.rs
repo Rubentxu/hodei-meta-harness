@@ -121,17 +121,18 @@ async fn supervisor_is_alive(path: &Path) -> bool {
 
 /// Accept loop: serve every connection until the listener breaks for good.
 /// The core is shared; requests are handled sequentially per connection.
-pub async fn serve(listener: UnixListener, core: SharedCore) -> std::io::Result<()> {
-    serve_with_runtime(listener, core, None).await
-}
-
-/// The controller WITH a runtime: an applied Start hands the objective to
-/// it, and the runtime's confirmation is what moves the run to `Running`.
 ///
-/// Without a runtime the controller still serves its surface, but a Start
-/// is refused: the engine refuses it, because a run that nobody can
-/// execute is not a run.
-pub async fn serve_with_runtime(
+/// The runtime is an EXPLICIT argument, not a second function: a caller
+/// that means to execute objectives and a caller that does not must both
+/// say so here, where the difference is visible. Two functions — one with
+/// a runtime and one without — let a caller reach for the wrong one and
+/// serve a controller that accepts a Start and never executes it.
+///
+/// With a runtime, an applied Start hands the objective to it, and the
+/// runtime's confirmation is what moves the run to `Running`. Without one
+/// the controller still serves its surface, but a Start is refused: the
+/// engine refuses it, because a run that nobody can execute is not a run.
+pub async fn serve(
     listener: UnixListener,
     core: SharedCore,
     runtime: Option<Arc<dyn ObjectiveRuntime>>,

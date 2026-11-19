@@ -132,7 +132,11 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
             let _ = out.flush();
         }
     });
-    let served = server::serve(listener, core).await;
+    // The runtime goes WITH the controller: the server hands the objective
+    // to it, and its confirmation is what moves the run to `Running`.
+    // Serving without it would accept the Start and leave the run in
+    // `Starting` forever.
+    let served = server::serve(listener, core, runtime).await;
     if let Some(identity) = owned_socket {
         server::unlink_if_owned(std::path::Path::new(&socket), identity);
     }

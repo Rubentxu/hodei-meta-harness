@@ -129,6 +129,14 @@ been published — with NO external effects, no ticket closed and no ref moved.
 It names itself in every snapshot (`runtime: rehearsal (...)`), so a
 rehearsal is never presented as a live execution.
 
+The rehearsal rehearses the work it is GIVEN: a `Start` that names a
+ticket rehearses that ticket, even when the rehearsal's own scenario
+does not know it. The named work lives in the rehearsal's process and in
+no other — nothing is created outside it, no ticket is closed and no ref
+moves. A `Start` without a ticket lets the rehearsal pick the next
+eligible work from its scenario, in the same reproducible order the
+tracker uses.
+
 ## The trust boundary
 
 Every sandbox runs in a network of its own, and the boundary is verified

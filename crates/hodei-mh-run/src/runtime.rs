@@ -112,6 +112,15 @@ pub struct ObjectiveHandle {
     completion: Pin<Box<dyn Future<Output = ObjectiveOutcome> + Send + 'static>>,
 }
 
+/// The handle prints its own name and nothing else: the future it holds
+/// has no observable state worth printing, and pretending otherwise
+/// would leak the internals of an execution into a log line.
+impl std::fmt::Debug for ObjectiveHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObjectiveHandle")
+    }
+}
+
 impl ObjectiveHandle {
     /// A handle whose objective ends when `completion` resolves.
     pub fn new<F>(completion: F) -> Self

@@ -75,7 +75,7 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
         "trial-project",
         runtime.identity(),
     )));
-    let server_task = tokio::spawn(server::serve_with_runtime(
+    let server_task = tokio::spawn(server::serve(
         listener,
         core.clone(),
         Some(Arc::new(runtime)),
@@ -187,15 +187,20 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The rehearsal has no path to promote or to close a ticket: its crate
-/// does not depend on the crate that does, and its publisher holds no
-/// writer at all.
+/// The rehearsal has no path to promote or to close a ticket.
+///
+/// Its crate does not depend on ANY crate that can write outside this
+/// process — the promoter, the releaser or the workspace exporter — so
+/// there is no route from the rehearsal to a real effect. Its publisher
+/// holds no writer at all: it can only record.
 #[test]
 fn the_rehearsal_cannot_reach_the_promoter() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("the crate manifest");
-    assert!(
-        !manifest.contains("hodei-mh-promote"),
-        "the rehearsal must not depend on the crate that promotes or writes: {manifest}"
-    );
+    for writer in ["hodei-mh-promote", "hodei-mh-release", "hodei-mh-workspace"] {
+        assert!(
+            !manifest.contains(writer),
+            "the rehearsal must not depend on '{writer}', a crate that writes outside the process: {manifest}"
+        );
+    }
 }

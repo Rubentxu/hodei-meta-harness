@@ -78,7 +78,7 @@ async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
         "gc-fixture",
         RuntimeIdentity::rehearsal("stub"),
     )));
-    let server_task = tokio::spawn(server::serve_with_runtime(
+    let server_task = tokio::spawn(server::serve(
         listener,
         core.clone(),
         Some(Arc::new(StubRuntime)),
@@ -163,7 +163,7 @@ async fn a_controller_without_a_runtime_refuses_to_start() {
     let listener = server::bind(&path).await.expect("bind");
     let core: Arc<Mutex<engine::SupervisorCore>> =
         Arc::new(Mutex::new(engine::default_core("gc-fixture")));
-    let server_task = tokio::spawn(server::serve(listener, core.clone()));
+    let server_task = tokio::spawn(server::serve(listener, core.clone(), None));
 
     let mut client = client::connect(&path).await.expect("connect");
     let start = client
@@ -202,7 +202,7 @@ async fn a_second_supervisor_cannot_steal_a_live_socket() {
     let listener = server::bind(&path).await.expect("bind");
     let core: Arc<Mutex<engine::SupervisorCore>> =
         Arc::new(Mutex::new(engine::default_core("gc-fixture")));
-    let server_task = tokio::spawn(server::serve(listener, core.clone()));
+    let server_task = tokio::spawn(server::serve(listener, core.clone(), None));
 
     // A second supervisor on the SAME socket must be refused: two live
     // cores would split the state (the clients would disagree).
@@ -228,7 +228,7 @@ async fn a_supervisor_may_restart_after_the_previous_one_crashed() {
     let listener = server::bind(&path).await.expect("bind");
     let core: Arc<Mutex<engine::SupervisorCore>> =
         Arc::new(Mutex::new(engine::default_core("first")));
-    let server_task = tokio::spawn(server::serve(listener, core));
+    let server_task = tokio::spawn(server::serve(listener, core, None));
     server_task.abort();
     // The socket file is still there; the listener is gone.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -237,7 +237,7 @@ async fn a_supervisor_may_restart_after_the_previous_one_crashed() {
     let listener = server::bind(&path).await.expect("restart binds");
     let core: Arc<Mutex<engine::SupervisorCore>> =
         Arc::new(Mutex::new(engine::default_core("second")));
-    let server_task = tokio::spawn(server::serve(listener, core));
+    let server_task = tokio::spawn(server::serve(listener, core, None));
     let mut client = client::connect(&path).await.expect("connect");
     let snapshot = client.snapshot().await.expect("snapshot");
     assert_eq!(snapshot.project, "second");
