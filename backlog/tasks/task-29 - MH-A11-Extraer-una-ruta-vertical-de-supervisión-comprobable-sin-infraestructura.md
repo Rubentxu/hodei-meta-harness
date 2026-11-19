@@ -3,11 +3,11 @@ id: TASK-29
 title: >-
   [MH-A11] Extraer una ruta vertical de supervisión comprobable sin
   infraestructura
-status: In Progress
+status: Done
 assignee:
   - '@rdcabrera'
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-19T02:14:00Z'
+updated_date: '2026-11-19T02:15:00Z'
 labels:
   - audit-v0.2
   - product
@@ -34,10 +34,10 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 CLI/TUI observan la misma máquina de estado; Start transita a Starting y Running únicamente por confirmación del runtime de ensayo o real identificado.
-- [ ] #2 Secuencia Start, Pause, Resume, Stop y error queda demostrada por un único test de producto con fake ACP y tracker; sin invocar Docker, red ni LLM.
-- [ ] #3 No hay nueva ruta de promoción/escritura en modo ensayo; estados de simulación están explícitos y no marcan tickets reales Done.
-- [ ] #4 Se elimina duplicación de decisiones entre supervisor y el flujo extraído, conservando compatibilidad de los comandos públicos o migración documentada.
+- [x] #1 CLI/TUI observan la misma máquina de estado; Start transita a Starting y Running únicamente por confirmación del runtime de ensayo o real identificado.
+- [x] #2 Secuencia Start, Pause, Resume, Stop y error queda demostrada por un único test de producto con fake ACP y tracker; sin invocar Docker, red ni LLM.
+- [x] #3 No hay nueva ruta de promoción/escritura en modo ensayo; estados de simulación están explícitos y no marcan tickets reales Done.
+- [x] #4 Se elimina duplicación de decisiones entre supervisor y el flujo extraído, conservando compatibilidad de los comandos públicos o migración documentada.
 <!-- AC:END -->
 
 ## Implementation Plan

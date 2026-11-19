@@ -3,7 +3,14 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
-updated_date: '2026-11-19T01:56:00Z'
+updated_date: '2026-11-19T02:16:00Z'
+---
+---
+id: doc-1
+title: handoff
+type: other
+created_date: '2026-11-18T21:38:00Z'
+updated_date: '2026-11-19T03:30:00Z'
 ---
 # Handoff
 
@@ -12,81 +19,117 @@ updated_date: '2026-11-19T01:56:00Z'
 
 ## Ahora
 
-- **TASK-29 (MH-A11) está EN CURSO y NO está cerrada.** La sesión que la empezó se quedó a medias
-  (terminó su turno sin cerrar nada) y el bucle la midió **FAIL**. **Continúa sobre lo que hay, no
-  desde cero: el trabajo está casi entero.**
-- Repo: `hodei-meta-harness` (`/home/rdcabrera/Proyectos/rust/goal-cycle-mh`), rama
-  `task/task-29-supervision-vertical-path`, commit `45420e6` con la primera parte (19 ficheros,
-  +969 líneas, y el crate nuevo `crates/hodei-mh-runner/`). `main` sigue en `8ebcecc`.
-- **El árbol NO COMPILA.** `cargo check --workspace --all-targets` → `rc=101`:
-  `error[E0277]: ObjectiveHandle doesn't implement Debug` en
-  `crates/hodei-mh-runner/src/rehearsal.rs:369:61` (una aserción de test formatea `{started:?}`).
-  **Arranca por aquí.**
-- Sesiones: perfil `cuenta-1` (MiniMax-M3.1-Flash). Lee "Aprendido": este perfil puede emitir el
-  markup de las herramientas **como texto**; si te pasa, reintenta la invocación.
+- **TASK-29 (MH-A11) está CERRADA.** No queda nada a medias: la tarea está `Done` con sus
+  cuatro AC comprobados, el PR está mergeado en `main` y las ramas de la tarea están
+  borradas en local y en remoto.
+- Repo: `hodei-meta-harness` (`/home/rdcabrera/Proyectos/rust/goal-cycle-mh`), en `main` y
+  con el árbol limpio. PR #40 (merge `c8f485c`), commits `45420e6` (extracción) + `6fe02a7`
+  (cableado) + `d2d82cf` (revisión) + `5c8bc3c` (cierre de tablero).
+- **La siguiente sesión arranca por TASK-30 (MH-A07, HIGH)**: es la de mayor prioridad del
+  plan v0.2 que sigue abierta. MH-A06 (TASK-34, el runtime ACP real) también está
+  desbloqueada y es el bloque natural siguiente, porque hoy **solo existe runtime de ensayo**.
+- Sesiones: perfil `cuenta-1` (MiniMax-M3.1-Flash). Lee "Aprendido": este perfil puede emitir
+  el markup de las herramientas **como texto**; si te pasa, reintenta la invocación.
 
 ## Última tarea cerrada
 
-- **TASK-28 (MH-A05) — Preparar workspaces y comandos sin transportar secretos del host.**
-  La exportación del workspace decide qué sale (denylist de salida: metadata de git, caches,
-  familia `.env`, claves y credenciales), la redacción ocurre **antes** de truncar o persistir y
-  conserva la estructura de la salida, y el fixture local con secretos sintéticos comprueba el
-  artefacto y los logs sin proveedor LLM. Los comandos del host no ejecutan URLs/proyectos con
-  caracteres especiales y ninguna credencial llega a `argv` ni a los logs.
-- Evidencia: PRs #38 y #39 (merge `f154e5b`), commit de cierre `70106c0`; `cargo fmt`,
-  `clippy -D warnings` y `scripts/fast-check.sh` PASS.
+- **TASK-29 (MH-A11) — Extraer una ruta vertical de supervisión comprobable sin
+  infraestructura.** El crate nuevo `hodei-mh-runner` separa el núcleo (un `GoalRunner` puro
+  con puertos `AgentPort`/`VerifierPort`/`PublisherPort`) del ensayo (`TrialRuntime` con
+  adaptadores guionizados y un `RecordingPublisher` SIN escritor). El supervisor lo consume
+  como runtime por el puerto `ObjectiveRuntime`, y la máquina de estados sigue siendo UNA: la
+  del engine del supervisor, con el `RunState` del crate `run` como único dueño y su fase
+  **privada** (`Running` solo se alcanza por `confirm()`). El binario sirve el runtime con el
+  controlador (`hodei-mh supervisor --rehearsal`): sin él, el `Start` se rechaza con "no
+  runtime is wired".
+- Evidencia: PR #40 (merge `c8f485c`); `cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` y `cargo test
+  --workspace --doc --locked` PASS; `hodei-mh supervisor-probe` con sus 11 checks verdes.
+- **Cuatro defectos REALES del camino que la sesión anterior dejó escrito** (no eran
+  hipótesis del diseño): (1) el controlador servía la socket **sin runtime**, así que un
+  `Start` se aceptaba y el run se quedaba en `Starting` para siempre; (2) el ensayo
+  **rechazaba el ticket nombrado** y mataba el run antes de empezar; (3) el aviso `SIMULATED`
+  de la TUI se **recortaba** en un terminal corto (un estado simulado sin aviso es
+  indistinguible de uno real); (4) la sonda **devolvía su última respuesta al vencer el plazo**,
+  de modo que un estado nunca alcanzado pasaba por alcanzado: el check del run en `running`
+  era un **verde falso**.
+- **Lo que encontró la revisión independiente del diseño** (dos revisores con contexto
+  nuevo) y se resolvió en la misma tarea: el hecho "hay runtime" estaba **decidido en dos
+  capas** sin que nada los atara (ahora el servidor es el único escritor); la confirmación
+  **no comprobaba la identidad** del runtime que confirmaba; la puerta de publicación
+  **comentaba una regla que el código no implementaba**; la fase de `RunState` era un campo
+  **público** (ahora la invariante la impone el tipo); y la superficie pública cambió de
+  comportamiento **sin nota de migración** (ya está en `docs/profiles.md`).
 
 ## Qué queda a medias
 
-- **Rama `task/task-29-supervision-vertical-path`, commit `45420e6`.**
-  - Crate nuevo `crates/hodei-mh-runner/` (`core.rs`, `ports.rs`, `rehearsal.rs`, `lib.rs` + tests):
-    `GoalRunner` puro con puertos `AgentPort`/`VerifierPort`/`PublisherPort`, la puerta pura
-    "sin evidencia no se publica" y el ensayo (`TrialTracker`, `ScriptedAgent`, `ScriptedVerifier`,
-    `RecordingPublisher`) **sin `WorkWriter`: el ensayo no puede escribir**.
-  - `crates/hodei-mh-run/`: `Phase::Starting` + `RuntimeIdentity{kind,id}` + `RunState::starting/confirm`
-    + puerto `ObjectiveRuntime` (el `RunState` sigue siendo UNO).
-  - `crates/hodei-mh-supervisor/`: `apply(Start) -> Starting` (nunca `Running` sin confirmación),
-    transiciones de `engine` (`confirm_runtime`/`refuse_runtime`), `Snapshot` con runtime y modo
-    (`Rehearsal|Live`), `server::serve` recibe el runtime.
-  - `crates/hodei-mh/`: `supervisor --rehearsal` cablea el runtime de ensayo; sin él, `Start` se
-    rechaza honestamente. Sondas y CLI apuntando al camino nuevo. `docs/profiles.md` actualizado.
-- **Lo que falta para cerrar TASK-29** (AC #1..#4):
-  1. Que el árbol compile (el error de arriba) y las pruebas de lo ya escrito.
-  2. El **test de producto único** `crates/hodei-mh-runner/tests/product_flow.rs`: socket real +
-     cliente real + runtime de ensayo → `Start` (Starting) → confirmación → `Running` → `Pause` →
-     `Resume` → `Stop` + el caso de error, con fake ACP y tracker, **sin Docker, red ni LLM**
-     (AC #2), y que el ensayo **no marque ningún ticket Done** (AC #3).
-  3. La prueba de que CLI y TUI observan la **misma** máquina de estado y que `Running` solo se
-     alcanza por confirmación del runtime de ensayo o real identificado (AC #1).
-  4. La revisión de que **no hay duplicación de decisiones** entre el supervisor y el flujo
-     extraído, con los comandos públicos compatibles o la migración documentada (AC #4).
-  5. Gates (`cargo fmt`, `clippy -D warnings`, `scripts/fast-check.sh`), PR con merge a `main` y
-     cierre de la tarea con su evidencia.
-- El plan completo (6 pasos, con lo ya hecho marcado) está en el tablero, en TASK-29
-  (Implementation Plan): léelo, no lo rederives.
+- Nada de TASK-29: los cuatro AC están comprobados con evidencia ejecutada y la tarea está
+  `Done`.
+- Lo que sigue es el plan v0.2: TASK-30 (MH-A07, HIGH), TASK-31 (MH-A08), TASK-33 (MH-A12),
+  TASK-34 (MH-A06), TASK-35 (MH-A13), TASK-36 (MH-A10), más TASK-38 y el descubrimiento
+  nuevo **TASK-39** (las sondas dejan los sockets de supervisor en /tmp: 205 ficheros
+  acumulados, ya limpiados en esta sesión pero la fuga sigue ahí).
+- **Límites que la tarea dejó anotados, no arreglados:** el runner evalúa la selección con
+  las reservas siempre vacías (la política de reservas la decide el runtime real);
+  `record_outcome` rechaza en silencio el veredicto de un objetivo parado en vuelo (hueco de
+  observabilidad, fijado por un test del engine); `Phase::Stopping` no lo observa ningún
+  cliente.
+- **Dato para la siguiente sesión:** la pista de sondas completa (`multiproject-probe`) falla
+  en esta máquina por INFRAESTRUCTURA, no por el código: no hay lifecycle server en `:8081`,
+  así que no hay sandboxes ni builds (`error sending request for url
+  (http://127.0.0.1:8081/v1/sandboxes/)`). Docker sí está (29.1.3). No lo tomes por una
+  regresión.
 
 ## Recursos liberados
 
 | Recurso | Qué era | Liberado |
 | --- | --- | --- |
-| ramas local y remota | `task/task-27-atomic-admission`, `task/task-28-workspace-secretless-export`, `task/task-28-fixture-cleanup` | sí (PRs #37, #38 y #39 mergeados con `--delete-branch`) |
-| contenedores y sandboxes | los de las sondas | sí (la pista informó `sandboxes=0 containers=0 networks=0`) |
-| procesos auxiliares | servidor de presupuesto en 8099 y lifecycle en 8081 | sí (la pista los cierra) |
+| rama local y remota | `task/task-29-supervision-vertical-path` | sí (PR #40 mergeado y rama borrada en local y en remoto) |
+| worktrees de git | ninguno creado (el bucle trabaja en el MISMO worktree) | — |
+| sockets de supervisor en /tmp | 204 ficheros rancios de corridas anteriores de la sonda | sí (borrados; no había ningún proceso escuchando detrás: `ss -xl` no listaba ninguno) |
+| contenedores y sandboxes | los de la sonda multiproject | sí (no queda ningún contenedor de hodei: `docker ps -a` solo muestra el cluster `cluster-portatil-*`, que es de otra cosa y **NO** se ha tocado) |
+| procesos auxiliares | ninguno (las sondas matan a sus supervisores) | sí (no queda ningún proceso `hodei-mh` en marcha) |
+| ficheros temporales de la sesión | scripts, logs y veredictos en `/tmp/t29-*` | sí |
 | gateway local `qoder2api-hub` | systemd de usuario en 127.0.0.1:8790 | **NO**: sigue en pie a propósito (perfil `cuenta-9`); con *hold* en `/run/user/1001/proxy-hold-qoder2api-hub.service.hold` para que el temporizador de inactividad no lo pare |
-| rama `task/task-29-supervision-vertical-path` | trabajo a medias de TASK-29 | **NO**: es la rama de la tarea en curso; se libera al cerrar la tarea |
+| `/tmp/hodei-mh-offline-docker.sock` | fichero guard de otra sesión | **NO**: no es de esta tarea |
 
 ## Aprendido
 
+- **Un hecho duplicado en dos capas es un bug esperando.** "Hay runtime" vivía en el flag
+  `core.runtime` del engine y en el argumento `runtime` del servidor, y nada los ataba: un
+  desajuste dejaba un `Start` APLICADO con el run en `Starting` para siempre, sin fallo ni
+  plazo. Y el bug que realmente rompió el producto fue EXACTAMENTE eso (la CLI llamaba a la
+  función `serve` sin runtime). Ahora el servidor es el único escritor y el runtime que nombra
+  el snapshot es el que ejecuta. **Un solo hecho, un solo escritor.**
+- **Una invariante que solo la sostiene la disciplina no es una invariante.** La fase de
+  `RunState` era un campo público: cualquiera podía declarar `Running` sin confirmación.
+  Ahora es privada y se lee por `phase()`: la regla la impone el tipo.
+- **Un check que devuelve su última respuesta al vencer el plazo es un VERDE FALSO.** El
+  cambio de una línea (`Some` → `None` al expirar) destapó tres defectos de producto que la
+  sonda llevaba tiempo ocultando. Cuando un deadline vence, el resultado debe ser "no se
+  alcanzó", nunca "lo último que vi".
+- **Un aviso al final de un panel es un aviso que se recorta.** El aviso `SIMULATED` de la
+  TUI desaparecía en un terminal de 34 líneas. Un aviso que no se ve es peor que ningún
+  aviso, porque el lector cree que no hay nada que avisar: los avisos van PRIMERO.
+- **Un comentario que describe una regla que el código no implementa es una mentira en el
+  código.** La puerta de publicación cubría ids de checks, no evidencia. El comentario dice
+  ahora la regla real, y la puerta ligada a la evidencia queda para el verificador real de
+  MH-A06.
+- **La revisión goldfish aquí fue PARCIAL, y hay que decirlo**: el canario de aislamiento dio
+  bien (el marcador de la conversación del padre NO apareció en el hijo: conversación
+  nueva), pero el host inyecta `CLAUDE.md`, la memoria y el estado de git al subagente. Es
+  `sourcesRestricted=false`: es una segunda opinión con contexto fresco, no una auditoría
+  aislada. Sus hallazgos son candidatos, no defectos certificados, y se resolvieron uno a uno
+  contra el código. Ver `[[goldfish-partial-isolation]]`.
+- **Continuar el trabajo a medias es más barato que repetirlo**: la sesión anterior dejó 19
+  ficheros y 969 líneas commiteados y un error de compilación; esta sesión no rediseñó nada,
+  solo arregló y VERIFICÓ. Por eso el trabajo a medias se commitea en la rama de la tarea y
+  se documenta aquí.
 - **Un modelo que corta el turno a mitad de tarea se mide FAIL, y el trabajo se pierde**: la
-  sesión terminó con `is_error=false` y `stop_reason=end_turn` después de 90 turnos y 38 min, con el
-  último mensaje anunciando lo que iba a hacer a continuación. Por eso el trabajo a medias se
-  commitea en la rama de la tarea y se documenta aquí: sin eso, la siguiente sesión repite 38
-  minutos de diseño.
-- **Un perfil puede emitir el markup de las herramientas COMO TEXTO**: con `cuenta-1` (MiniMax)
-  el transcript muestra 92 reenvíos del mismo prompt y respuestas del tipo
-  `<invoke name="Edit">…<file_path>…` escritos en el contenido del assistant en vez de bloques
-  `tool_use`: el cliente no los ejecuta, repite, y la sesión muere (`end_turn`) sin cerrar nada.
-  Cuando veas ese markup en tu propia salida, **no lo copies al fichero**: invoca la herramienta.
-- **El bucle se cura entre iteraciones**: una sesión que se queda a medias deja su trabajo
-  commiteado y documentado, y la siguiente sesión lo continúa y cierra la tarea (TASK-28 se cerró
-  así: la primera sesión se quedó a medias y la segunda la terminó).
+  sesión anterior terminó con `is_error=false` y `stop_reason=end_turn` tras 90 turnos. De
+  ahí el commiteo del trabajo a medias en la rama de la tarea.
+- **Un perfil puede emitir el markup de las herramientas COMO TEXTO**: con `cuenta-1`
+  (MiniMax) el transcript muestra el prompt reenviado y respuestas del tipo
+  `<invoke name="Edit">…` escritas en el contenido del assistant en vez de bloques
+  `tool_use`: el cliente no los ejecuta, repite, y la sesión muere sin cerrar nada. Cuando
+  veas ese markup en tu propia salida, **no lo copies al fichero**: invoca la herramienta.
