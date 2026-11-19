@@ -18,8 +18,7 @@ use opensandbox::execd::frames::ServerEvent;
 use serde_json::{Value, json};
 
 use promote::git;
-use promote::ledger::{PromotionLedger, PromotionPlan};
-use promote::ticket::TicketUpdate;
+use promote::intent::{PromotionFacts, PromotionIntent};
 use promote::writer::{BacklogWorkWriter, WorkWriter};
 use verify::evidence::EvidenceSet;
 use verify::git::{GitRevision, GitTree};
@@ -511,7 +510,8 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             break;
         }
 
-        // PROMOTE by CAS onto the managed branch, ledger-first.
+        // PROMOTE by CAS onto the managed branch, with the intent of the
+        // attempt stated before the promotion.
         let current_base = Command::new("git")
             .args([
                 "-C",
@@ -525,19 +525,36 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             .unwrap_or_default();
         let candidate_branch = "main";
         let _ = std::fs::write(base.join("candidate-out.bundle"), &candidate_bundle);
-        let mut ledger = PromotionLedger::plan(PromotionPlan {
+        // The intent of the promotion: the candidate it names, the base it
+        // applies to and the evidence that closes the ticket. The marker
+        // of the operation travels in the note, so a resumed attempt knows
+        // the evidence is already there.
+        let candidate_head =
+            git::candidate_head(&base.join("candidate-out.bundle"), candidate_branch)
+                .unwrap_or_default();
+        let intent = match PromotionIntent::new(PromotionFacts {
+            project: "autonomous".into(),
             work_ref: ticket.clone(),
+            epoch: 1,
             managed_branch: "hodei-mh/main".into(),
-            base_ref: current_base.clone(),
+            expected_base: current_base.clone(),
+            expected_candidate: candidate_head,
             target_status: "Done".into(),
-            update: TicketUpdate {
-                note: "Evidencia: verificado en entorno limpio (CleanRunner), commit del candidato promovido por CAS."
-                    .to_string(),
-                check_ac: vec![1],
-                final_summary: format!("Paso {step_index} completado por el bucle autónomo."),
-                target_status: "Done".into(),
-            },
-        });
+            note: "Evidencia: verificado en entorno limpio (CleanRunner), commit del candidato promovido por CAS."
+                .to_string(),
+            check_ac: vec![1],
+            final_summary: format!("Paso {step_index} completado por el bucle autónomo."),
+        }) {
+            Ok(intent) => intent,
+            Err(error) => {
+                steps.push(Step {
+                    name: "promote",
+                    passed: false,
+                    detail: format!("round {round}: the intent is not usable: {error}"),
+                });
+                break;
+            }
+        };
         // The promotion demands the evidence of the candidate it promotes:
         // the same work, the same commit and the very bundle that was
         // verified. The CAS is unchanged; the evidence gate is a
@@ -562,7 +579,6 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
                 break;
             }
         };
-        ledger.record_promoted(&commit);
         // The NEXT conversation ships THIS promoted state (AC-2): refresh the
         // bundle the loop ships to new sandboxes by building it from the
         // managed branch.
@@ -577,11 +593,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             ],
         );
         // CLOSE the ticket through the official CLI (real re-read applies).
-        let applied = writer.apply(ticket, &ledger.plan.update).is_ok();
+        let applied = writer.apply(ticket, &intent.update).is_ok();
         let snapshot = writer.read_ticket(ticket);
         let closed = snapshot.map(|s| s.status == "Done").unwrap_or(false);
-        let recovery = ledger.recovery();
-        let _ = recovery;
         completed.push(ticket.clone());
         steps.push(Step {
             name: "cycle",

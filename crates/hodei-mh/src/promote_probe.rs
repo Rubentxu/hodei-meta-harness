@@ -1,16 +1,31 @@
-//! `hodei-mh promote-probe`: TASK-10 vertical slice — CAS git promotion with
-//! a write-ahead ledger, crash recovery between git and the official CLI,
-//! re-read verification, and tracker-failure conservation, all against a
-//! real example project (real git repo + real backlog).
+//! `hodei-mh promote-probe`: the promotion of a candidate and the closure
+//! of its ticket as ONE attempt, against a real example project (a real git
+//! repo, a real tracker and the real durable store).
+//!
+//! What it proves: the intent is written BEFORE the effect, a tracker that
+//! fails does not lose the promoted work, a crash is resumed by observing
+//! the two authorities (the same commit, no second one, no duplicated note),
+//! the closure goes through the official CLI, and a change of a person is
+//! never overwritten.
+//!
+//! The evidence of the candidate is DECLARED here with the shape the
+//! verifier mints: this probe is about the promotion and the closure, not
+//! about the verification, which is the verify-probe's subject.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use hodei_mh_coordinator::core::ClaimResult;
+use hodei_mh_coordinator::store::CoordinatorStore;
 use hodei_mh_workspace::git as workspace_git;
-use promote::git::{self, PromoteError};
-use promote::ledger::{LedgerPhase, PromotionLedger, PromotionPlan, RecoveryAction};
-use promote::ticket::TicketUpdate;
+use promote::flow::{PromotionRequest, execute};
+use promote::git;
+use promote::intent::{Conflict, PromotionFacts, PromotionIntent};
+use promote::journal::{CoordinatorJournal, IntentJournal};
 use promote::writer::{BacklogWorkWriter, WorkWriter};
+use serde_json::json;
+use verify::evidence::EvidenceSet;
+use verify::transport::TransportDigest;
 
 struct ProbeCheck {
     name: &'static str,
@@ -54,6 +69,9 @@ fn commit_file(repo: &Path, name: &str, message: &str) -> Option<String> {
 struct ExampleProject {
     root: PathBuf,
     ticket_id: String,
+    base: String,
+    candidate: String,
+    tree: String,
 }
 
 fn make_example_project(base_dir: &Path) -> Option<ExampleProject> {
@@ -117,7 +135,11 @@ fn make_example_project(base_dir: &Path) -> Option<ExampleProject> {
     git_out(&root, &["branch", "-q", "hodei-mh/main", &base])?;
     // Candidate branch: one commit on top of base, exported as a bundle.
     git_out(&root, &["checkout", "-q", "-b", "candidate"])?;
-    let _head = commit_file(&root, "feature.txt", "candidate work")?;
+    let candidate = commit_file(&root, "feature.txt", "candidate work")?;
+    let tree = git_out(&root, &["rev-parse", "candidate^{tree}"])?
+        .1
+        .trim()
+        .to_string();
     let bundle = base_dir.join("candidate.bundle");
     if !git_out(
         &root,
@@ -128,7 +150,13 @@ fn make_example_project(base_dir: &Path) -> Option<ExampleProject> {
         return None;
     }
     git_out(&root, &["checkout", "-q", "main"])?;
-    Some(ExampleProject { root, ticket_id })
+    Some(ExampleProject {
+        root,
+        ticket_id,
+        base,
+        candidate,
+        tree,
+    })
 }
 
 fn configured_statuses(project: &Path) -> Vec<String> {
@@ -145,6 +173,66 @@ fn configured_statuses(project: &Path) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The evidence of the candidate, declared with the shape the verifier
+/// mints: the promotion needs evidence that speaks for the candidate, and
+/// this probe is about what happens with it, not about minting it.
+fn declared_evidence(work_ref: &str, revision: &str, tree: &str, bundle: &[u8]) -> EvidenceSet {
+    let digest = TransportDigest::of(bundle);
+    let document = json!({
+        "work_ref": work_ref,
+        "binding": {
+            "revision": revision,
+            "tree": tree,
+            "transport_digest": digest.as_str(),
+            "required_checks": [{"id": "AC-1", "command": "make check"}],
+            "image_id": "sha256:image",
+            "environment": "sha256:image::sandbox-1"
+        },
+        "entries": [{
+            "result": {
+                "check_id": "AC-1",
+                "environment": "sha256:image::sandbox-1",
+                "image_id": "sha256:image",
+                "tree": tree,
+                "transport_digest": digest.as_str(),
+                "command": "make check",
+                "record": {
+                    "command": "make check",
+                    "exit_code": 0,
+                    "output": "ok",
+                    "output_truncated": false,
+                    "stream_completed": true
+                }
+            },
+            "status": "Valid"
+        }]
+    });
+    serde_json::from_value(document).expect("the evidence document is well formed")
+}
+
+/// The attempt, against a tracker and a durable store.
+fn attempt(
+    intent: &PromotionIntent,
+    evidence: &EvidenceSet,
+    project: &ExampleProject,
+    bundle: &Path,
+    writer: &BacklogWorkWriter,
+    store: &mut CoordinatorStore,
+) -> Result<promote::flow::PromotionReport, promote::flow::PromotionError> {
+    let mut journal = CoordinatorJournal::new(store);
+    execute(
+        PromotionRequest {
+            intent,
+            evidence,
+            repo: &project.root,
+            bundle,
+            candidate_branch: "candidate",
+        },
+        writer,
+        &mut journal,
+    )
 }
 
 pub async fn run() -> i32 {
@@ -171,133 +259,223 @@ pub async fn run() -> i32 {
         });
         return finish(&checks);
     };
-    let base_ref = git_out(&project.root, &["rev-parse", "hodei-mh/main"])
-        .and_then(|(ok, out, _)| ok.then(|| out.trim().to_string()))
-        .unwrap_or_default();
+    let bundle = base_dir.join("candidate.bundle");
     checks.push(ProbeCheck {
         name: "example-project-setup",
-        passed: !base_ref.is_empty() && Path::new(&base_dir.join("candidate.bundle")).exists(),
+        passed: project.base.len() == 40 && project.candidate.len() == 40 && bundle.exists(),
         detail: format!(
-            "ticket {} target '{target_status}' base {base}..",
+            "ticket {} target '{target_status}' base {}.. candidate {}..",
             project.ticket_id,
-            base = &base_ref[..8]
+            &project.base[..8],
+            &project.candidate[..8]
         ),
     });
 
-    // Plan written to the outbox BEFORE any effect (write-ahead).
-    let ledger_path = base_dir.join("outbox.json");
-    let bundle = base_dir.join("candidate.bundle");
-    let mut ledger = PromotionLedger::plan(PromotionPlan {
-        work_ref: project.ticket_id.clone(),
-        managed_branch: "hodei-mh/main".into(),
-        base_ref: base_ref.clone(),
-        target_status: target_status.clone(),
-        update: TicketUpdate {
-            note: "Evidencia: candidato promovido por promote-probe".into(),
-            check_ac: vec![1],
-            final_summary: "Candidato integrado y ticket cerrado sin doble verdad.".into(),
-            target_status: target_status.clone(),
-        },
-    });
-    let _ = std::fs::write(&ledger_path, ledger.to_json().unwrap_or_default());
-
-    // CAS promotion against the verified base.
-    let promoted = git::promote_ff_only_unchecked(
-        &project.root,
-        "hodei-mh/main",
-        &bundle,
-        "candidate",
-        &base_ref,
-    );
-    let commit = match promoted {
-        Ok(commit) => commit,
-        Err(err) => {
+    // The durable store of the project, and the claim of the ticket: the
+    // attempt is fenced to it.
+    let mut store = match CoordinatorStore::open("promote-probe", &base_dir.join("state.db")) {
+        Ok(store) => store,
+        Err(error) => {
             checks.push(ProbeCheck {
-                name: "cas-promotion",
+                name: "durable-store-opens",
                 passed: false,
-                detail: err.to_string(),
+                detail: error.to_string(),
             });
             return finish(&checks);
         }
     };
-    ledger.record_promoted(&commit);
-    let _ = std::fs::write(&ledger_path, ledger.to_json().unwrap_or_default());
-    checks.push(ProbeCheck {
-        name: "cas-promotion",
-        passed: git::ensure_ref(&project.root, "hodei-mh/main", &commit).unwrap_or(false),
-        detail: format!("managed branch now at {}..", &commit[..8]),
-    });
-
-    // CRASH: drop the ledger, reload from disk, classify recovery.
-    let reloaded =
-        PromotionLedger::from_json(&std::fs::read_to_string(&ledger_path).unwrap_or_default());
-    let Some(reloaded) = reloaded.ok().filter(|l| l == &ledger) else {
-        checks.push(ProbeCheck {
-            name: "crash-recovers-same-commit",
-            passed: false,
-            detail: "outbox reload mismatch".into(),
-        });
-        return finish(&checks);
-    };
-    let mut ledger = reloaded;
-    let reconcile_ok = ledger.recovery()
-        == RecoveryAction::ReconcileTracker {
-            commit: commit.clone(),
+    let epoch =
+        match store.transact(|state| Ok(state.try_claim(&project.ticket_id, "promote-probe"))) {
+            Ok(ClaimResult::Granted(claim)) => claim.epoch,
+            Ok(ClaimResult::Denied { holder }) => {
+                checks.push(ProbeCheck {
+                    name: "durable-store-opens",
+                    passed: false,
+                    detail: format!("the ticket is claimed by {holder}"),
+                });
+                return finish(&checks);
+            }
+            Err(error) => {
+                checks.push(ProbeCheck {
+                    name: "durable-store-opens",
+                    passed: false,
+                    detail: error.to_string(),
+                });
+                return finish(&checks);
+            }
         };
-    checks.push(ProbeCheck {
-        name: "crash-recovers-same-commit",
-        passed: reconcile_ok,
-        detail: format!("recovery reconciles THE SAME commit {}..", &commit[..8]),
-    });
 
-    // Tracker failure (AC-4): the technical work survives, nothing is lost.
-    let broken_writer = BacklogWorkWriter {
-        bin: "backlog".into(),
-        working_dir: base_dir.clone(), // no backlog here -> CLI fails
+    // The intent of the attempt: the candidate it names, the base it
+    // applies to, the ticket and the epoch.
+    let intent = match PromotionIntent::new(PromotionFacts {
+        project: "promote-probe".into(),
+        work_ref: project.ticket_id.clone(),
+        epoch,
+        managed_branch: "hodei-mh/main".into(),
+        expected_base: project.base.clone(),
+        expected_candidate: project.candidate.clone(),
+        target_status: target_status.clone(),
+        note: "Evidencia: candidato promovido por promote-probe".into(),
+        check_ac: vec![1],
+        final_summary: "Candidato integrado y ticket cerrado sin doble verdad.".into(),
+    }) {
+        Ok(intent) => intent,
+        Err(error) => {
+            checks.push(ProbeCheck {
+                name: "the-intent-states-the-candidate",
+                passed: false,
+                detail: error.to_string(),
+            });
+            return finish(&checks);
+        }
     };
-    let failed = ledger.plan.update.clone();
-    let apply_err = broken_writer.apply(&project.ticket_id, &failed).is_err();
-    let work_intact = git::ensure_ref(&project.root, "hodei-mh/main", &commit).unwrap_or(false)
-        && ledger.recovery()
-            == RecoveryAction::ReconcileTracker {
-                commit: commit.clone(),
-            };
-    checks.push(ProbeCheck {
-        name: "tracker-failure-conserves-work",
-        passed: apply_err && work_intact,
-        detail: format!(
-            "apply failed as expected; promoted commit intact={work_intact}; ledger still pending"
-        ),
-    });
-
-    // Reconcile through the official CLI against the real backlog.
+    let bytes = std::fs::read(&bundle).unwrap_or_default();
+    let evidence = declared_evidence(
+        &project.ticket_id,
+        &project.candidate,
+        &project.tree,
+        &bytes,
+    );
     let writer = BacklogWorkWriter {
         bin: "backlog".into(),
         working_dir: project.root.clone(),
     };
-    let update_ok = writer
-        .apply(&project.ticket_id, &ledger.plan.update)
-        .is_ok();
-    ledger.record_tracker_updated();
+
+    // The tracker fails: the promotion happens and the closure does not.
+    // The attempt must not lose the promoted work.
+    let broken_writer = BacklogWorkWriter {
+        bin: "backlog".into(),
+        working_dir: base_dir.clone(), // no backlog here -> the CLI fails
+    };
+    let failed = attempt(
+        &intent,
+        &evidence,
+        &project,
+        &bundle,
+        &broken_writer,
+        &mut store,
+    );
+    let tracker_failed = failed.is_err();
+    let work_intact =
+        git::ensure_ref(&project.root, "hodei-mh/main", &project.candidate).unwrap_or(false);
     checks.push(ProbeCheck {
-        name: "official-cli-update",
-        passed: update_ok,
+        name: "tracker-failure-conserves-work",
+        passed: tracker_failed && work_intact,
         detail: format!(
-            "ticket {} updated: notes appended, AC checked, status '{target_status}'",
-            project.ticket_id
+            "the tracker failed as expected ({:?}); the promoted commit is intact={work_intact}",
+            failed.as_ref().err().map(|error| error.to_string())
         ),
     });
 
-    // Real re-read of the ticket: closure is verified, prior content conserved.
+    // The intent was written BEFORE the effect, so it is there even though
+    // the closure did not happen.
+    let recorded = {
+        let journal = CoordinatorJournal::new(&mut store);
+        journal.load(&intent.operation_id)
+    };
+    let recorded = match recorded {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            checks.push(ProbeCheck {
+                name: "the-intent-is-written-before-the-effect",
+                passed: false,
+                detail: "the attempt was not recorded".into(),
+            });
+            return finish(&checks);
+        }
+        Err(error) => {
+            checks.push(ProbeCheck {
+                name: "the-intent-is-written-before-the-effect",
+                passed: false,
+                detail: error.to_string(),
+            });
+            return finish(&checks);
+        }
+    };
+    checks.push(ProbeCheck {
+        name: "the-intent-is-written-before-the-effect",
+        passed: recorded.intent.same_attempt(&intent)
+            && recorded
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.is_applied()),
+        detail: format!(
+            "operation {} recorded with the candidate {}.. and the outcome {:?}",
+            intent.operation_id,
+            &project.candidate[..8],
+            recorded.outcome
+        ),
+    });
+
+    // CRASH RESUMED: the attempt runs again. It observes what happened and
+    // does only what is left to do: the candidate is not promoted again
+    // and the note is not duplicated.
+    let resumed = attempt(&intent, &evidence, &project, &bundle, &writer, &mut store);
+    let branch_after = git_out(&project.root, &["rev-parse", "hodei-mh/main"])
+        .map(|(_, out, _)| out.trim().to_string())
+        .unwrap_or_default();
+    let notes_after = writer
+        .read_ticket(&project.ticket_id)
+        .map(|snapshot| snapshot.notes)
+        .unwrap_or_default();
+    let marker_count = notes_after.matches(&intent.marker()).count();
+    checks.push(ProbeCheck {
+        name: "crash-resumes-the-same-commit-without-duplicating",
+        passed: resumed.as_ref().is_ok_and(|report| !report.promoted && report.closed)
+            && branch_after == project.candidate
+            && marker_count == 1,
+        detail: format!(
+            "the branch is at {}.., the note of the operation appears {marker_count} time(s), the resumed attempt promoted={} closed={}",
+            &branch_after[..8.min(branch_after.len())],
+            resumed.as_ref().map(|report| report.promoted).unwrap_or(true),
+            resumed.as_ref().map(|report| report.closed).unwrap_or(false),
+        ),
+    });
+
+    // The record of the attempt carries the facts it was written with, and
+    // it says that the operation finished.
+    let recorded = {
+        let journal = CoordinatorJournal::new(&mut store);
+        journal.load(&intent.operation_id)
+    };
+    let recorded = match recorded {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            checks.push(ProbeCheck {
+                name: "the-record-carries-the-facts",
+                passed: false,
+                detail: "the attempt was not recorded".into(),
+            });
+            return finish(&checks);
+        }
+        Err(error) => {
+            checks.push(ProbeCheck {
+                name: "the-record-carries-the-facts",
+                passed: false,
+                detail: error.to_string(),
+            });
+            return finish(&checks);
+        }
+    };
+    checks.push(ProbeCheck {
+        name: "the-record-carries-the-facts",
+        passed: recorded.intent.same_attempt(&intent)
+            && recorded.outcome.is_some_and(|outcome| outcome.is_applied()),
+        detail: format!(
+            "operation {} recorded with the candidate {}..",
+            intent.operation_id,
+            &project.candidate[..8]
+        ),
+    });
+
+    // Real re-read of the ticket: the closure is verified, the prior
+    // content is conserved.
     let snapshot = writer.read_ticket(&project.ticket_id);
-    let ticket_ok = snapshot
-        .as_ref()
-        .map(|snap| {
-            snap.status == target_status
-                && snap.checked_ac.contains(&1)
-                && snap.raw.contains("creado por el probe")
-        })
-        .unwrap_or(false);
+    let ticket_ok = snapshot.as_ref().is_ok_and(|snap| {
+        snap.status == target_status
+            && snap.checked_ac.contains(&1)
+            && snap.raw.contains("creado por el probe")
+    });
     let (reread_status, reread_acs) = snapshot
         .map(|s| (s.status, s.checked_ac))
         .unwrap_or_else(|_| (String::new(), Vec::new()));
@@ -309,27 +487,8 @@ pub async fn run() -> i32 {
         ),
     });
 
-    // Real re-read of the branch: the SAME commit, no duplicates.
-    let branch_ok = git::ensure_ref(&project.root, "hodei-mh/main", &commit).unwrap_or(false);
-    ledger.confirm();
-    let idempotent = ledger.recovery()
-        == RecoveryAction::AlreadyDone {
-            commit: commit.clone(),
-        };
-    checks.push(ProbeCheck {
-        name: "branch-reread-and-idempotent-close",
-        passed: branch_ok
-            && idempotent
-            && ledger.phase
-                == LedgerPhase::Confirmed {
-                    commit: commit.clone(),
-                },
-        detail: "branch at persisted commit; repeated recovery is AlreadyDone; no second commit"
-            .to_string(),
-    });
-
-    // AC-2: a human change on the managed branch after verification forces
-    // revalidation; nothing human is lost and no second ticket path is taken.
+    // A change of a person on the managed branch: the attempt is refused,
+    // and nothing of that person is touched.
     let checkouts_ok = git_out(&project.root, &["checkout", "-q", "hodei-mh/main"])
         .map(|(ok, _, _)| ok)
         .unwrap_or(false);
@@ -343,26 +502,22 @@ pub async fn run() -> i32 {
         None
     };
     git_out(&project.root, &["checkout", "-q", "main"]);
-    let moved = git::promote_ff_only_unchecked(
-        &project.root,
-        "hodei-mh/main",
-        &bundle,
-        "candidate",
-        &base_ref,
-    );
-    let moved_ok = matches!(moved, Err(PromoteError::BaseMoved { .. }));
+    let moved = attempt(&intent, &evidence, &project, &bundle, &writer, &mut store);
+    let refused = moved
+        .as_ref()
+        .is_ok_and(|report| matches!(report.conflict, Some(Conflict::RefMoved { .. })));
     let human_intact = human
         .as_deref()
         .map(|h| git::ensure_ref(&project.root, "hodei-mh/main", h).unwrap_or(false))
         .unwrap_or(false);
     let notes_still_there = writer
         .read_ticket(&project.ticket_id)
-        .map(|s| s.raw.contains("creado por el probe") && s.raw.contains("Evidencia"))
+        .map(|s| s.notes.contains("Evidencia"))
         .unwrap_or(false);
     checks.push(ProbeCheck {
         name: "base-move-forces-revalidation-conserving-humans",
-        passed: moved_ok && human_intact && notes_still_there,
-        detail: "stale promotion rejected (BaseMoved); human commit intact; ticket notes conserved"
+        passed: refused && human_intact && notes_still_there,
+        detail: "the attempt is refused (the branch moved); the human commit is intact; the notes are conserved"
             .to_string(),
     });
 
