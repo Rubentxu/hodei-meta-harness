@@ -14,11 +14,40 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::engine::{self, SupervisorCore};
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, SupervisorAction};
+
+/// How long a runtime has to CONFIRM an objective it accepted. A runtime
+/// that never answers would leave the run in `Starting` forever; the
+/// deadline turns that into an explicit, visible failure.
+pub const CONFIRMATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The in-flight execution, so a Stop can cancel it.
+type Pending = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+/// What one request asks the server to do next.
+#[derive(Debug, Clone, PartialEq)]
+enum FollowUp {
+    Nothing,
+    /// Hand the objective to the runtime.
+    Execute {
+        request: ObjectiveRequest,
+        epoch: u64,
+    },
+    /// The run was stopped: the in-flight execution must be cancelled.
+    Cancel,
+}
+
+/// One request and its answer.
+#[derive(Debug, Clone, PartialEq)]
+struct Handled {
+    response: Response,
+    follow_up: FollowUp,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -93,13 +122,30 @@ async fn supervisor_is_alive(path: &Path) -> bool {
 /// Accept loop: serve every connection until the listener breaks for good.
 /// The core is shared; requests are handled sequentially per connection.
 pub async fn serve(listener: UnixListener, core: SharedCore) -> std::io::Result<()> {
+    serve_with_runtime(listener, core, None).await
+}
+
+/// The controller WITH a runtime: an applied Start hands the objective to
+/// it, and the runtime's confirmation is what moves the run to `Running`.
+///
+/// Without a runtime the controller still serves its surface, but a Start
+/// is refused: the engine refuses it, because a run that nobody can
+/// execute is not a run.
+pub async fn serve_with_runtime(
+    listener: UnixListener,
+    core: SharedCore,
+    runtime: Option<Arc<dyn ObjectiveRuntime>>,
+) -> std::io::Result<()> {
+    let pending: Pending = Arc::new(Mutex::new(None));
     let mut consecutive_errors = 0u32;
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 consecutive_errors = 0;
                 let core = core.clone();
-                tokio::spawn(handle_connection(stream, core));
+                let runtime = runtime.clone();
+                let pending = pending.clone();
+                tokio::spawn(handle_connection(stream, core, runtime, pending));
             }
             Err(e) => {
                 // A transient accept failure (fd exhaustion, EINTR) must not
@@ -115,28 +161,125 @@ pub async fn serve(listener: UnixListener, core: SharedCore) -> std::io::Result<
     }
 }
 
-async fn handle_connection(stream: UnixStream, core: SharedCore) -> std::io::Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    core: SharedCore,
+    runtime: Option<Arc<dyn ObjectiveRuntime>>,
+    pending: Pending,
+) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        let response = respond_to_line(&core, &line);
-        let mut payload = serde_json::to_string(&response).expect("response serializes");
+        let handled = respond_to_line(&core, &line);
+        let mut payload = serde_json::to_string(&handled.response).expect("response serializes");
         payload.push('\n');
         writer.write_all(payload.as_bytes()).await?;
+        // The runtime runs OUTSIDE the lock: the core is never held
+        // across an await.
+        match handled.follow_up {
+            FollowUp::Nothing => {}
+            FollowUp::Execute { request, epoch } => {
+                spawn_execution(
+                    core.clone(),
+                    runtime.clone(),
+                    pending.clone(),
+                    request,
+                    epoch,
+                );
+            }
+            FollowUp::Cancel => cancel_execution(&pending),
+        }
     }
     Ok(())
 }
 
+/// Hand the objective to the runtime and apply what it reports.
+///
+/// The runtime NEVER runs while the core is locked: the lock is taken
+/// only to read the epoch and to apply the outcome.
+fn spawn_execution(
+    core: SharedCore,
+    runtime: Option<Arc<dyn ObjectiveRuntime>>,
+    pending: Pending,
+    request: ObjectiveRequest,
+    epoch: u64,
+) {
+    let Some(runtime) = runtime else {
+        // The engine refuses a Start when no runtime is wired, so this
+        // cannot happen; the guard keeps the failure honest anyway.
+        return;
+    };
+    let handle = tokio::spawn(async move {
+        let started = tokio::time::timeout(CONFIRMATION_DEADLINE, runtime.start(request)).await;
+        match started {
+            Ok(Ok(objective)) => {
+                {
+                    let mut guard = lock_core(&core);
+                    engine::confirm_runtime(&mut guard, epoch);
+                }
+                // The objective ends on its own time; its verdict is
+                // recorded when it does.
+                let outcome = objective.completion().await;
+                let mut guard = lock_core(&core);
+                engine::record_outcome(&mut guard, epoch, outcome);
+            }
+            Ok(Err(error)) => {
+                let mut guard = lock_core(&core);
+                engine::record_outcome(
+                    &mut guard,
+                    epoch,
+                    ObjectiveOutcome::Failed {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+            Err(_elapsed) => {
+                let mut guard = lock_core(&core);
+                engine::record_outcome(
+                    &mut guard,
+                    epoch,
+                    ObjectiveOutcome::Failed {
+                        reason: format!(
+                            "the runtime did not confirm the objective within {}s",
+                            CONFIRMATION_DEADLINE.as_secs()
+                        ),
+                    },
+                );
+            }
+        }
+    });
+    // Keep the handle so a Stop can cancel the in-flight execution.
+    let mut slot = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = slot.replace(handle) {
+        previous.abort();
+    }
+}
+
+/// Cancel the in-flight execution: the user stopped the run.
+fn cancel_execution(pending: &Pending) {
+    let mut slot = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(handle) = slot.take() {
+        handle.abort();
+    }
+}
+
 /// Turn one NDJSON line into its response. An unparseable line is an
 /// ERROR response, never a silent snapshot.
-fn respond_to_line(core: &SharedCore, line: &str) -> Response {
+fn respond_to_line(core: &SharedCore, line: &str) -> Handled {
     match serde_json::from_str::<Request>(line) {
         Ok(request) => respond(core, request),
-        Err(e) => Response::Error {
-            message: format!("unparseable request: {e}"),
+        Err(e) => Handled {
+            response: Response::Error {
+                message: format!("unparseable request: {e}"),
+            },
+            follow_up: FollowUp::Nothing,
         },
     }
 }
@@ -160,15 +303,44 @@ fn lock_core(core: &SharedCore) -> MutexGuard<'_, SupervisorCore> {
 
 /// Answer one request against the shared core. The mutex lock is scoped
 /// tightly: pure decisions happen inside, only serialization outside.
-fn respond(core: &SharedCore, request: Request) -> Response {
+fn respond(core: &SharedCore, request: Request) -> Handled {
     let mut guard = lock_core(core);
     match request {
-        Request::Snapshot => Response::Snapshot(Box::new(engine::snapshot(&guard))),
+        Request::Snapshot => Handled {
+            response: Response::Snapshot(Box::new(engine::snapshot(&guard))),
+            follow_up: FollowUp::Nothing,
+        },
         Request::Events { since } => {
             let (events, next_seq) = engine::events_since(&guard, since);
-            Response::Events { events, next_seq }
+            Handled {
+                response: Response::Events { events, next_seq },
+                follow_up: FollowUp::Nothing,
+            }
         }
-        Request::Action { action } => Response::Action(engine::apply(&mut guard, action)),
+        Request::Action { action } => {
+            let starts = matches!(&action, SupervisorAction::Start { .. });
+            let stops = matches!(&action, SupervisorAction::Stop);
+            let outcome = engine::apply(&mut guard, action);
+            let follow_up = if starts && outcome.applied {
+                // The objective the client named, or none: the runtime
+                // selects the next eligible work when it was not named.
+                FollowUp::Execute {
+                    request: ObjectiveRequest {
+                        project: guard.project.clone(),
+                        work_ref: guard.ticket.clone(),
+                    },
+                    epoch: guard.epoch,
+                }
+            } else if stops && outcome.applied {
+                FollowUp::Cancel
+            } else {
+                FollowUp::Nothing
+            };
+            Handled {
+                response: Response::Action(outcome),
+                follow_up,
+            }
+        }
     }
 }
 
@@ -176,12 +348,13 @@ fn respond(core: &SharedCore, request: Request) -> Response {
 mod tests {
     use super::*;
     use crate::protocol::SupervisorAction;
+    use run::runtime::RuntimeIdentity;
 
     #[test]
     fn unparseable_requests_get_error_not_silence() {
         let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
-        let response = respond_to_line(&core, "garbage");
-        match response {
+        let handled = respond_to_line(&core, "garbage");
+        match handled.response {
             Response::Error { message } => assert!(
                 message.contains("unparseable request"),
                 "real error expected, got {message}"
@@ -193,12 +366,12 @@ mod tests {
     #[test]
     fn a_valid_line_is_answered_with_its_response() {
         let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
-        let response = respond_to_line(&core, r#"{"req":"snapshot"}"#);
-        assert!(matches!(response, Response::Snapshot(_)));
+        let handled = respond_to_line(&core, r#"{"req":"snapshot"}"#);
+        assert!(matches!(handled.response, Response::Snapshot(_)));
     }
 
     #[test]
-    fn actions_through_respond_are_applied_to_the_shared_core() {
+    fn a_start_without_a_runtime_is_refused_instead_of_pretended() {
         let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
         let request = Request::Action {
             action: SupervisorAction::Start {
@@ -207,13 +380,50 @@ mod tests {
                 revision: None,
             },
         };
-        let response = respond(&core, request);
-        match response {
+        let handled = respond(&core, request);
+        match handled.response {
+            Response::Action(outcome) => {
+                assert!(!outcome.applied, "a run nobody can execute is not a run");
+                assert!(
+                    outcome.detail.contains("no runtime is wired"),
+                    "{}",
+                    outcome.detail
+                );
+            }
+            other => panic!("expected action outcome, got {other:?}"),
+        }
+        assert_eq!(handled.follow_up, FollowUp::Nothing);
+    }
+
+    #[test]
+    fn an_applied_start_starts_the_run_and_hands_the_objective_to_the_runtime() {
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::rehearsal("trial"),
+        )));
+        let request = Request::Action {
+            action: SupervisorAction::Start {
+                project: "gc".into(),
+                ticket: Some("TASK-9".into()),
+                revision: None,
+            },
+        };
+        let handled = respond(&core, request);
+        match &handled.response {
             Response::Action(outcome) => assert!(outcome.applied),
             other => panic!("expected action outcome, got {other:?}"),
         }
+        // The run is STARTING: nothing has confirmed it yet.
         let guard = core.lock().expect("lock");
-        assert_eq!(engine::snapshot(&guard).phase, run::run::Phase::Running,);
+        assert_eq!(engine::snapshot(&guard).phase, run::run::Phase::Starting);
+        drop(guard);
+        match handled.follow_up {
+            FollowUp::Execute { request, epoch } => {
+                assert_eq!(request.work_ref.as_deref(), Some("TASK-9"));
+                assert_eq!(epoch, 1);
+            }
+            other => panic!("the objective must be handed to the runtime, got {other:?}"),
+        }
     }
 
     #[test]
@@ -225,8 +435,8 @@ mod tests {
             panic!("simulated panic while the lock was held");
         }));
         assert!(poisoned.is_err(), "the simulated panic must have happened");
-        let response = respond(&core, Request::Snapshot);
-        match response {
+        let handled = respond(&core, Request::Snapshot);
+        match handled.response {
             Response::Snapshot(snapshot) => assert!(
                 snapshot.degraded.is_some(),
                 "a recovered poison must be visible in the snapshot"

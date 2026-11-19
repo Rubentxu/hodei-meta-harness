@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hodei_mh_run::runtime::ObjectiveRuntime;
 use supervisor::client;
 use supervisor::engine;
 use supervisor::protocol::{ResourceObservation, Snapshot, StructuredEvent, SupervisorAction};
@@ -32,9 +33,15 @@ fn opt_flag(args: &[String], name: &str) -> Option<String> {
 /// `hodei-mh supervisor`: THE controller. One per machine/project; serves
 /// the socket until interrupted. Every event is logged to stdout WITH its
 /// provenance and AFTER credential redaction (AC-4).
+///
+/// `--rehearsal` wires the rehearsal runtime: a deterministic run with no
+/// external effects, which says so in every snapshot. Without it the
+/// controller has NO runtime and refuses to start, because a run nobody
+/// can execute is not a run.
 pub async fn run_supervisor(args: &[String]) -> i32 {
     let socket = flag(args, "--socket", DEFAULT_SOCKET);
     let project = flag(args, "--project", "hodei-mh");
+    let rehearsal = args.iter().any(|a| a == "--rehearsal");
     let listener = match server::bind(&socket).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -45,15 +52,27 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // Ownership of the socket file: only OUR file is removed on exit, so a
     // successor supervisor that already replaced it keeps its socket.
     let owned_socket = server::identity_of(std::path::Path::new(&socket));
+    let runtime: Option<Arc<dyn ObjectiveRuntime>> = if rehearsal {
+        Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
+    } else {
+        None
+    };
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new({
-        let mut core = engine::default_core(project);
+        let mut core = match &runtime {
+            Some(runtime) => engine::core_with_runtime(project.clone(), runtime.identity()),
+            None => engine::default_core(project.clone()),
+        };
         // The boot decision is the supervisor's own: logged with automatic
         // provenance (AC-4: automatic decisions state their rule).
         engine::emit_event(
             &mut core,
             "supervisor/boot",
             serde_json::Value::String(format!(
-                "listening on {socket}; credentials will be redacted"
+                "listening on {socket}; credentials will be redacted; runtime: {}",
+                runtime
+                    .as_ref()
+                    .map(|runtime| runtime.identity().label())
+                    .unwrap_or_else(|| "(none wired)".to_string())
             )),
             supervisor::protocol::Provenance::Automatic {
                 rule: "boot".into(),
@@ -62,7 +81,11 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
         core
     }));
     println!(
-        "supervisor listening on {socket}; logs identify provenance, credentials are redacted"
+        "supervisor listening on {socket}; logs identify provenance, credentials are redacted; runtime: {}",
+        runtime
+            .as_ref()
+            .map(|runtime| runtime.identity().label())
+            .unwrap_or_else(|| "(none wired — a Start is refused)".to_string())
     );
     let log_core = core.clone();
     // The log watcher prints every event as it is recorded — provenance
@@ -223,7 +246,7 @@ pub async fn run_action(args: &[String]) -> i32 {
                 },
                 outcome.detail,
                 if outcome.applied {
-                    "confirmation is real"
+                    "the supervisor applied it"
                 } else {
                     "this was NOT executed"
                 }
@@ -346,6 +369,10 @@ pub fn simulated_snapshot() -> Snapshot {
         epoch: 1,
         grant_effects: Vec::new(),
         degraded: None,
+        runtime: Some(hodei_mh_run::runtime::RuntimeIdentity::rehearsal(
+            "simulated",
+        )),
+        objective: None,
     }
 }
 

@@ -41,6 +41,9 @@ fn spawn_supervisor(bin: &std::path::Path, socket: &str, log_path: &std::path::P
             socket,
             "--project",
             "probe-project",
+            // The rehearsal runtime: the probe exercises the real flow
+            // without Docker, network or a model.
+            "--rehearsal",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -102,6 +105,19 @@ pub async fn run() -> i32 {
             && first_status.contains("ticket: (none)"),
         detail: format!(
             "sup-status exit=0 after discovery; snapshot shows phase idle, resources UNKNOWN (no telemetry invented), ticket none. stderr: {first_stderr}"
+        ),
+    });
+
+    // ---- the rehearsal NAMES ITSELF: it is never presented as a live run
+    checks.push(Check {
+        name: "the-runtime-kind-is-visible-and-never-hidden",
+        passed: first_status.contains("runtime: rehearsal"),
+        detail: format!(
+            "the snapshot states the kind of runtime it has; a rehearsal says 'rehearsal' and never passes for a live run: {}",
+            first_status
+                .lines()
+                .find(|line| line.starts_with("runtime:"))
+                .unwrap_or("(no runtime line in the snapshot)")
         ),
     });
 

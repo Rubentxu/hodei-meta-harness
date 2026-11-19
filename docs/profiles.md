@@ -120,6 +120,15 @@ The supervisor serves ONE project: a `Start` naming a different project is
 refused with `project mismatch`, and the snapshot states the grant's effect
 scope explicitly (the supervisor authorizes no effect by itself).
 
+The supervisor needs a RUNTIME to execute an objective, and it says so: a
+`Start` on a supervisor without a runtime is refused with `no runtime is
+wired`, because a run nobody can execute is not a run. The rehearsal runtime
+(`hodei-mh supervisor --rehearsal`) is the deterministic one: it selects the
+work, runs a scripted agent, judges the result and records what would have
+been published — with NO external effects, no ticket closed and no ref moved.
+It names itself in every snapshot (`runtime: rehearsal (...)`), so a
+rehearsal is never presented as a live execution.
+
 ## The trust boundary
 
 Every sandbox runs in a network of its own, and the boundary is verified

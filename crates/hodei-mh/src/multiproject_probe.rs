@@ -127,7 +127,16 @@ fn spawn_supervisor(bin: &Path, socket: &str, project: &str, log: &Path) -> Comm
     let log_file = std::fs::File::create(log).expect("supervisor log");
     let mut command = Command::new(bin);
     command
-        .args(["supervisor", "--socket", socket, "--project", project])
+        .args([
+            "supervisor",
+            "--socket",
+            socket,
+            "--project",
+            project,
+            // The rehearsal runtime: the probe exercises the real control
+            // flow without Docker, network or a model.
+            "--rehearsal",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::null())

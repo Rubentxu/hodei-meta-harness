@@ -3,11 +3,58 @@
 //! reconnection, and honest not-reachable when the socket is gone.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use run::runtime::{
+    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RuntimeError,
+    RuntimeIdentity,
+};
 use supervisor::client::{self, ClientError};
 use supervisor::engine;
 use supervisor::protocol::{Snapshot, SupervisorAction};
 use supervisor::server;
+
+/// A runtime that confirms immediately and reports a confirmed outcome.
+/// The supervisor's own test needs no agent: what it proves is the
+/// contract between the controller and a runtime.
+struct StubRuntime;
+
+#[async_trait::async_trait]
+impl ObjectiveRuntime for StubRuntime {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity::rehearsal("stub")
+    }
+
+    async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+        Ok(ObjectiveHandle::finished(ObjectiveOutcome::Confirmed {
+            work_ref: request.work_ref.unwrap_or_else(|| "TASK-9".into()),
+            detail: "the stub confirmed the objective".into(),
+        }))
+    }
+}
+
+/// Wait for the run to reach a phase. The confirmation arrives
+/// asynchronously; a deadline that expires FAILS the test instead of
+/// passing quietly.
+async fn wait_for_phase(
+    client: &mut supervisor::client::SupervisorClient,
+    expected: run::run::Phase,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = client.snapshot().await.expect("snapshot");
+        if snapshot.phase == expected {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the run never reached {expected:?}; it is {:?}",
+                snapshot.phase
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 fn temp_socket_path(tag: &str) -> String {
     std::env::temp_dir()
@@ -27,9 +74,15 @@ fn temp_socket_path(tag: &str) -> String {
 async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
     let path = temp_socket_path("main");
     let listener = server::bind(&path).await.expect("bind");
-    let core: Arc<Mutex<engine::SupervisorCore>> =
-        Arc::new(Mutex::new(engine::default_core("gc-fixture")));
-    let server_task = tokio::spawn(server::serve(listener, core.clone()));
+    let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new(engine::core_with_runtime(
+        "gc-fixture",
+        RuntimeIdentity::rehearsal("stub"),
+    )));
+    let server_task = tokio::spawn(server::serve_with_runtime(
+        listener,
+        core.clone(),
+        Some(Arc::new(StubRuntime)),
+    ));
 
     // AC-2: snapshot before anything — telemetry unknown is honest.
     let mut client = client::connect(&path).await.expect("connect");
@@ -40,6 +93,9 @@ async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
         snapshot.resources,
         supervisor::protocol::ResourceObservation::Unknown { .. }
     ));
+    // The runtime's kind is visible before anything runs.
+    let runtime = snapshot.runtime.expect("the wired runtime is visible");
+    assert_eq!(runtime.kind, run::runtime::RuntimeKind::Rehearsal);
 
     // AC-2: an action applied for real is confirmed; a refused one is a
     // real answer too.
@@ -54,8 +110,10 @@ async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
         .await
         .expect("start");
     assert!(start.applied);
+    // The run is running because the runtime CONFIRMED it, not because
+    // the client asked for it.
+    wait_for_phase(&mut client, run::run::Phase::Running).await;
     let after = client.snapshot().await.expect("snapshot after");
-    assert_eq!(after.phase, run::run::Phase::Running);
     assert_eq!(after.ticket.as_deref(), Some("TASK-9"));
 
     // The second-controller Start is refused over the wire.
@@ -78,6 +136,12 @@ async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
     assert_eq!(next, events.last().map(|e| e.seq + 1).unwrap_or(1));
     let phases = client2.snapshot().await.expect("snapshot again");
     assert_eq!(phases.phase, run::run::Phase::Running);
+    // The objective's verdict is recorded, not just the phase.
+    let objective = phases.objective.expect("the objective reported");
+    assert!(matches!(
+        objective.outcome,
+        ObjectiveOutcome::Confirmed { .. }
+    ));
 
     drop(client2);
     server_task.abort();
@@ -91,6 +155,34 @@ async fn clients_discover_apply_and_reconnect_without_a_second_controller() {
         Err(other) => panic!("expected NotReachable, got {other}"),
         Ok(_) => panic!("connect must fail with the supervisor gone"),
     }
+}
+
+#[tokio::test]
+async fn a_controller_without_a_runtime_refuses_to_start() {
+    let path = temp_socket_path("no-runtime");
+    let listener = server::bind(&path).await.expect("bind");
+    let core: Arc<Mutex<engine::SupervisorCore>> =
+        Arc::new(Mutex::new(engine::default_core("gc-fixture")));
+    let server_task = tokio::spawn(server::serve(listener, core.clone()));
+
+    let mut client = client::connect(&path).await.expect("connect");
+    let start = client
+        .action(SupervisorAction::Start {
+            project: "gc-fixture".into(),
+            ticket: None,
+            revision: None,
+        })
+        .await
+        .expect("start");
+    assert!(!start.applied, "a run nobody can execute is not a run");
+    assert!(
+        start.detail.contains("no runtime is wired"),
+        "{}",
+        start.detail
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
