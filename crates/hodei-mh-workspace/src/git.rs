@@ -24,6 +24,26 @@ fn run_raw(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result
     run_raw_env(operation, args, cwd, &[])
 }
 
+/// Raw stdout bytes. The NUL-separated plumbing (`ls-files -z`) must not go
+/// through a lossy `String`: a non-UTF-8 path replaced to U+FFFD would be
+/// handed to `tar` as a name that does not exist, and an export that
+/// silently misses files is worse than one that fails.
+fn run_bytes(operation: &'static str, args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>, GitError> {
+    let mut command = Command::new("git");
+    command.args(args);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let output = command.output().map_err(GitError::Unavailable)?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            operation,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output.stdout)
+}
+
 /// `run_raw` with an explicit environment for the child process.
 fn run_raw_env(
     operation: &'static str,
@@ -218,6 +238,47 @@ pub fn inspect_bundle(
         Some(dest),
     )?;
     Ok((head, changed.lines().map(str::to_string).collect()))
+}
+
+/// The tracked files of `repo_dir` (the index), as repository-root-relative
+/// paths. `-z` is not a style choice: git C-quotes any path with unusual
+/// bytes unless asked not to, and a line-split of quoted paths yields names
+/// that do not exist. An empty repo yields an empty list, not an error.
+pub fn ls_tracked(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes("ls-files", &["ls-files", "-z"], Some(repo_dir))?;
+    Ok(split_nul(&stdout))
+}
+
+/// The untracked, not-gitignored files of `repo_dir`. `--exclude-standard`
+/// is the ONLY place gitignore is trusted — for untracked files that is
+/// literally its job; tracked files never rely on it (a committed secret is
+/// still a secret).
+pub fn ls_untracked(repo_dir: &Path) -> Result<Vec<String>, GitError> {
+    let stdout = run_bytes(
+        "ls-files --others",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        Some(repo_dir),
+    )?;
+    Ok(split_nul(&stdout))
+}
+
+/// Whether `dir` is inside a git working tree.
+pub fn is_git_repo(dir: &Path) -> bool {
+    run_raw(
+        "rev-parse",
+        &["rev-parse", "--git-dir"],
+        Some(dir),
+    )
+    .map(|out| !out.trim().is_empty())
+    .unwrap_or(false)
+}
+
+fn split_nul(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
 }
 
 /// Create a bundle of the current branch HEAD in `repo_dir` (host-side test

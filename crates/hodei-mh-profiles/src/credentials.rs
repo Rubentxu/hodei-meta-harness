@@ -112,13 +112,26 @@ pub fn command_has_secret(command: &str) -> bool {
         || SECRET_CASE_SENSITIVE_PATTERNS
             .iter()
             .any(|pattern| command.contains(pattern))
+        // Detection and redaction must see the same shapes: a URL
+        // credential whose token has no known shape
+        // (`https://<random>@host`) is still a credential.
+        || url_credentials_present(command)
 }
 
 /// Redact the secrets of a free-form output (a build log). The shapes
-/// covered are the same as the command detector's, plus a bearer token.
+/// covered are the same as the command detector's, plus a bearer token,
+/// URL userinfo (colon or not), scheme-less `user:pass@host` references
+/// and AWS access key ids.
+///
+/// CONTRACT: any text reaching a log, a record or a truncation must pass
+/// through this FIRST. Truncating before redacting keeps the bytes of a
+/// secret that sat in the retained window — the tail of a credential-
+/// printing build was persisted whole while the head was dropped.
 pub fn redact_output(text: &str) -> String {
-    let mut out = redact_url_credentials(text);
+    let mut out = redact_spans(&url_userinfo_spans(text), text);
+    out = redact_spans(&schemeless_credential_spans(&out), &out);
     out = redact_bearer(&out);
+    out = redact_aws_access_key_id(&out);
     for pattern in SECRET_VALUE_PATTERNS {
         out = redact_value_shape(&out, pattern);
     }
@@ -128,31 +141,113 @@ pub fn redact_output(text: &str) -> String {
     out
 }
 
-/// Replace the `user:pass@` part of a URL: there the credentials ARE the
-/// matched shape, so the value AFTER the shape must be kept.
-fn redact_url_credentials(text: &str) -> String {
+/// Replace every `[start..end)` span with the placeholder.
+fn redact_spans(spans: &[(usize, usize)], text: &str) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
-    while let Some(start) = text[cursor..].find("://") {
-        let start = cursor + start;
-        let after = start + 3;
-        // The credentials run up to the '@' that precedes the host.
-        let Some(at_offset) = text[after..].find('@') else {
-            break;
-        };
-        let at = after + at_offset;
-        let credentials = &text[after..at];
-        if !credentials.contains(':') {
-            out.push_str(&text[cursor..at + 1]);
-            cursor = at + 1;
-            continue;
+    for (start, end) in spans {
+        if *start < cursor {
+            continue; // overlapping span from an earlier pass
         }
-        out.push_str(&text[cursor..after]);
+        out.push_str(&text[cursor..*start]);
         out.push_str("[redacted]");
-        cursor = at;
+        cursor = *end;
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+/// Where a URL authority ends: path/query/fragment start, a quote or
+/// whitespace — never the remainder of the whole text. An unbounded scan
+/// redacts across sentences; a `break` on the first clean URL hides every
+/// later credential in the same line.
+fn authority_end(text: &str, from: usize) -> usize {
+    from + text[from..]
+        .char_indices()
+        .find(|(_, c)| matches!(c, '/' | '?' | '#' | '"' | '\'' | '`') || c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(text.len() - from)
+}
+
+/// The userinfo spans of every `scheme://user[:pass]@host` in the text.
+/// ANY non-empty userinfo counts: a token used AS the username
+/// (`https://<hex>@registry.internal`, routine in package.json git
+/// dependencies printed by npm) is exactly as secret as `user:pass@`.
+/// The old colon-only check passed it through untouched.
+fn url_userinfo_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut scan = 0usize;
+    while let Some(rel) = text[scan..].find("://") {
+        let authority_start = scan + rel + 3;
+        let end = authority_end(text, authority_start);
+        if let Some(at) = text[authority_start..end].find('@')
+            && at > 0
+        {
+            spans.push((authority_start, authority_start + at));
+        }
+        scan = end.max(authority_start);
+    }
+    spans
+}
+
+/// Credentials in scheme-less `user:pass@host` references (git's scp-like
+/// syntax, JDBC URLs): there is no `://` to anchor on. The userinfo window
+/// runs back to whitespace, a quote, a slash or a previous `@`; it must
+/// carry a `:` (a bare `git@github.com` is an identity, not a credential)
+/// and the host after the `@` must look like a host.
+fn schemeless_credential_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find('@') {
+        let at = cursor + rel;
+        let start = text[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| matches!(c, '/' | '"' | '\'' | '`' | '@') || c.is_whitespace())
+            .map(|(i, _)| i + 1)
+            .unwrap_or(0);
+        let userinfo = &text[start..at];
+        let host = &text[at + 1..authority_end(text, at + 1)];
+        if userinfo.contains(':') && (host.contains('.') || host.contains(':')) {
+            spans.push((start, at));
+        }
+        cursor = at + 1;
+    }
+    spans
+}
+
+/// AWS access key ids are caught by the case-sensitive detection patterns
+/// but were NEVER redacted: a build that echoes its provider config
+/// persisted `AKIA...` verbatim into the log tail and the durable export.
+fn redact_aws_access_key_id(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find(["AKIA", "ASIA"]) {
+        let start = cursor + rel;
+        let body = &text[start + 4..];
+        let body_len = body
+            .bytes()
+            .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            .count();
+        if body_len == 16 {
+            out.push_str(&text[cursor..start]);
+            out.push_str("[redacted]");
+            cursor = start + 4 + body_len;
+        } else {
+            out.push_str(&text[cursor..start + 4]);
+            cursor = start + 4;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Whether the text carries URL credentials of any userinfo shape.
+fn url_credentials_present(text: &str) -> bool {
+    !url_userinfo_spans(text).is_empty() || !schemeless_credential_spans(text).is_empty()
 }
 
 /// Replace the value that follows a `Bearer ` marker.
