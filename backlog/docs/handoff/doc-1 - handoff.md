@@ -3,6 +3,13 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
+updated_date: '2026-11-19T00:57:00Z'
+---
+---
+id: doc-1
+title: handoff
+type: other
+created_date: '2026-11-18T21:38:00Z'
 updated_date: '2026-11-19T00:50:00Z'
 ---
 # Handoff
@@ -62,7 +69,8 @@ updated_date: '2026-11-19T00:50:00Z'
   Docker real: `scripts/probes.sh` → **6/6 PASS** (release, supervisor, profile, multiproject,
   verify, trust), `sandboxes=0 containers=0 networks=0`; el `profile-probe` compila los proyectos
   Rust y JVM dentro del sandbox pineado por el camino **nuevo** de exportación. CI: `workspace
-  gate` SUCCESS en ambos PR.
+  gate` SUCCESS en ambos PR y, en `main`, las DOS job verdes (workspace gate y probe lane: las 6
+  sondas también pasan en el runner).
 
 ## Qué queda a medias
 
@@ -81,8 +89,15 @@ updated_date: '2026-11-19T00:50:00Z'
     (`crates/hodei-mh-coordinator/src/store.rs:290` y `actor.rs:369`) crean un directorio temporal
     por caso y **no lo borran**: cada `cargo test` deja ~40 directorios `/tmp/hodei-store-*` y
     `/tmp/hodei-actor-*`. Se limpiaron los 540 que había, pero la fuga sigue ahí.
-  - La pista de probes se ejecutó en este host; el CI la ejecuta en `main` (job `probe lane`):
-    conviene mirar ese job tras el merge.
+  - **Descubrimiento (preexistente, no lo arregla esta tarea)**: `hodei-mh-tracker` tiene un test
+    INESTABLE en el runner de CI:
+    `backlog::tests::snapshot_parses_pinned_cli_fixture_script` falla a veces con
+    `spawn /tmp/hodei-tracker-<pid>/fake-backlog.sh: Text file busy (os error 26)` (ETXTBSY al
+    ejecutar un script recién escrito). Falló en el merge del PR #38 y pasó en las corridas
+    siguientes (incluida la de `main`); no se reprodujo en 30 vueltas locales. Si vuelve a
+    romper, el arreglo es dar a cada caso su propio script.
+  - La pista de probes se ejecutó en este host y también en el runner de `main` (job `probe lane`),
+    con las 6 sondas en verde.
 
 ## Recursos liberados
 
