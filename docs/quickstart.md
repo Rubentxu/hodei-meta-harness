@@ -20,8 +20,8 @@ The per-command reference (every flag, refusal and exit code) lives in
 [supervisor-protocol.md](supervisor-protocol.md); the profile pinning and
 the egress prerequisites in [profiles.md](profiles.md). Environment
 variables are collected in
-[configuration.md](configuration.md) (that file is the subject of a
-separate task, so the link may not resolve yet).
+[configuration.md](configuration.md), and the plain-language
+"what is this" introduction lives in [overview.md](overview.md).
 
 ## 0. Build the binaries
 
@@ -408,4 +408,4 @@ $BIN/hodei-mh supervisor --live --token 'sk-ant-…'   # no such flag exists
 | What exactly does each flag refuse? | [cli-reference.md](cli-reference.md) |
 | How is the socket authenticated, bounded, versioned? | [supervisor-protocol.md](supervisor-protocol.md) |
 | How are profiles pinned and egress enforced? | [profiles.md](profiles.md) |
-| Which environment variables exist and at what precedence? | [configuration.md](configuration.md) *(pending — separate task)* |
+| Which environment variables exist and at what precedence? | [configuration.md](configuration.md) |
