@@ -407,7 +407,7 @@ fn unchanged_stage(work_ref: &str, index_tree: &str, base_tree: &str) -> Option<
 /// touching the worktree, so its attribution and trailers never reach the
 /// promoted history.
 fn commit_command(worktree: &str, base: &str, author: &GitIdentity, work_ref: &str) -> String {
-    let message = format!("hodei-mh: verified work for {work_ref}");
+    let message = format!("chore(work): verified work for {work_ref}");
     format!(
         "git -C {worktree} add -A && git -C {worktree} reset -q --soft {base} && git -C {worktree} -c user.name={name} -c user.email={email} commit -q -m {message}",
         worktree = crate::probe_util::shell_quote(worktree),
@@ -773,7 +773,7 @@ mod tests {
         };
         let work_ref = "TASK-1's work";
         let command = commit_command(WORKTREE, "abc123", &author, work_ref);
-        let message = "hodei-mh: verified work for TASK-1's work";
+        let message = "chore(work): verified work for TASK-1's work";
         assert!(
             command.contains(&crate::probe_util::shell_quote(message)),
             "the message is one quoted word: {command}"
@@ -787,7 +787,7 @@ mod tests {
         assert!(command.contains(&crate::probe_util::shell_quote(WORKTREE)));
         // The single quote of the work reference never leaves its quotes.
         assert!(
-            command.contains(r#"'hodei-mh: verified work for TASK-1'\''s work'"#),
+            command.contains(r#"'chore(work): verified work for TASK-1'\''s work'"#),
             "{command}"
         );
     }
@@ -835,7 +835,7 @@ mod tests {
             "harness@example.com"
         );
         let message = git(&repo, &["log", "-1", "--format=%B"]);
-        assert_eq!(message, "hodei-mh: verified work for TASK-9");
+        assert_eq!(message, "chore(work): verified work for TASK-9");
         assert!(!message.contains("Co-Authored-By"));
         assert!(
             !git(&repo, &["log", "-1", "--format=%ae|%ce"]).contains("hodei-mh@local"),
