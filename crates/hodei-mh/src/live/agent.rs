@@ -243,10 +243,7 @@ impl AcpAgent {
     }
 
     fn failure(work_ref: &str, reason: impl ToString) -> AgentError {
-        AgentError {
-            work_ref: work_ref.to_string(),
-            reason: reason.to_string(),
-        }
+        AgentError::new(work_ref, reason.to_string())
     }
 
     /// Execute the objective: prepare the worktree, run the conversation
@@ -327,10 +324,15 @@ impl AcpAgent {
                 ),
                 None => format!("{}{interactions_part}", turn.summary),
             };
-            return Err(Self::failure(
-                work_ref,
-                format!("the agent did not finish its turn: {detail}"),
-            ));
+            let reason = format!("the agent did not finish its turn: {detail}");
+            return Err(if turn.refusal.is_some() {
+                // The refusal is a typed fact, not prose: it is the only
+                // turn end that left NO effect behind, and the runtime
+                // settles the durable record because the type says so.
+                AgentError::refused_no_effect(work_ref, reason)
+            } else {
+                Self::failure(work_ref, reason)
+            });
         }
         // The harness authors the candidate commit: whatever the agent
         // committed on its own is squashed into one commit carrying the
@@ -557,10 +559,7 @@ fn managed_bundle(
     managed_branch: &str,
     work_ref: &str,
 ) -> Result<String, AgentError> {
-    let failure = |reason: String| AgentError {
-        work_ref: work_ref.to_string(),
-        reason,
-    };
+    let failure = |reason: String| AgentError::new(work_ref.to_string(), reason);
     let reference = format!("refs/heads/{managed_branch}");
     hodei_mh_workspace::git::create_bundle(project_dir, bundle_path, &reference)
         .map_err(|error| failure(error.to_string()))?;
@@ -602,9 +601,11 @@ fn staged_trees(output: &str) -> Option<(&str, &str)> {
 /// The refusal when the staged worktree is still the base state, so there
 /// is nothing to promote.
 fn unchanged_stage(work_ref: &str, index_tree: &str, base_tree: &str) -> Option<AgentError> {
-    (index_tree.trim() == base_tree.trim()).then(|| AgentError {
-        work_ref: work_ref.to_string(),
-        reason: "the agent produced no changes to the managed state: the staged worktree is still the base tree".to_string(),
+    (index_tree.trim() == base_tree.trim()).then(|| {
+        AgentError::new(
+            work_ref,
+            "the agent produced no changes to the managed state: the staged worktree is still the base tree",
+        )
     })
 }
 

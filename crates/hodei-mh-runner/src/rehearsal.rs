@@ -102,14 +102,10 @@ struct ScriptedAgent;
 #[async_trait::async_trait]
 impl AgentPort for ScriptedAgent {
     async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError> {
-        let revision = GitRevision::parse(REHEARSAL_REVISION).map_err(|error| AgentError {
-            work_ref: objective.work_ref.clone(),
-            reason: error.to_string(),
-        })?;
-        let tree = GitTree::parse(REHEARSAL_TREE).map_err(|error| AgentError {
-            work_ref: objective.work_ref.clone(),
-            reason: error.to_string(),
-        })?;
+        let revision = GitRevision::parse(REHEARSAL_REVISION)
+            .map_err(|error| AgentError::new(objective.work_ref.clone(), error.to_string()))?;
+        let tree = GitTree::parse(REHEARSAL_TREE)
+            .map_err(|error| AgentError::new(objective.work_ref.clone(), error.to_string()))?;
         Ok(Candidate {
             revision,
             tree,
