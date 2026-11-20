@@ -42,6 +42,46 @@ binaries taken one by one need `chmod +x` before they can run. The bundle needs
 nothing — its binaries already carry the bit, and `install.sh` copies them as they
 are.
 
+### Stable download URLs
+
+Asset names are deterministic, so a download URL is a function of the release
+tag. The bundle name is generated in `crates/hodei-mh/src/package.rs` as
+`hodei-mh-v{version}-{os}-{arch}.tar.gz` (`{os}-{arch}` is the compiled target,
+e.g. `linux-x86_64`); the standalone binaries and the digest manifest follow the
+same identity rules.
+
+**Versioned template** — stable forever, `{tag}` is the release tag (e.g. `v0.1.1`):
+
+```text
+https://github.com/Rubentxu/hodei-meta-harness/releases/download/{tag}/hodei-mh-{tag}-linux-x86_64.tar.gz
+https://github.com/Rubentxu/hodei-meta-harness/releases/download/{tag}/hodei-mh-{tag}-linux-x86_64
+https://github.com/Rubentxu/hodei-meta-harness/releases/download/{tag}/hodei-mh-lifecycle-server-{tag}-linux-x86_64
+https://github.com/Rubentxu/hodei-meta-harness/releases/download/{tag}/SHA256SUMS
+```
+
+All four return `200` for `v0.1.1` today.
+
+**Latest alias** — `releases/latest/download/{asset}` redirects to the same
+asset *name* on the newest release. Because `SHA256SUMS` carries no version in
+its name, it is the one alias that never changes:
+
+```bash
+curl -L -O https://github.com/Rubentxu/hodei-meta-harness/releases/latest/download/SHA256SUMS
+```
+
+Versioned assets also answer under `/latest/download/` while their release is
+the newest (e.g. `latest/download/hodei-mh-v0.1.1-linux-x86_64.tar.gz` returns
+`200` now), but pinning a version there defeats the purpose: the URL breaks as
+soon as a newer release ships. There is **no** version-less bundle alias —
+`latest/download/hodei-mh-linux-x86_64.tar.gz` returns `404`. To always fetch
+the newest bundle, resolve the tag first and build the versioned URL:
+
+```bash
+REPO=Rubentxu/hodei-meta-harness
+TAG=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | jq -r .tag_name)
+curl -L -O "https://github.com/$REPO/releases/download/$TAG/hodei-mh-$TAG-linux-x86_64.tar.gz"
+```
+
 ### 2. Verify the checksums
 
 `SHA256SUMS` carries the digests above. With every published asset in the same
