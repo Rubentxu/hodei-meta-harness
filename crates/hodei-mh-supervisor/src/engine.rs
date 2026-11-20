@@ -30,6 +30,13 @@ pub const MAX_EVENT_PAYLOAD_BYTES: usize = 4 * 1024;
 /// go beyond it is refused with its reason.
 pub const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// Why a stopped run is reported as uncertain: no verdict was recorded
+/// when the stop landed.
+const STOP_UNCERTAIN: &str = "the objective is cancelled and its outcome is uncertain";
+
+/// Why a stopped run is NOT uncertain: a verdict stands beside the stop.
+const STOP_VERDICT_STANDS: &str = "the recorded verdict of the objective stands";
+
 /// Whether a transition the engine applies took effect. A refusal is a
 /// real answer with its reason, never a silent no-op.
 #[derive(Debug, Clone, PartialEq)]
@@ -427,19 +434,17 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                     core.winding_down = true;
                     let reason = match (was_starting, uncertain) {
                         (true, true) => {
-                            "stopped before the runtime confirmed: the objective is cancelled and its outcome is uncertain"
+                            format!("stopped before the runtime confirmed: {STOP_UNCERTAIN}")
                         }
-                        (false, true) => {
-                            "stopped by the user: the objective is cancelled and its outcome is uncertain"
-                        }
-                        (true, false) => {
-                            "stopped before the runtime confirmed: the session ended and the recorded verdict of the objective stands"
-                        }
-                        (false, false) => {
-                            "stopped by the user: the session ended and the recorded verdict of the objective stands"
-                        }
+                        (false, true) => format!("stopped by the user: {STOP_UNCERTAIN}"),
+                        (true, false) => format!(
+                            "stopped before the runtime confirmed: the session ended and {STOP_VERDICT_STANDS}"
+                        ),
+                        (false, false) => format!(
+                            "stopped by the user: the session ended and {STOP_VERDICT_STANDS}"
+                        ),
                     };
-                    core.stop_reason = Some(reason.to_string());
+                    core.stop_reason = Some(reason.clone());
                     emit_event(
                         core,
                         "objective/cancelled",
@@ -538,6 +543,13 @@ pub fn confirm_runtime(
 /// The verdict is RECORDED, and every outcome has a transition: a
 /// confirmed objective leaves the session alive, a rejected or failed
 /// one ends it, and an idle objective returns the supervisor to waiting.
+///
+/// A CONFIRMED effect that completes after a Stop is a fact of the past:
+/// it is recorded beside the stop instead of being discarded as an
+/// outcome nobody can trust. The run is NOT resurrected — it stays
+/// stopped — and the stop reason is corrected to say the verdict stands.
+/// Every other outcome of a stopped run is refused: nothing reopens a
+/// session that was ended.
 pub fn record_outcome(
     core: &mut SupervisorCore,
     epoch: u64,
@@ -553,11 +565,24 @@ pub fn record_outcome(
     // verdict is recorded or not, no attempt of this run is winding down
     // any more, and the next Start may proceed.
     core.winding_down = false;
-    // The outcome belongs to a LIVE run: a run that was stopped or
-    // dropped does not get a verdict afterwards.
     let live = core.run.as_ref().is_some_and(|run| run.is_live());
+    // A run that a Stop ended, as opposed to one that ended by its own
+    // verdict: only a stop can stand beside a confirmed effect.
+    let stopped_by_the_user = core.stop_reason.is_some()
+        && core
+            .run
+            .as_ref()
+            .is_some_and(|run| *run.phase() == Phase::Stopped);
     if !live {
-        return Transition::refused("the run is no longer live: the outcome is not recorded");
+        if !(stopped_by_the_user && matches!(outcome, ObjectiveOutcome::Confirmed { .. })) {
+            return Transition::refused("the run is no longer live: the outcome is not recorded");
+        }
+        // The effect completed after the stop. The recorded reason is
+        // corrected: the stop ended the session, it did not make the
+        // effect unknown.
+        core.stop_reason = Some(format!(
+            "the session ended by a stop and {STOP_VERDICT_STANDS}"
+        ));
     }
     let work_ref = match &outcome {
         ObjectiveOutcome::Confirmed { work_ref, .. }
@@ -843,14 +868,51 @@ mod tests {
     }
 
     #[test]
-    fn an_outcome_of_a_stopped_run_is_not_recorded() {
+    fn a_verdict_of_a_stopped_run_is_refused_unless_it_is_a_confirmed_effect() {
         let mut core = wired("gc");
         let epoch = started(&mut core);
         apply(&mut core, SupervisorAction::Stop);
+        for refused in [
+            ObjectiveOutcome::Rejected {
+                work_ref: "TASK-1".into(),
+                reason: "the evidence did not hold".into(),
+            },
+            ObjectiveOutcome::Failed {
+                reason: "the sandbox could not be created".into(),
+            },
+            ObjectiveOutcome::Idle {
+                reason: "no eligible work".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    record_outcome(&mut core, epoch, refused.clone()),
+                    Transition::Refused { .. }
+                ),
+                "{refused:?} must not reopen a stopped run"
+            );
+        }
+        assert!(
+            core.objective.is_none(),
+            "a refused verdict is never recorded"
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+
+        // A run that ended by its own verdict is not a stopped run: a
+        // second, contradictory verdict is refused instead of recorded.
+        let mut ended = wired("gc");
+        let ended_epoch = started(&mut ended);
+        record_outcome(
+            &mut ended,
+            ended_epoch,
+            ObjectiveOutcome::Failed {
+                reason: "the sandbox could not be created".into(),
+            },
+        );
         assert!(matches!(
             record_outcome(
-                &mut core,
-                epoch,
+                &mut ended,
+                ended_epoch,
                 ObjectiveOutcome::Confirmed {
                     work_ref: "TASK-1".into(),
                     detail: "published".into(),
@@ -858,6 +920,53 @@ mod tests {
             ),
             Transition::Refused { .. }
         ));
+    }
+
+    #[test]
+    fn a_confirmed_effect_that_lands_after_a_stop_is_recorded_as_a_fact() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        apply(&mut core, SupervisorAction::Stop);
+        assert!(
+            core.stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("uncertain")),
+            "before the verdict arrives the outcome is honestly uncertain"
+        );
+
+        // The effect had already been moved when the stop landed: it
+        // completed, and it is a fact.
+        assert_eq!(
+            record_outcome(
+                &mut core,
+                epoch,
+                ObjectiveOutcome::Confirmed {
+                    work_ref: "TASK-1".into(),
+                    detail: "published 1f0c3a5b".into(),
+                },
+            ),
+            Transition::Applied
+        );
+        let snapshot = snapshot(&core);
+        assert_eq!(snapshot.phase, Phase::Stopped, "the run stays stopped");
+        let objective = snapshot.objective.expect("the verdict is recorded");
+        assert_eq!(objective.work_ref.as_deref(), Some("TASK-1"));
+        assert!(matches!(
+            objective.outcome,
+            ObjectiveOutcome::Confirmed { .. }
+        ));
+        let reason = core.stop_reason.as_deref().expect("the stop reason");
+        assert!(reason.contains("verdict"), "{reason}");
+        assert!(
+            !reason.contains("uncertain"),
+            "a recorded fact is no longer uncertain: {reason}"
+        );
+        assert!(!core.winding_down, "the attempt has ended");
+        // Nothing is running: the session was ended by the stop.
+        assert_eq!(
+            core.run.as_ref().map(|run| run.phase().clone()),
+            Some(Phase::Stopped)
+        );
     }
 
     #[test]

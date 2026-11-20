@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use run::runtime::{
-    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome,
+    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome, RunId,
     RuntimeError, RuntimeIdentity,
 };
 use tokio::sync::Notify;
@@ -304,7 +304,11 @@ impl ObjectiveRuntime for TrialRuntime {
         self.identity.clone()
     }
 
-    async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+    async fn start(
+        &self,
+        _run: RunId,
+        request: ObjectiveRequest,
+    ) -> Result<ObjectiveHandle, RuntimeError> {
         // The gate: the runtime does not confirm until it is opened.
         if let Some(accept) = &self.accept {
             accept.notified().await;
@@ -350,10 +354,13 @@ mod tests {
     async fn the_rehearsal_selects_the_first_eligible_work_and_publishes_nothing() {
         let runtime = TrialRuntime::new();
         let handle = runtime
-            .start(ObjectiveRequest {
-                project: "trial".into(),
-                work_ref: None,
-            })
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: None,
+                },
+            )
             .await
             .expect("the rehearsal accepts the objective");
         let outcome = handle.completion().await;
@@ -372,10 +379,13 @@ mod tests {
     async fn the_rehearsal_rejects_an_objective_whose_evidence_does_not_hold() {
         let runtime = TrialRuntime::rejecting();
         let handle = runtime
-            .start(ObjectiveRequest {
-                project: "trial".into(),
-                work_ref: None,
-            })
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: None,
+                },
+            )
             .await
             .expect("the rehearsal accepts the objective");
         let outcome = handle.completion().await;
@@ -397,10 +407,13 @@ mod tests {
         // for, and the rehearsal is where it is rehearsed.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            runtime.start(ObjectiveRequest {
-                project: "trial".into(),
-                work_ref: Some("TASK-9".into()),
-            }),
+            runtime.start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: Some("TASK-9".into()),
+                },
+            ),
         )
         .await;
         let handle = answered

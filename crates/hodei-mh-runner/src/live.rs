@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use run::runtime::{
-    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RuntimeError,
+    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId, RuntimeError,
     RuntimeIdentity,
 };
 use tracker::core::TrackerRead;
@@ -81,7 +81,7 @@ pub enum AttemptEnd {
     Unverifiable { work_ref: String, reason: String },
     /// Somebody else holds the work.
     ClaimDenied { work_ref: String, holder: String },
-    /// The attempt was cancelled after the agent returned.
+    /// The attempt was stopped before its effects could be published.
     Cancelled { work_ref: String },
     /// The agent could not run the objective.
     AgentFailed { work_ref: String, reason: String },
@@ -185,6 +185,79 @@ impl Drop for ClaimGuard {
     }
 }
 
+/// The cancellation state of the runtime: the attempt in flight and the
+/// stop that arrived before that attempt installed its flag.
+///
+/// The state is shared through an `Arc` so the attempt and whoever raises
+/// the stop read the SAME answer: a stop is never addressed to an attempt
+/// that has not started, and never to the one that came after it.
+#[derive(Debug, Default)]
+struct Cancellations {
+    state: Mutex<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    /// A stop for a run whose attempt has not installed its flag yet. It
+    /// is held here so the attempt begins already cancelled instead of
+    /// running work nobody wants anymore.
+    early: Option<RunId>,
+    /// The run whose attempt is in flight, with the flag it reads.
+    current: Option<(RunId, Arc<AtomicBool>)>,
+}
+
+impl Cancellations {
+    /// Install the flag of `run`'s attempt and return it.
+    ///
+    /// The flag REPLACES the previous one, so a stop raised for an earlier
+    /// attempt cannot be read by this one. It starts true when its own
+    /// stop arrived before the attempt did: a stop raised while the run
+    /// was starting is never lost. An attempt that installs late never
+    /// steals the slot from a newer one.
+    fn install(&self, run: RunId) -> Arc<AtomicBool> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // One attempt per run installs its flag once; a second install
+        // keeps the flag a stop may already have reached.
+        if let Some((current, flag)) = &state.current
+            && *current == run
+        {
+            return flag.clone();
+        }
+        let stopped_early = state.early == Some(run);
+        // A stop kept for a run that is not this one and cannot be newer
+        // than it is history: this install supersedes it.
+        if state.early.is_some_and(|early| early <= run) {
+            state.early = None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(stopped_early));
+        if state
+            .current
+            .as_ref()
+            .is_none_or(|(current, _)| *current < run)
+        {
+            state.current = Some((run, cancelled.clone()));
+        }
+        cancelled
+    }
+
+    /// Deliver a stop to the attempt of `run`, or keep it for the attempt
+    /// that has not started yet.
+    ///
+    /// A stop that belongs to an older run than the attempt in flight is
+    /// history: it is dropped instead of reaching an attempt it was never
+    /// raised for.
+    fn cancel(&self, run: RunId) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match &state.current {
+            Some((current, flag)) if *current == run => {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Some((current, _)) if *current > run => {}
+            _ => state.early = Some(run),
+        }
+    }
+}
+
 /// The live runtime: the product's ports, wired in the product's order.
 pub struct LiveRuntime {
     identity: RuntimeIdentity,
@@ -195,11 +268,7 @@ pub struct LiveRuntime {
     verifier: Arc<dyn VerifierPort>,
     publisher: Arc<dyn PublisherPort>,
     claims: Arc<dyn ClaimPort>,
-    /// The cancellation flag of the CURRENT attempt. Every start REPLACES
-    /// it, so a stop raised for one attempt cannot be read by the next
-    /// one, and a stop cannot be missed because a previous attempt reset
-    /// the flag it belonged to.
-    cancelled: Mutex<Option<Arc<AtomicBool>>>,
+    cancellations: Arc<Cancellations>,
 }
 
 impl LiveRuntime {
@@ -223,23 +292,19 @@ impl LiveRuntime {
             verifier,
             publisher,
             claims,
-            cancelled: Mutex::new(None),
+            cancellations: Arc::new(Cancellations::default()),
         }
     }
 
-    /// Ask the current attempt to stop after the agent returns. The
+    /// Ask the attempt of `run` to stop after the agent returns. The
     /// attempt then releases its claim without verifying or publishing.
     ///
-    /// A stop that arrives when no attempt is in flight changes nothing:
-    /// it never reaches an attempt that has not started yet.
-    pub fn cancel(&self) {
-        let slot = self
-            .cancelled
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(flag) = slot.as_ref() {
-            flag.store(true, Ordering::SeqCst);
-        }
+    /// A stop for a run whose attempt has not started yet is REMEMBERED:
+    /// the attempt begins already cancelled, so a stop raised while the
+    /// run was starting is never lost. A stop for an older run than the
+    /// attempt in flight never reaches it.
+    pub fn cancel(&self, run: RunId) {
+        self.cancellations.cancel(run);
     }
 
     fn runner(&self) -> GoalRunner {
@@ -259,24 +324,21 @@ impl ObjectiveRuntime for LiveRuntime {
         self.identity.clone()
     }
 
-    async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+    async fn start(
+        &self,
+        run: RunId,
+        request: ObjectiveRequest,
+    ) -> Result<ObjectiveHandle, RuntimeError> {
         if request.project != self.project {
             return Err(RuntimeError(format!(
                 "this runtime serves '{}', not '{}'",
                 self.project, request.project
             )));
         }
-        // A cancellation belongs to the attempt it was raised for: the
-        // attempt gets a FRESH flag, and a stop raised for an earlier
-        // attempt can neither silence this one nor be lost on it.
-        let cancelled = Arc::new(AtomicBool::new(false));
-        {
-            let mut slot = self
-                .cancelled
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *slot = Some(cancelled.clone());
-        }
+        // A cancellation belongs to the run it was raised for: the attempt
+        // gets a FRESH flag, and a stop that arrived before the attempt
+        // did starts it cancelled instead of being lost.
+        let cancelled = self.cancellations.install(run);
         // Work somebody else holds is not selected at all: it is not
         // eligible, and the chain skips it.
         let held = match self.claims.claims() {
@@ -298,7 +360,7 @@ impl ObjectiveRuntime for LiveRuntime {
             Ok(None) => {
                 return Ok(ObjectiveHandle::finished(outcome_of(
                     AttemptEnd::NoEligibleWork {
-                        reason: "no eligible work".into(),
+                        reason: no_eligible_work(&held),
                     },
                 )));
             }
@@ -359,11 +421,24 @@ impl ObjectiveRuntime for LiveRuntime {
         }))
     }
 
-    /// Signal the current attempt: it ends after the agent returns, without
-    /// verifying or publishing, and releases everything it owns.
-    fn cancel(&self) {
-        LiveRuntime::cancel(self)
+    /// Signal the attempt of `run`: it ends after the agent returns,
+    /// without verifying or publishing, and releases everything it owns.
+    fn cancel(&self, run: RunId) {
+        LiveRuntime::cancel(self, run)
     }
+}
+
+/// Why the selection found nothing eligible. Work somebody else holds is
+/// NAMED: a bare "no work" would hide that the queue is held, not empty.
+fn no_eligible_work(held: &BTreeMap<String, String>) -> String {
+    if held.is_empty() {
+        return "no eligible work".to_string();
+    }
+    format!(
+        "no eligible work: {} claim(s) held: {}",
+        held.len(),
+        held.keys().cloned().collect::<Vec<_>>().join(", ")
+    )
 }
 
 /// The attempt that ended before the agent ran: the selection itself
@@ -412,12 +487,21 @@ async fn attempt(
             };
         }
     };
+    // A stop observed while verifying ends the attempt BEFORE its verdict
+    // is turned into a rejection: the work was not judged, it was stopped.
+    if cancelled.load(Ordering::SeqCst) {
+        return AttemptEnd::Cancelled { work_ref };
+    }
     let required = objective.required();
     if !verification.covers(&required) {
         return AttemptEnd::ChecksNotHeld {
             work_ref,
             missing: verification.missing(&required),
         };
+    }
+    // The last gate: verifying is harmless, publishing is not.
+    if cancelled.load(Ordering::SeqCst) {
+        return AttemptEnd::Cancelled { work_ref };
     }
     match publisher
         .publish(objective, &candidate, &verification)
@@ -691,16 +775,20 @@ mod tests {
 
     fn start(
         runtime: &LiveRuntime,
+        run: RunId,
         work_ref: Option<&str>,
     ) -> impl std::future::Future<Output = Result<ObjectiveHandle, RuntimeError>> {
-        runtime.start(ObjectiveRequest {
-            project: "project".into(),
-            work_ref: work_ref.map(str::to_string),
-        })
+        runtime.start(
+            run,
+            ObjectiveRequest {
+                project: "project".into(),
+                work_ref: work_ref.map(str::to_string),
+            },
+        )
     }
 
     async fn outcome_of_start(runtime: &LiveRuntime, work_ref: Option<&str>) -> ObjectiveOutcome {
-        start(runtime, work_ref)
+        start(runtime, RunId(1), work_ref)
             .await
             .expect("the runtime accepts the objective")
             .completion()
@@ -996,10 +1084,10 @@ mod tests {
             claims.clone(),
             agent.clone(),
         );
-        let handle = start(&runtime, None)
+        let handle = start(&runtime, RunId(1), None)
             .await
             .expect("the runtime accepts the objective");
-        runtime.cancel();
+        runtime.cancel(RunId(1));
         let outcome = handle.completion().await;
         assert!(
             matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
@@ -1012,6 +1100,260 @@ mod tests {
         );
         assert_eq!(publisher.calls(), 0);
         assert_eq!(claims.releases(), vec![("T-1".to_string(), 17)]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_arrives_before_the_attempt_starts_is_not_lost() {
+        // The window between the engine applying a Start and the runtime
+        // installing its attempt: the stop lands with no attempt to signal.
+        // The attempt must then BEGIN cancelled instead of running work
+        // nobody wants anymore.
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(17));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        runtime.cancel(RunId(1));
+        let outcome = start(&runtime, RunId(1), None)
+            .await
+            .expect("the runtime accepts the objective")
+            .completion()
+            .await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            agent.calls(),
+            0,
+            "a stopped attempt never reaches the agent"
+        );
+        assert_eq!(publisher.calls(), 0);
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 17)],
+            "the claim goes back instead of staying held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_verification_never_reaches_the_publisher() {
+        struct GatedVerifier {
+            entered: Arc<tokio::sync::Notify>,
+            gate: Arc<tokio::sync::Notify>,
+            verified: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl VerifierPort for GatedVerifier {
+            async fn verify(
+                &self,
+                objective: &Objective,
+                _candidate: &Candidate,
+            ) -> Result<Verification, VerifierError> {
+                self.entered.notify_one();
+                self.gate.notified().await;
+                self.verified.store(true, Ordering::SeqCst);
+                Ok(Verification::satisfying(&objective.required()))
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let verified = Arc::new(AtomicBool::new(false));
+        let claims = Arc::new(FakeClaims::granting(29));
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            Arc::new(CountingAgent::default()),
+            Arc::new(GatedVerifier {
+                entered: entered.clone(),
+                gate: gate.clone(),
+                verified: verified.clone(),
+            }),
+            publisher.clone(),
+            claims.clone(),
+        );
+        let handle = start(&runtime, RunId(1), None)
+            .await
+            .expect("the runtime accepts the objective");
+        let completion = tokio::spawn(async move { handle.completion().await });
+        // The attempt is inside the verifier when the stop arrives.
+        entered.notified().await;
+        runtime.cancel(RunId(1));
+        gate.notify_one();
+        let outcome = completion.await.expect("the attempt ends");
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
+            "{outcome:?}"
+        );
+        assert!(
+            verified.load(Ordering::SeqCst),
+            "the verification that was already running completed"
+        );
+        assert_eq!(
+            publisher.calls(),
+            0,
+            "a stop observed after verification publishes nothing"
+        );
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 29)]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_publication_leaves_the_completed_effect_confirmed() {
+        struct GatedPublisher {
+            entered: Arc<tokio::sync::Notify>,
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl PublisherPort for GatedPublisher {
+            async fn publish(
+                &self,
+                _objective: &Objective,
+                _candidate: &Candidate,
+                _verification: &Verification,
+            ) -> Result<Publication, PublisherError> {
+                self.entered.notify_one();
+                self.gate.notified().await;
+                Ok(Publication {
+                    revision: "1f0c3a5b".into(),
+                    closed: true,
+                    detail: "the publisher moved the effects".into(),
+                })
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let claims = Arc::new(FakeClaims::granting(31));
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            Arc::new(CountingAgent::default()),
+            Arc::new(HoldingVerifier),
+            Arc::new(GatedPublisher {
+                entered: entered.clone(),
+                gate: gate.clone(),
+            }),
+            claims.clone(),
+        );
+        let handle = start(&runtime, RunId(1), None)
+            .await
+            .expect("the runtime accepts the objective");
+        let completion = tokio::spawn(async move { handle.completion().await });
+        // The stop lands while the effect is being moved: the effect
+        // completes, so it is a FACT and the attempt reports it.
+        entered.notified().await;
+        runtime.cancel(RunId(1));
+        gate.notify_one();
+        let outcome = completion.await.expect("the attempt ends");
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "T-1"),
+            "{outcome:?}"
+        );
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 31)]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_for_one_run_does_not_cancel_the_next() {
+        // A stop that belongs to a run that already ended must never reach
+        // the attempt of the run that followed it.
+        struct GatedAgent {
+            entered: Arc<tokio::sync::Notify>,
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentPort for GatedAgent {
+            async fn execute(&self, _objective: &Objective) -> Result<Candidate, AgentError> {
+                self.entered.notify_one();
+                self.gate.notified().await;
+                Ok(candidate())
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let claims = Arc::new(FakeClaims::granting(37));
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            Arc::new(GatedAgent {
+                entered: entered.clone(),
+                gate: gate.clone(),
+            }),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+        );
+        // Run 1 is stopped before its attempt begins: it never runs.
+        runtime.cancel(RunId(1));
+        let first = start(&runtime, RunId(1), None)
+            .await
+            .expect("the runtime accepts the objective")
+            .completion()
+            .await;
+        assert!(
+            matches!(first, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
+            "{first:?}"
+        );
+
+        // Run 2 is in flight when the stop of run 1 is repeated.
+        let second = start(&runtime, RunId(2), None)
+            .await
+            .expect("the runtime accepts the next objective");
+        let completion = tokio::spawn(async move { second.completion().await });
+        entered.notified().await;
+        runtime.cancel(RunId(1));
+        gate.notify_one();
+        let outcome = completion.await.expect("the attempt ends");
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "T-1"),
+            "a stop for run 1 must not cancel run 2: {outcome:?}"
+        );
+        assert_eq!(publisher.calls(), 1);
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 37), ("T-1".to_string(), 37)],
+            "both runs gave their claim back"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_with_held_claims_names_the_held_work() {
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::holding(7, &[("T-1", "another-agent")]));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match outcome {
+            ObjectiveOutcome::Idle { reason } => {
+                assert!(reason.contains("T-1"), "the held work is named: {reason}");
+                assert!(reason.contains("claim"), "the reason says why: {reason}");
+            }
+            other => panic!("expected idle, got {other:?}"),
+        }
+        assert_eq!(agent.calls(), 0);
+        assert_eq!(claims.claim_calls(), 0);
     }
 
     #[tokio::test]
@@ -1053,7 +1395,7 @@ mod tests {
             publisher.clone(),
             claims.clone(),
         );
-        let handle = start(&runtime, None)
+        let handle = start(&runtime, RunId(1), None)
             .await
             .expect("the runtime accepts the objective");
         let completion = tokio::spawn(async move { handle.completion().await });
@@ -1061,7 +1403,7 @@ mod tests {
         started.notified().await;
         // The stop is a SIGNAL: the attempt returns and closes what it owns
         // instead of being dropped.
-        runtime.cancel();
+        runtime.cancel(RunId(1));
         gate.notify_one();
         let outcome = completion.await.expect("the attempt ends");
         assert!(
@@ -1112,7 +1454,7 @@ mod tests {
             Arc::new(CountingPublisher::confirm_closing()),
             claims.clone(),
         );
-        let handle = start(&runtime, None)
+        let handle = start(&runtime, RunId(1), None)
             .await
             .expect("the runtime accepts the objective");
         let completion = tokio::spawn(async move { handle.completion().await });
@@ -1156,10 +1498,13 @@ mod tests {
             Arc::new(CountingAgent::default()),
         );
         let refused = runtime
-            .start(ObjectiveRequest {
-                project: "another-project".into(),
-                work_ref: None,
-            })
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "another-project".into(),
+                    work_ref: None,
+                },
+            )
             .await;
         assert!(refused.is_err(), "the runtime serves its own project only");
     }

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome};
+use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome, RunId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -104,20 +104,24 @@ impl Default for Limits {
     }
 }
 
-/// The in-flight execution, so a Stop can cancel it.
-type Pending = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+/// The in-flight execution and the run it belongs to, so a Stop cancels
+/// exactly the execution of the run it names.
+type Pending = Arc<Mutex<Option<(RunId, tokio::task::JoinHandle<()>)>>>;
 
 /// What one request asks the server to do next.
 #[derive(Debug, Clone, PartialEq)]
 enum FollowUp {
     Nothing,
-    /// Hand the objective to the runtime.
+    /// Hand the objective to the runtime under the run's identity.
     Execute {
         request: ObjectiveRequest,
-        epoch: u64,
+        run: RunId,
     },
-    /// The run was stopped: the in-flight execution must be cancelled.
-    Cancel,
+    /// The run named by `run` was stopped: its execution must be
+    /// cancelled, and no other run's execution may be touched.
+    Cancel {
+        run: RunId,
+    },
 }
 
 /// One request and its answer.
@@ -526,17 +530,11 @@ async fn handle_connection(
         // across an await.
         match handled.follow_up {
             FollowUp::Nothing => {}
-            FollowUp::Execute { request, epoch } => {
-                spawn_execution(
-                    core.clone(),
-                    runtime.clone(),
-                    pending.clone(),
-                    request,
-                    epoch,
-                );
+            FollowUp::Execute { request, run } => {
+                spawn_execution(core.clone(), runtime.clone(), pending.clone(), request, run);
             }
-            FollowUp::Cancel => {
-                cancel_execution(runtime.as_ref(), &pending, CANCEL_GRACE).await;
+            FollowUp::Cancel { run } => {
+                cancel_execution(runtime.as_ref(), &pending, run, CANCEL_GRACE).await;
                 // The attempt has ended, whichever way: a new one may run.
                 lock_core(&core).winding_down = false;
             }
@@ -620,7 +618,7 @@ fn spawn_execution(
     runtime: Option<Arc<dyn ObjectiveRuntime>>,
     pending: Pending,
     request: ObjectiveRequest,
-    epoch: u64,
+    run: RunId,
 ) {
     let Some(runtime) = runtime else {
         // The engine refuses a Start when no runtime is wired, so this
@@ -628,24 +626,25 @@ fn spawn_execution(
         return;
     };
     let handle = tokio::spawn(async move {
-        let started = tokio::time::timeout(CONFIRMATION_DEADLINE, runtime.start(request)).await;
+        let started =
+            tokio::time::timeout(CONFIRMATION_DEADLINE, runtime.start(run, request)).await;
         match started {
             Ok(Ok(objective)) => {
                 {
                     let mut guard = lock_core(&core);
-                    engine::confirm_runtime(&mut guard, epoch, &runtime.identity());
+                    engine::confirm_runtime(&mut guard, run.number(), &runtime.identity());
                 }
                 // The objective ends on its own time; its verdict is
                 // recorded when it does.
                 let outcome = objective.completion().await;
                 let mut guard = lock_core(&core);
-                engine::record_outcome(&mut guard, epoch, outcome);
+                engine::record_outcome(&mut guard, run.number(), outcome);
             }
             Ok(Err(error)) => {
                 let mut guard = lock_core(&core);
                 engine::record_outcome(
                     &mut guard,
-                    epoch,
+                    run.number(),
                     ObjectiveOutcome::Failed {
                         reason: error.to_string(),
                     },
@@ -655,7 +654,7 @@ fn spawn_execution(
                 let mut guard = lock_core(&core);
                 engine::record_outcome(
                     &mut guard,
-                    epoch,
+                    run.number(),
                     ObjectiveOutcome::Failed {
                         reason: format!(
                             "the runtime did not confirm the objective within {}s",
@@ -670,32 +669,52 @@ fn spawn_execution(
     let mut slot = pending
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(previous) = slot.replace(handle) {
+    // A Start that arrives this late belongs to a run that was already
+    // superseded: it must not abort the execution of the newer one.
+    if slot.as_ref().is_some_and(|(current, _)| *current > run) {
+        drop(slot);
+        handle.abort();
+        return;
+    }
+    if let Some((_, previous)) = slot.replace((run, handle)) {
         previous.abort();
     }
 }
 
-/// Stop the in-flight execution: the user stopped the run.
+/// Stop the execution of `run`: the user stopped the run.
 ///
 /// The stop is a SIGNAL first, through the runtime, and only then a
-/// deadline. Aborting straight away drops the attempt mid-flight, so the
-/// agent never reaches its `session.close()` and the sandbox outlives the
-/// stop; a cooperative wind-down lets the attempt release what it owns.
-/// An attempt that ignores the signal is aborted after `grace`, and the
-/// journal still names the sandbox to reconcile.
+/// deadline. The signal goes out even when no execution handle exists: the
+/// Start's follow-up may still be waiting to spawn, and the runtime keeps
+/// the stop so that attempt begins already cancelled. Aborting straight
+/// away drops the attempt mid-flight, so the agent never reaches its
+/// `session.close()` and the sandbox outlives the stop; a cooperative
+/// wind-down lets the attempt release what it owns. An attempt that
+/// ignores the signal is aborted after `grace`, and the journal still
+/// names the sandbox to reconcile.
 async fn cancel_execution(
     runtime: Option<&Arc<dyn ObjectiveRuntime>>,
     pending: &Pending,
+    run: RunId,
     grace: Duration,
 ) {
     if let Some(runtime) = runtime {
-        runtime.cancel();
+        // The stop names its run: a stop raised for a run that already
+        // ended never reaches the attempt of the one that followed it.
+        runtime.cancel(run);
     }
-    let handle = pending
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    let Some(mut handle) = handle else {
+    // Only the execution of the run this stop names is taken: a stop never
+    // cancels the execution of another run.
+    let taken = {
+        let mut slot = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some((held_run, _)) if *held_run == run => slot.take(),
+            _ => None,
+        }
+    };
+    let Some((_, mut handle)) = taken else {
         return;
     };
     if tokio::time::timeout(grace, &mut handle).await.is_err() {
@@ -797,10 +816,14 @@ fn respond(core: &SharedCore, request: Request, limits: Limits) -> Handled {
                         project: guard.project.clone(),
                         work_ref: guard.ticket.clone(),
                     },
-                    epoch: guard.epoch,
+                    // The epoch IS the identity of the run: the stop that
+                    // arrives later names the same run.
+                    run: RunId(guard.epoch),
                 }
             } else if stops && outcome.applied {
-                FollowUp::Cancel
+                FollowUp::Cancel {
+                    run: RunId(guard.epoch),
+                }
             } else {
                 FollowUp::Nothing
             };
@@ -880,7 +903,11 @@ mod tests {
             RuntimeIdentity::live("renewing")
         }
 
-        async fn start(&self, _request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+        async fn start(
+            &self,
+            _run: RunId,
+            _request: ObjectiveRequest,
+        ) -> Result<ObjectiveHandle, RuntimeError> {
             Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
                 reason: "nothing to do".into(),
             }))
@@ -1045,9 +1072,9 @@ mod tests {
         assert_eq!(engine::snapshot(&guard).phase, run::run::Phase::Starting);
         drop(guard);
         match handled.follow_up {
-            FollowUp::Execute { request, epoch } => {
+            FollowUp::Execute { request, run } => {
                 assert_eq!(request.work_ref.as_deref(), Some("TASK-9"));
-                assert_eq!(epoch, 1);
+                assert_eq!(run, RunId(1));
             }
             other => panic!("the objective must be handed to the runtime, got {other:?}"),
         }
@@ -1085,13 +1112,17 @@ mod tests {
             RuntimeIdentity::live("signalling")
         }
 
-        async fn start(&self, _request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+        async fn start(
+            &self,
+            _run: RunId,
+            _request: ObjectiveRequest,
+        ) -> Result<ObjectiveHandle, RuntimeError> {
             Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
                 reason: "nothing to do".into(),
             }))
         }
 
-        fn cancel(&self) {
+        fn cancel(&self, _run: RunId) {
             self.cancelled.store(true, Ordering::SeqCst);
             self.gate.notify_one();
         }
@@ -1121,10 +1152,10 @@ mod tests {
             waiter.notified().await;
             flag.store(true, Ordering::SeqCst);
         });
-        let pending: Pending = Arc::new(Mutex::new(Some(attempt)));
+        let pending: Pending = Arc::new(Mutex::new(Some((RunId(1), attempt))));
 
         let started = tokio::time::Instant::now();
-        cancel_execution(Some(&runtime), &pending, CANCEL_GRACE).await;
+        cancel_execution(Some(&runtime), &pending, RunId(1), CANCEL_GRACE).await;
 
         assert!(
             cancelled.load(Ordering::SeqCst),
@@ -1165,10 +1196,10 @@ mod tests {
             let _signal = signal;
             std::future::pending::<()>().await;
         });
-        let pending: Pending = Arc::new(Mutex::new(Some(attempt)));
+        let pending: Pending = Arc::new(Mutex::new(Some((RunId(1), attempt))));
 
         let started = tokio::time::Instant::now();
-        cancel_execution(Some(&runtime), &pending, CANCEL_GRACE).await;
+        cancel_execution(Some(&runtime), &pending, RunId(1), CANCEL_GRACE).await;
 
         assert!(
             cancelled.load(Ordering::SeqCst),
@@ -1184,5 +1215,176 @@ mod tests {
             "the abort waited for the whole grace"
         );
         assert!(pending.lock().expect("lock").is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_start_of_an_older_run_does_not_abort_the_newer_execution() {
+        // A Start whose follow-up was delayed until after a newer run took
+        // the slot must not abort the execution of that newer run.
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::rehearsal("trial"),
+        )));
+        let runtime = signalling(
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(tokio::sync::Notify::new()),
+        );
+        let newer_alive = Arc::new(AtomicBool::new(true));
+        let signal = DropSignal(newer_alive.clone());
+        let newer = tokio::spawn(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+        let pending: Pending = Arc::new(Mutex::new(Some((RunId(2), newer))));
+
+        spawn_execution(
+            core,
+            Some(runtime),
+            pending.clone(),
+            ObjectiveRequest {
+                project: "gc".into(),
+                work_ref: None,
+            },
+            RunId(1),
+        );
+        // The stale execution is aborted before it is polled.
+        tokio::task::yield_now().await;
+
+        assert!(
+            newer_alive.load(Ordering::SeqCst),
+            "the newer run keeps its execution"
+        );
+        assert_eq!(
+            pending.lock().expect("lock").as_ref().map(|(run, _)| *run),
+            Some(RunId(2)),
+            "the slot still belongs to the newer run"
+        );
+    }
+
+    /// A runtime that records the run each answer belongs to, so a test can
+    /// see WHICH run reached it and in which order.
+    #[derive(Default)]
+    struct RecordingRuntime {
+        started: Mutex<Vec<RunId>>,
+        cancelled: Mutex<Vec<RunId>>,
+    }
+
+    impl RecordingRuntime {
+        fn started(&self) -> Vec<RunId> {
+            self.started
+                .lock()
+                .map(|started| started.clone())
+                .unwrap_or_default()
+        }
+
+        fn cancelled(&self) -> Vec<RunId> {
+            self.cancelled
+                .lock()
+                .map(|cancelled| cancelled.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectiveRuntime for RecordingRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::live("recording")
+        }
+
+        async fn start(
+            &self,
+            run: RunId,
+            _request: ObjectiveRequest,
+        ) -> Result<ObjectiveHandle, RuntimeError> {
+            if let Ok(mut started) = self.started.lock() {
+                started.push(run);
+            }
+            Ok(ObjectiveHandle::finished(ObjectiveOutcome::Failed {
+                reason: "the run was stopped before it was published".into(),
+            }))
+        }
+
+        fn cancel(&self, run: RunId) {
+            if let Ok(mut cancelled) = self.cancelled.lock() {
+                cancelled.push(run);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_raised_before_the_execution_is_spawned_reaches_the_runtime_by_run_id() {
+        // The window TASK-34 closes: the engine applied the Start, the stop
+        // lands before the execution was spawned, so no handle exists to
+        // cancel. The stop must still reach the runtime — named for the
+        // same run — and the delayed Start must arrive after it.
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::live("recording"),
+        )));
+        let request = Request::Action {
+            action: SupervisorAction::Start {
+                project: "gc".into(),
+                ticket: Some("TASK-9".into()),
+                revision: None,
+            },
+        };
+        let started = respond(&core, request, Limits::default());
+        let FollowUp::Execute {
+            request,
+            run: starting,
+        } = started.follow_up
+        else {
+            panic!("the start must hand the objective to the runtime");
+        };
+
+        let stopped = respond(
+            &core,
+            Request::Action {
+                action: SupervisorAction::Stop,
+            },
+            Limits::default(),
+        );
+        let FollowUp::Cancel { run: stopping } = stopped.follow_up else {
+            panic!("the stop must cancel the run it stops");
+        };
+        assert_eq!(
+            stopping, starting,
+            "the stop names the run the start created"
+        );
+
+        let recorded = Arc::new(RecordingRuntime::default());
+        let runtime: Arc<dyn ObjectiveRuntime> = recorded.clone();
+        let pending: Pending = Arc::new(Mutex::new(None));
+        cancel_execution(Some(&runtime), &pending, stopping, CANCEL_GRACE).await;
+        // The delayed execution of the start still runs: it must arrive
+        // after the stop, under the same identity.
+        spawn_execution(
+            core.clone(),
+            Some(runtime),
+            pending.clone(),
+            request,
+            starting,
+        );
+        let (held_run, handle) = pending
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the execution handle");
+        assert_eq!(held_run, starting);
+        handle.await.expect("the execution ends");
+
+        assert_eq!(recorded.cancelled(), vec![starting]);
+        assert_eq!(
+            recorded.started(),
+            vec![starting],
+            "the stop reached the runtime before the start of the same run"
+        );
+        let guard = core.lock().expect("lock");
+        assert_eq!(engine::snapshot(&guard).phase, run::run::Phase::Stopped);
+        assert!(
+            guard.objective.is_none(),
+            "the stopped run gets no verdict of its own"
+        );
+        assert!(!guard.winding_down, "the delayed attempt has ended");
     }
 }
