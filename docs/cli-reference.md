@@ -207,10 +207,23 @@ controller; they speak to the one that is already serving.
 | `--managed-branch <branch>` | **required with `--live`** |
 | `--proxy-url <url>` | `http://hodei-proxy:8888` |
 | `--permission allow-once\|deny` | `allow-once` |
+| `--agent claude-code\|qoder` | `claude-code` |
 
 `--live` and `--rehearsal` are exclusive. Credentials for the live
-runtime come from the environment only (`ANTHROPIC_AUTH_TOKEN`); they are
-never a flag.
+runtime come from the environment only, under the variable the selected
+agent declares (`ANTHROPIC_AUTH_TOKEN` for `claude-code`,
+`QODER_PERSONAL_ACCESS_TOKEN` for `qoder`); they are never a flag.
+
+`--agent` selects the ACP agent runtime the live session drives.
+`claude-code` is the published default: the pinned npm adapter staged
+under `/workspace/ccacp`. `qoder` drives Qoder CLI in ACP server mode
+(`qodercli --acp`): the host stages a pinned vendor tarball whose sha256
+is verified before upload and re-verified inside the sandbox before
+extraction (`/workspace/qoder`). For both runtimes the credential
+travels only through the one-line stdin handshake and is exported to the
+agent process environment — never argv, never the request body. The
+agent's egress hosts are data of the runtime variant (proxy
+configuration), not a core policy.
 
 **Output.** One line on stdout at boot: `supervisor listening on <socket>;
 logs identify provenance, credentials are redacted; runtime: <label>`.
@@ -242,8 +255,10 @@ usage path here).
   `--<flag> is required with --live` for each of `server`, `image`,
   `project-dir`, `tracker-dir`, `managed-branch`;
   `--permission has the value '<x>': expected allow-once or deny`;
-  `ANTHROPIC_AUTH_TOKEN is empty: the live runtime takes its credentials
-  from the environment only`;
+  `--agent has the value '<x>': expected claude-code or qoder`;
+  `<credential variable> is empty: the live runtime takes its
+  credentials from the environment only` (the variable the selected
+  agent declares, e.g. `ANTHROPIC_AUTH_TOKEN` by default);
   `<path> is not a git repository: the managed branch lives in a
   repository`; `the managed branch '<b>' does not exist in <path>`;
   `the repository <path> has no user.name/user.email: the harness authors

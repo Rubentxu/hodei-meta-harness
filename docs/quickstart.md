@@ -299,7 +299,7 @@ Other accepted flags (`--server`, `--proxy-url`, `--cpu`, `--memory`,
 
 ### 2.4 Start the live controller: `supervisor --live`
 
-Every flag below is from `USAGE` lines 73–79 (`main.rs`); the five
+Every flag below is from `USAGE` lines 73–81 (`main.rs`); the five
 required ones are enforced in `live/mod.rs::config_from_args`, and the
 live configuration is wired **before** the socket is bound: a controller
 that cannot execute never takes the project's identity.
@@ -325,6 +325,12 @@ $BIN/hodei-mh supervisor --live \
 | `--managed-branch <branch>` | yes | the branch verified results promote to |
 | `--proxy-url <url>` | no | defaults to `http://hodei-proxy:8888` (`profile_run::DEFAULT_PROXY_URL`) |
 | `--permission allow-once\|deny` | no | the ACP permission policy; default `allow-once`; any other value is refused |
+| `--agent claude-code\|qoder` | no | the ACP agent runtime the session drives; default `claude-code`; any other value is refused |
+
+The `--agent` flag only chooses the runtime; the credential channel does
+not change: `qoder` reads `QODER_PERSONAL_ACCESS_TOKEN` from the
+environment exactly the way `claude-code` reads `ANTHROPIC_AUTH_TOKEN`
+(see §3).
 
 A successful boot answers with the same shape as the rehearsal, naming
 the live runtime:
@@ -351,6 +357,7 @@ refusing to start: --live and --rehearsal are exclusive (a rehearsal measures no
 refusing the live supervisor: --server is required with --live        # or --image, --project-dir, --tracker-dir, --managed-branch
 refusing the live supervisor: ANTHROPIC_AUTH_TOKEN is empty: the live runtime takes its credentials from the environment only
 refusing the live supervisor: the flag --permission has the value 'bogus': expected allow-once or deny
+refusing the live supervisor: the flag --agent has the value 'codex': expected claude-code or qoder
 ```
 
 (One wording note: `USAGE` lists the values as `allow-once|deny`; the

@@ -11,6 +11,7 @@ pub mod checkpoint;
 pub mod claims;
 pub mod publisher;
 pub mod requirements;
+pub mod runtime;
 pub mod session;
 pub mod verifier;
 
@@ -29,6 +30,7 @@ use crate::live::checkpoint::Recovery;
 use crate::live::claims::StoreClaims;
 use crate::live::publisher::VerifiedPublisher;
 use crate::live::requirements::BacklogRequirements;
+use crate::live::runtime::AgentRuntime;
 use crate::live::verifier::CleanVerifier;
 
 /// How the ACP agent answers a permission request.
@@ -68,6 +70,9 @@ pub struct LiveConfig {
     pub managed_branch: String,
     /// How the agent answers permission requests.
     pub permission: PermissionMode,
+    /// The ACP agent runtime the session drives, selected at the CLI
+    /// edge by `--agent`; the default is the published Claude Code.
+    pub runtime: AgentRuntime,
     /// The identity the harness commits the candidate with. The CLI leaves
     /// it empty; the wiring resolves it from the host repository before
     /// the agent runs.
@@ -92,9 +97,9 @@ impl LiveConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum LiveError {
     #[error(
-        "ANTHROPIC_AUTH_TOKEN is empty: the live runtime takes its credentials from the environment only"
+        "{credential_env} is empty: the live runtime takes its credentials from the environment only"
     )]
-    MissingCredentials,
+    MissingCredentials { credential_env: String },
     #[error("--{flag} is required with --live")]
     MissingFlag { flag: String },
     #[error("the flag {flag} has the value '{value}': {expected}")]
@@ -127,7 +132,15 @@ pub enum LiveError {
 /// branch and the tracker answer are checked BEFORE any port is built, so
 /// a refusal names the fact that is wrong.
 pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
-    let credentials = Credentials::from_env()?;
+    let credentials = Credentials::from_env(&config.runtime)?;
+    // The egress need is a fact of the chosen runtime, and the core does
+    // not enforce it: say it at boot so the proxy is configured from the
+    // variant's data instead of somebody's memory.
+    eprintln!(
+        "live agent: {}; egress hosts to allow in the proxy: {}",
+        config.runtime.name(),
+        config.runtime.egress_hosts().join(", ")
+    );
     if !hodei_mh_workspace::git::is_git_repo(&config.project_dir) {
         return Err(LiveError::NotARepository {
             path: config.project_dir.display().to_string(),
@@ -313,6 +326,19 @@ pub fn config_from_args(args: &[String], project: &str) -> Result<LiveConfig, Li
             });
         }
     };
+    // The agent runtime is parsed at the edge into the ADT: no value
+    // other than a declared runtime reaches the core, and an invented
+    // one is refused with every valid value named.
+    let runtime = match value(args, "--agent").as_deref() {
+        None => AgentRuntime::claude_code_acp(),
+        Some(value) => {
+            AgentRuntime::from_cli_value(value).ok_or_else(|| LiveError::InvalidFlag {
+                flag: "--agent".into(),
+                value: value.to_string(),
+                expected: AgentRuntime::expected_values(),
+            })?
+        }
+    };
     Ok(LiveConfig {
         project: project.to_string(),
         server: required(args, "--server")?,
@@ -323,6 +349,7 @@ pub fn config_from_args(args: &[String], project: &str) -> Result<LiveConfig, Li
         tracker_dir: PathBuf::from(required(args, "--tracker-dir")?),
         managed_branch: required(args, "--managed-branch")?,
         permission,
+        runtime,
         author: None,
     })
 }
@@ -392,9 +419,45 @@ mod tests {
         assert_eq!(config.proxy_url, crate::profile_run::DEFAULT_PROXY_URL);
         assert_eq!(config.project, "project");
         assert_eq!(
+            config.runtime,
+            AgentRuntime::claude_code_acp(),
+            "no --agent means the published Claude Code runtime: zero regression"
+        );
+        assert_eq!(
             config.author, None,
             "the CLI states no identity: the wiring resolves it"
         );
+    }
+
+    #[test]
+    fn the_agent_flag_selects_the_declared_runtime() {
+        let mut args = live_args();
+        args.extend(["--agent".to_string(), "qoder".to_string()]);
+        let config = config_from_args(&args, "project").expect("qoder is a runtime");
+        assert_eq!(config.runtime, AgentRuntime::qoder_acp());
+    }
+
+    /// An invented agent never reaches the core: the refusal is specific
+    /// and names every value that would have been accepted.
+    #[test]
+    fn an_invented_agent_is_refused_with_the_valid_values() {
+        for invented in ["codex", "claude", "Qoder", "claude_code"] {
+            let mut args = live_args();
+            args.extend(["--agent".to_string(), invented.to_string()]);
+            let error = config_from_args(&args, "project").expect_err("not a runtime");
+            match error {
+                LiveError::InvalidFlag {
+                    flag,
+                    value,
+                    expected,
+                } => {
+                    assert_eq!(flag, "--agent");
+                    assert_eq!(value, invented);
+                    assert_eq!(expected, "expected claude-code or qoder");
+                }
+                other => panic!("expected InvalidFlag for '{invented}', got {other:?}"),
+            }
+        }
     }
 
     #[test]
