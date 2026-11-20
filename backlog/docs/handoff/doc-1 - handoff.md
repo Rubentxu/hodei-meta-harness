@@ -3,7 +3,7 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
-updated_date: '2026-11-20T10:24:00Z'
+updated_date: '2026-11-20T10:27:00Z'
 ---
 # Handoff
 
@@ -38,18 +38,25 @@ updated_date: '2026-11-20T10:24:00Z'
   por conteo (puede declarar ACs no verificadas); (d) `publisher.rs:74-123` construye
   `PromotionIntent` y lo descarta en vez de `promote::flow::execute` + `CoordinatorJournal`;
   (e) `supervisor_cli.rs:145,189-193` y `mod.rs` enmascaran fallos no-EPIPE/git.
-- **TASK-35 entregado por worker, sin aceptar aún**: `618521d` en `task/task-35-resume`
-  (worktree `../wt-task35`), gate del worker `scripts/fast-check.sh --all` **PASS**, 1425+/164-,
-  checkpoint durable en producción (`live/checkpoint.rs`), permisos ACP vía `interact::resolve`,
-  `-32601` para interacciones no soportadas, objetivo personalizado sin ticket
-  (`Closes::Nothing`, `StartObjective`). Revisión goldfish independiente en vuelo.
+- **TASK-35 entregado por worker y RECHAZADO por la revisión independiente** (`618521d` en
+  `task/task-35-resume`, worktree `../wt-task35`; gate del worker `--all` PASS): goldfish-verdict
+  **DO_NOT_SHIP** con 8 defectos confirmados y verificados por el supervisor contra el código —
+  el objetivo personalizado declara `checks` vacío así que `require_evidence` lo rechaza y nunca
+  se confirma (el test aprobaba con un publisher fake); el claim sobrevive a un crash sin dueño;
+  `recover()` no puerta la ejecución; un `confirm` que falla degrada una promoción real; el
+  handoff se anuncia en el boot pero se escribe después del turno; el JSON de estado queda 0644
+  con la instrucción cruda; `--objective` descarta `--ticket` en silencio; el rehearsal ignora
+  `request.objective`. Las decisiones de corrección están en la nota de TASK-35 (incluida la
+  reutilización de `TerminationCriterion`/`advance_custom`, que ya existe en el dominio).
 
 ## Siguiente corte exacto
 
 1. Verificar el diff real de `task/task-34-fixes` (no el informe del worker), correr
    `scripts/fast-check.sh --all`, PR con asunto convencional, merge tras el gate de workspace.
-2. Rebasear `task/task-35-resume` sobre el `main` nuevo, reconciliar con la revisión goldfish,
-   PR y merge; después reconstruir `--release` y **liberar** los recursos vivos de esta sesión.
+2. Con `task/task-34-fixes` ya en `main`, **rebasear `task/task-35-resume` y relanzar un worker
+   de corrección** con las 8 decisiones de la nota de TASK-35 (un solo escritor por zona de
+   código: publisher/agent/server solapan con TASK-34). Después gate `--all`, segunda ronda de
+   revisión y PR/merge.
 3. **UAT final con el binario corregido** (requisito AC4: el propio binario + SHA): escenario A
    con dos tickets dependientes en un solo `Start` (el segundo debe recibir `a0e3c3e...` y
    promover su propio commit sin `Stop` intermedio), B confirmado-después-de-stop, C check
@@ -89,6 +96,11 @@ updated_date: '2026-11-20T10:24:00Z'
   verificación de "¿avanzó?" debe mirar si hay una *nueva* selección, no solo el `phase`.
 - **Los timeouts fijos de producto matan objetivos lentos**: 180 s por turno ACP no es
   configurable ni se reporta como decisión del producto; hay que dimensionarlo o exponerlo.
+- **Un test que enchufa un fake en el punto exacto del defecto aprueba el fake, no el producto.**
+  TASK-35 pasó su gate `--all` y aun así el objetivo personalizado no podía confirmarse:
+  `require_evidence` rechazaba el `EvidenceSet` vacío y la prueba usaba un publisher fake. Regla:
+  cuando una AC habla de promover/cerrar, el oráculo debe recorrer el publisher real (o un fake
+  que aplique la misma política de evidencia).
 - **El squash de GitHub inyecta `Co-authored-by` y `git-control` lo rechaza**; el asunto de merge
   por defecto también se rechaza (`GCTL-CONV-002`) → merge manual con asunto `chore:` y nunca
   `--no-verify`.
