@@ -560,6 +560,11 @@ pub async fn run(args: &[String]) -> i32 {
     let _ = std::fs::create_dir_all(&base);
     let sampler = PressureSampler::new();
     sampler.spawn();
+    // The supervisor sockets the host ALREADY carries: the probe measures
+    // the count before and after its own run. The orphans of earlier runs
+    // are the host's business, not the probe's: what the probe owes is
+    // that it does not ADD any.
+    let host_sockets_before = crate::probe_sockets::sockets_in(Path::new("/tmp")).len();
 
     let projects: Vec<(String, PathBuf, String)> = [
         ("alpha", "build-ok-alpha"),
@@ -750,11 +755,17 @@ pub async fn run(args: &[String]) -> i32 {
     });
 
     // ---- Supervisors: one socket per project ---------------------------
+    // The probe OWNS the socket files it names: the supervisor unlinks its
+    // own socket only when its serve loop ends normally, and this probe
+    // KILLS its supervisors, so the files would survive the run.
+    let mut supervisor_sockets = crate::probe_sockets::SocketFiles::new();
     let mut supervisor_handles: Vec<(String, Option<tokio::process::Child>, String)> = Vec::new();
     for (name, _, _) in &projects {
-        let socket = format!("/tmp/hodei-sup-mproj-{}-{name}.sock", std::process::id());
+        let socket = crate::probe_sockets::supervisor_socket_path(std::process::id(), name);
+        let socket = socket.to_string_lossy().into_owned();
         let log = base.join(format!("sup-{name}.log"));
         let child = spawn_supervisor(&bin, &socket, name, &log).spawn().ok();
+        supervisor_sockets.track(&socket);
         supervisor_handles.push((name.to_string(), child, socket));
     }
     let supervisors_ready = {
@@ -1038,12 +1049,50 @@ pub async fn run(args: &[String]) -> i32 {
     for (_, sid) in &sandbox_ids {
         let _ = delete_sandbox(&control, sid).await;
     }
+    // The supervisors are KILLED, so none of them unlinks its own socket:
+    // the probe removes the socket files it named, and it says whether
+    // every one of them is really gone.
     for (_, child, _) in supervisor_handles.iter_mut() {
         if let Some(mut child) = child.take() {
             let _ = child.kill().await;
         }
     }
-    let _ = relaunched.take();
+    if let Some(mut child) = relaunched.take() {
+        let _ = child.kill().await;
+    }
+    let registered = supervisor_sockets.paths().len();
+    let socket_cleanup = supervisor_sockets.remove_all();
+    let host_sockets_after = crate::probe_sockets::sockets_in(Path::new("/tmp")).len();
+    let outcomes: Vec<String> = socket_cleanup
+        .outcomes()
+        .iter()
+        .map(|outcome| match outcome {
+            crate::probe_sockets::Removal::Removed(path) => {
+                format!("{}:removed", path.to_string_lossy())
+            }
+            crate::probe_sockets::Removal::AlreadyGone(path) => {
+                format!("{}:already-gone", path.to_string_lossy())
+            }
+            crate::probe_sockets::Removal::Failed { path, kind } => {
+                format!("{}:FAILED({kind})", path.to_string_lossy())
+            }
+        })
+        .collect();
+    let leftovers: Vec<String> = socket_cleanup
+        .leftovers()
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    steps.push(Step {
+        name: "no-supervisor-socket-survives-the-probe",
+        passed: socket_cleanup.is_complete() && host_sockets_after == host_sockets_before,
+        detail: format!(
+            "{removed} of {registered} registered supervisor socket file(s) removed on exit (the supervisors were KILLED, so none of them could unlink its own socket): {outcomes:?}; {survived} file(s) survived: {leftovers:?}; the host carried {host_sockets_before} supervisor socket(s) before this run and carries {host_sockets_after} now",
+            removed = socket_cleanup.removed(),
+            registered = registered,
+            survived = leftovers.len(),
+        ),
+    });
     let _ = std::fs::remove_dir_all(&base);
 
     // ---- AC-4: installable package E2E ----------------------------------

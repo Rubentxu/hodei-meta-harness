@@ -336,6 +336,47 @@ Behavior:
   the observed image digest, the exact commands and their outcomes (this is
   the artifact you archive per build).
 
+### Opt-in build cache (host-side)
+
+The cache inside the sandbox dies with the sandbox, so consecutive builds
+start cold. `profile-run --cache` additionally keeps a host-side archive of
+the dependency download cache (`CARGO_HOME`) and restores it into the next
+build of the SAME project. It is OFF by default:
+
+```bash
+$BIN/hodei-mh profile-run --profile rust --project /path/to/project --cache
+$BIN/hodei-mh profile-run --profile rust --project /path/to/project --cache --cache-target
+```
+
+- The default scope is the download cache. `--cache-target` also archives
+  the compiled outputs (the target directory); that is a mutable-artifact
+  cache and it stays a separate opt-in.
+- The key is a SHA-256 over the profile, the pinned image reference, the
+  toolchain, the digest of `Cargo.lock` (or `none`), the per-project token
+  and the scope. A different project, image, toolchain, lockfile or scope
+  is a different key, so stale mutable artifacts cannot be read by another
+  build.
+- Every stored archive carries the SHA-256 of its bytes in the manifest. A
+  digest that does not match (corruption, truncation, replacement) is
+  REJECTED and the archive is DISCARDED: the build runs cold. An archive
+  with no manifest entry is not restorable either, so it is removed.
+- The store is bounded. `--cache-quota-mib` (default 1024) caps the total;
+  after storing, the oldest entries are evicted until the total fits, the
+  archive just written is never evicted, an archive larger than the whole
+  quota is refused, and files no manifest entry describes are pruned.
+  `--cache-dir DIR` (or `HODEI_MH_BUILD_CACHE_DIR`) chooses the store root;
+  `HODEI_MH_BUILD_CACHE=1` enables the cache like `--cache`, and
+  `--no-cache` always wins.
+- The cache is NEVER an input to verification. Promotion is validated by
+  the clean runner, which materializes the candidate from a git bundle in
+  a fresh sandbox and never reads this store; the run record states
+  `cache.verification_eligible: false`. A poisoned cache therefore cannot
+  produce PASS for a promoted candidate, and a verification caller that
+  resolves the policy as `Verification` is disabled whatever the flags say.
+- The record carries the cache key, scope, restore verdict, stored size,
+  evictions and quota, plus `build.elapsed_seconds`, so cold and warm runs
+  can be compared with real numbers.
+
 ### What leaves the host
 
 The project is NOT copied as a tree. The export is an explicit list of
