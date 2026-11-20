@@ -343,6 +343,7 @@ command must carry the flag itself. Verify before repackaging:
 
 ### More documentation
 
+- [docs/overview.md](docs/overview.md) — what this is, what it guarantees and how to start, for a reader with zero context.
 - [docs/cli-reference.md](docs/cli-reference.md) — every subcommand, flag, refusal and exit code.
 - [docs/configuration.md](docs/configuration.md) — the environment variables each lane reads, with their code anchors.
 - [docs/quickstart.md](docs/quickstart.md) — a narrated walkthrough of one full turn of the objective loop.
