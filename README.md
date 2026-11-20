@@ -173,6 +173,140 @@ compiled for, and **refuses** to package binaries that carry a dynamic loader.
 Everything above is demonstrated by the repository's E2E probes and by the tests of
 the crate that owns each guarantee, not asserted.
 
+## Troubleshooting
+
+Every refusal below is the product's real behaviour: the signals quoted here
+are the strings the code prints. A refusal is never a silent degradation —
+the answer says what is missing and nothing else happens.
+
+### The gate refuses: no restricted egress
+
+**Signal.** `hodei-mh doctor` prints
+
+```
+[MISS] restricted-egress: egress proxy NOT reachable — builds needing the network would refuse to run
+gate: REFUSE — no native (YOLO) fallback exists
+  missing: restricted egress path (proxy)
+```
+
+and exits `1`; `profile-run` writes a record with `"gate": "REFUSE"` and
+`"missing": ["restricted egress path (proxy)"]`.
+
+**Cause.** The reachability check is a TCP connect to the proxy
+(`HODEI_MH_PROXY_CHECK_URL`, falling back to `HODEI_MH_PROXY_URL`, default
+`http://hodei-proxy:8888`), and it did not answer. The gate has no native
+fallback: without the restricted egress path the build simply does not
+happen.
+
+**Fix.** Start the shipped proxy (`scripts/egress-proxy.py`) or point
+`--proxy-url` at the trusted one you already run. For the probe lane,
+`scripts/probes.sh --preflight` fails with an explicit reason when the
+operator variables are unset or the proxy container is not running — set
+`HODEI_MH_EGRESS_PROXY_CONTAINER` and `HODEI_MH_PROXY_CHECK_URL`. The
+lifecycle server itself refuses to start without
+`HODEI_MH_EGRESS_PROXY_CONTAINER`: `HODEI_MH_EGRESS_PROXY_CONTAINER must
+identify the trusted proxy container`.
+
+### The profile image is not in the local daemon
+
+**Signal.**
+
+```
+[MISS] pinned-image-local: <ref> not present locally — the docker daemon must pull it first (the profile never runs without it)
+```
+
+(or, for a user image, `user image <ref> not present locally — the docker
+daemon must pull it first`), followed by
+`missing: pinned image (pull required; the daemon fetches it, the profile
+never runs without it)`.
+
+**Cause.** The doctor is strictly read-only: it inspects the daemon but
+never pulls, so an absent pinned image is a hard stop, not something the
+run fixes on the way. A digest mismatch is the sibling failure — the check
+reports `pinned <digest>; local <digest> (MISMATCH)` and the gate refuses
+with `local image digest does not match the pinned digest`; a foreign
+image is never trusted.
+
+**Fix.** `docker pull` the exact reference the message names (the full
+`name@sha256:...` form), then re-run the doctor. It turns to
+`gate: PROCEED` only when the local digest matches the pin.
+
+### `429 SANDBOX::BUDGET_EXHAUSTED` on a sandbox create
+
+**Signal.** The lifecycle server answers the create with HTTP `429` and the
+body `detail.code` `SANDBOX::BUDGET_EXHAUSTED`; the message names the
+exhausted dimension, e.g. `global environment budget exhausted: N of N
+slots in use; no environment is created and the caller must WAIT (no
+silent admission)`. In `profile-run` the create is retried once with the
+same request tag and the second refusal is reported as
+`sandbox create retry returned 429 Too Many Requests`, exit `1`.
+
+**Cause.** The server enforces a global budget in the create path, reserved
+atomically before any effect — so the refusal created nothing, and
+simultaneous creates cannot overshoot. The slots budget comes from
+`MAX_CONCURRENT_ENVIRONMENTS` (unset means no limit); the aggregate memory
+and CPU budgets from `SANDBOX_TOTAL_MEMORY_BYTES` and
+`SANDBOX_TOTAL_NANOCPUS`.
+
+**Fix.** Wait for an environment to be released, or raise
+`MAX_CONCURRENT_ENVIRONMENTS` in the lifecycle server's environment and
+restart it. See [docs/configuration.md](docs/configuration.md) for every
+variable and [docs/cli-reference.md](docs/cli-reference.md) for the client
+behaviour around the retry.
+
+### The credential does not reach the sandbox agent
+
+**Signal.** The live runtime refuses at boot:
+`ANTHROPIC_AUTH_TOKEN is empty: the live runtime takes its credentials
+from the environment only`. A networked `profile-run` with no credentials
+instead reports the limitation it carries:
+`[note] subscription-limitations: none: no credentials configured;
+networked builds will fail to fetch dependencies`.
+
+**Cause.** `CredentialChannel::ProcessEnvOnly` is the only authorized
+delivery channel: the token travels solely in the environment of the one
+sandbox process that needs it. In the live loop it is handed over a single
+stdin-line handshake that a staged wrapper `export`s before `exec`ing the
+adapter — argv is never a credential channel, so the session command, the
+process table and every log stay secret-free by construction. An empty or
+whitespace value in the host's environment is a hard error
+(`MissingCredentials`), never a silent unauthenticated run.
+
+**Fix.** `export ANTHROPIC_AUTH_TOKEN` in the environment of the host
+process that starts the supervisor or the live loop before launching it
+(the variables are listed in
+[docs/configuration.md](docs/configuration.md)). Never put a token in a
+command line, a file or the repo — records redact any that leaks anyway
+(`[redacted]`).
+
+### `hodei-mh package` refuses your binaries
+
+**Signal.**
+
+```
+refusing to package non-standalone binaries: <path>: NeedsDynamicLoader, ... — build them statically (cargo build --release with -C target-feature=+crt-static) or the bundle would need the host's glibc
+```
+
+**Cause.** The linkage is read from the ELF bytes, never assumed: a binary
+carrying a `PT_INTERP` segment needs the host's dynamic loader and its
+system libraries, which would make the bundle unusable on an older distro
+than the build host. Related refusals: `refusing to package a debug build`
+(only the release profile ships), an architecture mismatch
+(`refusing to package <path>: it is a <arch> binary, but the artifact
+would be named <os>-<arch>`), and a missing product document
+(`refusing to package without the product's documentation`).
+
+**Fix.** Rebuild statically: `cargo build --release` already applies
+`-C target-feature=+crt-static` through `.cargo/config.toml`; a hand-built
+command must carry the flag itself. Verify before repackaging:
+`readelf -l <bin> | grep -c INTERP` must print `0`.
+
+### More documentation
+
+- [docs/cli-reference.md](docs/cli-reference.md) — every subcommand, flag, refusal and exit code.
+- [docs/configuration.md](docs/configuration.md) — the environment variables each lane reads, with their code anchors.
+- [docs/quickstart.md](docs/quickstart.md) — a narrated walkthrough of one full turn of the objective loop.
+
 ## Status
 
 The task board lives in `backlog/` (Backlog.md is the single source of truth).
