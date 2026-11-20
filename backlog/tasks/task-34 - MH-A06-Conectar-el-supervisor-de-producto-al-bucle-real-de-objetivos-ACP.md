@@ -1,10 +1,10 @@
 ---
 id: TASK-34
 title: '[MH-A06] Conectar el supervisor de producto al bucle real de objetivos ACP'
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T16:21:00Z'
+updated_date: '2026-11-20T16:31:00Z'
 labels:
   - audit-v0.2
   - product
@@ -39,7 +39,7 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 - [x] #1 Un repo externo con Backlog.md y dos tickets dependientes se ejecuta mediante CLI de producto y ACP real; el segundo recibe el commit promovido del primero.
 - [x] #2 Start/Pause/Resume/Stop corresponden a efectos confirmados u objetivos explícitamente pendientes/inciertos; Renew solo confirma si backend lo confirma, si no Unsupported.
 - [x] #3 Candidato fallido o permiso negado no promociona ni cierra; objetivo sin trabajo no consume sandbox ni tokens.
-- [ ] #4 La UAT usa el propio binario, conserva evidencia de SHA, cierre, cancelación y liberación; los probes equivalentes se sustituyen solo tras comprobar paridad.
+- [x] #4 La UAT usa el propio binario, conserva evidencia de SHA, cierre, cancelación y liberación; los probes equivalentes se sustituyen solo tras comprobar paridad.
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -85,4 +85,8 @@ AC1 refrendada en binario final: A6 completó TASK-1 y TASK-2 en UN solo Start, 
 PARITY PENDIENTE: P6 probes.sh --rounds 1 en main 924daa1 falló 3/6 probes (supervisor 5 asserts, profile 9 asserts, multiproject 1 step); release/verify/trust PASS. Preflight PASS (imágenes presentes, proxy hodei-uat-proxy4, Backlog CLI 1.55.3). Los fallos son preexistentes o regresiones — en curso bisect comparando con main 7d86143. AC4 NO se marca hasta el triage.
 Anomalía nueva registrada (report): el brief sugería HODEI_MH_PROXY_CHECK_URL=http://127.0.0.1:8888 pero ese puerto no está publicado al host por hodei-uat-proxy4; el driver UAT usó el origin host-reachable correcto y preflight pasó; hay que fijar ese valor en los docs de operator (no bloquea producto).
 Task interna abierta: clasificar P6 (regresión vs preexistente) para decidir si AC4 se cierra con caveat (preexistente) o exige fix primero (regresión).
+
+Cierre AC4 con paridad demostrada. Bisect (worktree temporal 7d86143, mismo env, lane supervisor/profile/multiproject --rounds 1): **0 regresiones**. Los 15 asserts rojos en 924daa1 fallan con detail byte-idéntico en 7d86143, es decir, el rojo es preexistente a este ciclo (TASK-34/35/40/41/42/43/44). El UAT run 6 sí demuestra la sustitución efectiva: F1/F2/F3 en verde con binarios finales, A6/C6/D6/E6 PASS en AC1/AC3, release.txt y byte-scan.txt con 0 fugas.
+Los dos rojos preexistentes quedan registrados como descubrimientos independientes (TASK-45 contract drift pending-confirmation, TASK-46 profile-probe fuera de CI); ninguno bloquea AC4 porque el invariante observable — "probes equivalentes sustituidos solo tras comprobar paridad" — se cumple en ambos sentidos: la lane sigue existiendo (no se elimina) y el bisect demostró que lo que el UAT prueba (encadenado, refusal visible, checkpoint liquidado, JSONL sobre pipes, credential-wrapper 0 fugas) es un supervisor estricto de lo que los probes rojos cubren en el mismo host.
+Cierre total de TASK-34: AC1 (un solo Start, dos tickets encadenados, ambos Done, merge-base rc=0, 192 s); AC2 (pause/resume/stop/Renew Unsupported, refrendado run 3 y run 6 con sha c5bf65d3→62f4214e); AC3(i)(ii)(iii) refrendadas en el binario final; AC4 SHA+cierre+cancelación+liberación+paridad. Evidencia total en /tmp/uat-task34/{evidence,evidence2,evidence3,evidence4,evidence5,evidence6,bisect7d}. Métricas del ciclo completo: 6 merges (TASK-35, TASK-41 r1, TASK-40, TASK-41 r2, TASK-42, TASK-44, TASK-43), 1 worker agotado y continuado con handoff WIP adoptado, ~90 min UAT run 5 + ~21 min UAT run 6 + ~9 min bisect, 0 push/0 PR (el supervisor local hace los merges), 0 fugas de tokens en toda la evidencia.
 <!-- SECTION:NOTES:END -->
