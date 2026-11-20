@@ -12,6 +12,8 @@ use hodei_mh_workspace::git;
 use hodei_mh_workspace::plan::{WorkspacePlan, validate_candidate};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 
 use crate::probe_util::run_command_session_with_output;
@@ -285,8 +287,14 @@ async fn resolve_execd(client: &ControlPlane, sid: &str) -> Option<ExecdEndpoint
         .ok()?;
     let execd = ExecdEndpoint::from_contract(&value)?;
     // The sandbox publishes its execd port before the server inside can
-    // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd).await;
+    // answer: wait (bounded) before using it. The readiness is tied to
+    // the generation behind the endpoint, so one client holds it.
+    let transport = ExecdClient::new(execd.clone());
+    let _ = crate::probe_util::wait_for_execd(
+        &transport,
+        Deadline::in_budget(crate::probe_util::EXECD_READY_TIMEOUT),
+    )
+    .await;
     Some(execd)
 }
 

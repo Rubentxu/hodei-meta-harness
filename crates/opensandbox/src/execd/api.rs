@@ -18,6 +18,10 @@ pub enum ExecdApiError {
     Status { status: u16, body: String },
     #[error("invalid JSON from execd: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    /// The transport of the client itself could not be built: nothing was
+    /// sent and no session exists.
+    #[error("the HTTP client of the execd is unavailable: {0}")]
+    ClientUnavailable(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -52,8 +56,21 @@ pub async fn create_session_with_timeout(
     req: CreateSessionRequest<'_>,
     timeout: std::time::Duration,
 ) -> Result<CreateSessionResponse, ExecdApiError> {
+    let http = http_client()?;
+    create_session_with_client(&http, endpoint, req, timeout).await
+}
+
+/// Same, over a client that is SHARED with the other calls: the
+/// connections are reused and the deadline of the call is the one of the
+/// operation that asked for it.
+pub async fn create_session_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    req: CreateSessionRequest<'_>,
+    timeout: std::time::Duration,
+) -> Result<CreateSessionResponse, ExecdApiError> {
     let url = format!("{}/pty", endpoint.base_url());
-    let mut builder = http_client(timeout)?.post(url).json(&req);
+    let mut builder = http.post(url).timeout(timeout).json(&req);
     if let Some(token) = endpoint.access_token() {
         builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
@@ -114,14 +131,24 @@ pub async fn session_status(
     endpoint: &ExecdEndpoint,
     session_id: &str,
 ) -> Result<SessionStatusResponse, ExecdApiError> {
-    let client = http_client(DEFAULT_TIMEOUT)?;
+    let http = http_client()?;
+    session_status_with_client(&http, endpoint, session_id, DEFAULT_TIMEOUT).await
+}
+
+/// Same, over a client that is SHARED with the other calls.
+pub async fn session_status_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> Result<SessionStatusResponse, ExecdApiError> {
     let mut last: Option<ExecdApiError> = None;
     for path in [
         format!("/pty/{session_id}"),
         format!("/pty/{session_id}/status"),
     ] {
         let url = format!("{}{path}", endpoint.base_url());
-        let mut builder = client.get(url);
+        let mut builder = http.get(url).timeout(timeout);
         if let Some(token) = endpoint.access_token() {
             builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
         }
@@ -162,7 +189,18 @@ pub async fn session_status(
 
 /// How many output bytes the execd says the session produced.
 pub async fn session_output_offset(endpoint: &ExecdEndpoint, session_id: &str) -> Option<i64> {
-    session_status(endpoint, session_id)
+    let http = http_client().ok()?;
+    session_output_offset_with_client(&http, endpoint, session_id, DEFAULT_TIMEOUT).await
+}
+
+/// Same, over a client that is SHARED with the other calls.
+pub async fn session_output_offset_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> Option<i64> {
+    session_status_with_client(http, endpoint, session_id, timeout)
         .await
         .ok()
         .and_then(|status| status.output_offset)
@@ -173,8 +211,19 @@ pub async fn delete_session(
     endpoint: &ExecdEndpoint,
     session_id: &str,
 ) -> Result<(), ExecdApiError> {
+    let http = http_client()?;
+    delete_session_with_client(&http, endpoint, session_id, DEFAULT_TIMEOUT).await
+}
+
+/// Same, over a client that is SHARED with the other calls.
+pub async fn delete_session_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> Result<(), ExecdApiError> {
     let url = format!("{}/pty/{session_id}", endpoint.base_url());
-    let mut builder = http_client(DEFAULT_TIMEOUT)?.delete(url);
+    let mut builder = http.delete(url).timeout(timeout);
     if let Some(token) = endpoint.access_token() {
         builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
@@ -196,6 +245,18 @@ pub async fn upload_file(
     bytes: Vec<u8>,
     remote_path: &str,
 ) -> Result<(), ExecdApiError> {
+    let http = http_client()?;
+    upload_file_with_client(&http, endpoint, bytes, remote_path, DEFAULT_TIMEOUT).await
+}
+
+/// Same, over a client that is SHARED with the other calls.
+pub async fn upload_file_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    bytes: Vec<u8>,
+    remote_path: &str,
+    timeout: std::time::Duration,
+) -> Result<(), ExecdApiError> {
     let url = format!("{}/files/upload", endpoint.base_url());
     let metadata = serde_json::json!({
         "path": remote_path,
@@ -210,7 +271,7 @@ pub async fn upload_file(
     let form = reqwest::multipart::Form::new()
         .part("metadata", metadata_part)
         .part("file", file_part);
-    let mut builder = http_client(DEFAULT_TIMEOUT)?.post(url).multipart(form);
+    let mut builder = http.post(url).timeout(timeout).multipart(form);
     if let Some(token) = endpoint.access_token() {
         builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
@@ -225,10 +286,19 @@ pub async fn upload_file(
 
 /// `GET /files/download?path=...` — stream a sandbox file back to the host.
 pub async fn download_file(endpoint: &ExecdEndpoint, path: &str) -> Result<Vec<u8>, ExecdApiError> {
+    let http = http_client()?;
+    download_file_with_client(&http, endpoint, path, DEFAULT_TIMEOUT).await
+}
+
+/// Same, over a client that is SHARED with the other calls.
+pub async fn download_file_with_client(
+    http: &reqwest::Client,
+    endpoint: &ExecdEndpoint,
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, ExecdApiError> {
     let url = format!("{}/files/download", endpoint.base_url());
-    let mut builder = http_client(DEFAULT_TIMEOUT)?
-        .get(url)
-        .query(&[("path", path)]);
+    let mut builder = http.get(url).timeout(timeout).query(&[("path", path)]);
     if let Some(token) = endpoint.access_token() {
         builder = builder.header(EXECD_ACCESS_TOKEN_HEADER, token);
     }
@@ -241,9 +311,11 @@ pub async fn download_file(endpoint: &ExecdEndpoint, path: &str) -> Result<Vec<u
     Ok(response.bytes().await?.to_vec())
 }
 
-fn http_client(timeout: std::time::Duration) -> Result<reqwest::Client, ExecdApiError> {
+/// The HTTP client of the execd calls. The deadline of a call is the
+/// deadline of the REQUEST, not of the client: the same client serves
+/// calls with different budgets.
+fn http_client() -> Result<reqwest::Client, ExecdApiError> {
     Ok(reqwest::Client::builder()
-        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }

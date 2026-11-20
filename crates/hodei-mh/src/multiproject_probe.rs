@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use opensandbox::control::ControlPlane;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -336,7 +338,7 @@ async fn create_sandbox(client: &ControlPlane, tag: &str) -> String {
     created["id"].as_str().unwrap_or_default().to_string()
 }
 
-async fn execd_for(client: &ControlPlane, sid: &str) -> ExecdEndpoint {
+async fn execd_for(client: &ControlPlane, sid: &str) -> ExecdClient {
     let execd = match client
         .get(&ControlPlane::endpoint_path(sid, 44772))
         .send()
@@ -348,10 +350,18 @@ async fn execd_for(client: &ControlPlane, sid: &str) -> ExecdEndpoint {
         }
         Err(_) => ExecdEndpoint::default(),
     };
+    // ONE transport for the work on this sandbox: the connections are
+    // reused and the readiness is observed once, for the generation that
+    // the endpoint addresses.
+    let transport = ExecdClient::new(execd);
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd).await;
-    execd
+    let _ = crate::probe_util::wait_for_execd(
+        &transport,
+        Deadline::in_budget(crate::probe_util::EXECD_READY_TIMEOUT),
+    )
+    .await;
+    transport
 }
 
 async fn delete_sandbox(client: &ControlPlane, sid: &str) -> bool {
@@ -380,10 +390,11 @@ async fn sandbox_exists(client: &ControlPlane, sid: &str) -> bool {
 }
 
 async fn stage_and_build(
-    execd: &ExecdEndpoint,
+    transport: &ExecdClient,
     project: &Path,
     marker: &str,
     proxy_url: &str,
+    deadline: Deadline,
 ) -> bool {
     let tgz =
         std::env::temp_dir().join(format!("hodei-mproj-{}-{}.tgz", std::process::id(), marker));
@@ -406,7 +417,12 @@ async fn stage_and_build(
     let _ = std::fs::remove_file(&tgz);
     let mut uploaded = false;
     for _ in 0..3 {
-        if opensandbox::execd::api::upload_file(execd, bytes.clone(), "/tmp/project.tgz")
+        if transport
+            .upload_file(
+                bytes.clone(),
+                "/tmp/project.tgz",
+                deadline.within(Duration::from_secs(30)).remaining(),
+            )
             .await
             .is_ok()
         {
@@ -419,9 +435,9 @@ async fn stage_and_build(
         return false;
     }
     let staged = crate::probe_util::run_in_sandbox(
-        execd,
+        transport,
         "mkdir -p /workspace/project && tar xzf /tmp/project.tgz -C /workspace/project && rm /tmp/project.tgz",
-        Duration::from_secs(60),
+        deadline.within(Duration::from_secs(60)),
     )
     .await;
     if !staged.succeeded() {
@@ -429,9 +445,9 @@ async fn stage_and_build(
     }
     let quoted_proxy = format!("'{}'", proxy_url.replace('\'', "'\\''"));
     let build = crate::probe_util::run_in_sandbox(
-        execd,
+        transport,
         &format!("HTTPS_PROXY={quoted_proxy} HTTP_PROXY={quoted_proxy} CARGO_TARGET_DIR=/workspace/.cache/target cargo run --quiet --manifest-path /workspace/project/Cargo.toml"),
-        Duration::from_secs(240),
+        deadline.within(Duration::from_secs(240)),
     )
     .await;
     build.succeeded() && build.output.contains(marker)
@@ -779,8 +795,9 @@ pub async fn run(args: &[String]) -> i32 {
             break;
         }
         sandbox_ids.push((name.to_string(), sid.clone()));
-        let execd = execd_for(&control, &sid).await;
-        let built = stage_and_build(&execd, dir, marker, &proxy_url).await;
+        let transport = execd_for(&control, &sid).await;
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
+        let built = stage_and_build(&transport, dir, marker, &proxy_url, deadline).await;
         builds_ok = builds_ok && built;
         build_detail.push_str(&format!("{name}={built} "));
     }
@@ -869,8 +886,9 @@ pub async fn run(args: &[String]) -> i32 {
         false
     } else {
         sandbox_ids.push(("alpha-restart".into(), alpha_new_sid.clone()));
-        let execd = execd_for(&control, &alpha_new_sid).await;
-        stage_and_build(&execd, alpha_dir, new_task_marker, &proxy_url).await
+        let transport = execd_for(&control, &alpha_new_sid).await;
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
+        stage_and_build(&transport, alpha_dir, new_task_marker, &proxy_url, deadline).await
     };
     let stop_cycle_ok = start_code == 0
         && start_out.contains("applied")
@@ -927,8 +945,16 @@ pub async fn run(args: &[String]) -> i32 {
         false
     } else {
         sandbox_ids.push(("gamma".into(), gamma_sid.clone()));
-        let execd = execd_for(&control, &gamma_sid).await;
-        stage_and_build(&execd, gamma_dir, "build-ok-gamma", &proxy_url).await
+        let transport = execd_for(&control, &gamma_sid).await;
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
+        stage_and_build(
+            &transport,
+            gamma_dir,
+            "build-ok-gamma",
+            &proxy_url,
+            deadline,
+        )
+        .await
     };
     steps.push(Step {
         name: "release-admits-next-and-loss-recovers-from-durable",
@@ -955,8 +981,16 @@ pub async fn run(args: &[String]) -> i32 {
     let delta_built = if delta_sid.is_empty() {
         false
     } else {
-        let execd = execd_for(&control, &delta_sid).await;
-        stage_and_build(&execd, delta_dir, "build-ok-delta", &proxy_url).await
+        let transport = execd_for(&control, &delta_sid).await;
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
+        stage_and_build(
+            &transport,
+            delta_dir,
+            "build-ok-delta",
+            &proxy_url,
+            deadline,
+        )
+        .await
     };
     steps.push(Step {
         name: "last-waitlisted-project-admitted-and-built",

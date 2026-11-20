@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::oneshot;
 
 pub async fn run(args: &[String]) -> i32 {
@@ -24,8 +26,15 @@ pub async fn run(args: &[String]) -> i32 {
     }
     // The credential travels in the environment of this process, never
     // in the command line: a flag would show it in the process list.
-    let execd = opensandbox::execd::endpoint::ExecdEndpoint::from_env(format!("http://{endpoint}"));
-    let outcome = oneshot::run(&execd, &exec, Duration::from_secs(timeout)).await;
+    let endpoint =
+        opensandbox::execd::endpoint::ExecdEndpoint::from_env(format!("http://{endpoint}"));
+    let client = ExecdClient::new(endpoint);
+    let outcome = oneshot::run(
+        &client,
+        &exec,
+        Deadline::in_budget(Duration::from_secs(timeout)),
+    )
+    .await;
     println!(
         "{}",
         serde_json::json!({

@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use hodei_mh_workspace::git as workspace_git;
 use opensandbox::acp;
+use opensandbox::cleanup::CleanupRegistry;
 use opensandbox::control::ControlPlane;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use serde_json::{Value, json};
@@ -197,6 +200,7 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
     let runner = CleanRunner {
         lifecycle_url: server.to_string(),
         image: image.to_string(),
+        journal: CleanupRegistry::default_journal_path(),
         timeout: Duration::from_secs(20),
     };
     let bundle_path = base.join("candidate.bundle");
@@ -250,9 +254,17 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             }
             Err(_) => ExecdEndpoint::default(),
         };
+        // ONE transport and ONE deadline for the work on this sandbox:
+        // the connections are reused and the readiness is observed once.
+        let transport = ExecdClient::new(execd.clone());
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
         // The sandbox publishes its execd port before the server inside
         // can answer: wait (bounded) before using it.
-        crate::probe_util::wait_for_execd(&execd).await;
+        crate::probe_util::wait_for_execd(
+            &transport,
+            deadline.within(crate::probe_util::EXECD_READY_TIMEOUT),
+        )
+        .await;
         if execd.is_empty() {
             steps.push(Step {
                 name: "sandbox",
@@ -299,9 +311,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         let adapter_uploaded =
             opensandbox::execd::api::upload_file(&execd, adapter, "/tmp/ccacp.tgz").await;
         let adapter_staged = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
-            Duration::from_secs(120),
+            deadline.within(Duration::from_secs(120)),
         )
         .await;
         if !packed || adapter_uploaded.is_err() || !adapter_staged.succeeded() {
@@ -340,9 +352,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             break;
         }
         let prepared = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git init -q -b main /workspace/work && git -C /workspace/work fetch -q /tmp/candidate.bundle '+refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/work checkout -q -f -B main refs/remotes/bundle/hodei-mh/main",
-            Duration::from_secs(60),
+            deadline.within(Duration::from_secs(60)),
         )
         .await;
         if !prepared.succeeded() {
@@ -418,9 +430,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
 
         // Extract the candidate commit as a bundle from the sandbox.
         let exported_ok = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work bundle create /tmp/candidate-out.bundle --all",
-            Duration::from_secs(60),
+            deadline.within(Duration::from_secs(60)),
         )
         .await;
         if !exported_ok.succeeded() {
@@ -443,15 +455,15 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         // WHERE THE CANDIDATE LIVES, while the sandbox is still alive, so
         // the verification can compare them with what it checks out.
         let head = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work rev-parse HEAD",
-            Duration::from_secs(30),
+            deadline.within(Duration::from_secs(30)),
         )
         .await;
         let tree = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work rev-parse 'HEAD^{tree}'",
-            Duration::from_secs(30),
+            deadline.within(Duration::from_secs(30)),
         )
         .await;
         let _ = sandbox
@@ -662,9 +674,16 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
             }
             Err(_) => ExecdEndpoint::default(),
         };
+        // ONE transport and ONE deadline for the work on this sandbox.
+        let transport = ExecdClient::new(execd.clone());
+        let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
         // The sandbox publishes its execd port before the server inside
         // can answer: wait (bounded) before uploading.
-        crate::probe_util::wait_for_execd(&execd).await;
+        crate::probe_util::wait_for_execd(
+            &transport,
+            deadline.within(crate::probe_util::EXECD_READY_TIMEOUT),
+        )
+        .await;
         let uploaded = opensandbox::execd::api::upload_file(
             &execd,
             std::fs::read(&bundle_path).unwrap_or_default(),
@@ -673,9 +692,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         .await;
         let prepared = if uploaded.is_ok() {
             crate::probe_util::run_in_sandbox(
-            &execd,
+                &transport,
                 "git init -q -b main /workspace/work && git -C /workspace/work fetch -q /tmp/candidate.bundle '+refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/work checkout -q -f -B main refs/remotes/bundle/hodei-mh/main",
-                Duration::from_secs(60),
+                deadline.within(Duration::from_secs(60)),
             )
             .await
         } else {
@@ -715,9 +734,9 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         // (fraud.txt exists) cannot hold — the evidence is invalid, so the
         // promotion/closure path is never taken.
         let exported = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work bundle create /tmp/candidate-out.bundle --all",
-            Duration::from_secs(60),
+            deadline.within(Duration::from_secs(60)),
         )
         .await;
         let candidate_bundle =
@@ -727,15 +746,15 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         // The observation happens while the sandbox is alive: the candidate
         // is identified where it lives, not after it is gone.
         let fraud_head = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work rev-parse HEAD",
-            Duration::from_secs(30),
+            deadline.within(Duration::from_secs(30)),
         )
         .await;
         let fraud_tree = crate::probe_util::run_in_sandbox(
-            &execd,
+            &transport,
             "git -C /workspace/work rev-parse 'HEAD^{tree}'",
-            Duration::from_secs(30),
+            deadline.within(Duration::from_secs(30)),
         )
         .await;
         let _ = sandbox

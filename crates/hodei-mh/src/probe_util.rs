@@ -38,14 +38,21 @@ process.stdin.on('data', (chunk) => {
 use std::time::{Duration, Instant};
 
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
-use opensandbox::execd::oneshot::OneshotOutcome;
+use opensandbox::execd::oneshot::{self, OneshotOutcome};
 use opensandbox::execd::pipe;
 
 /// Bounded wait for a freshly created sandbox's execd to accept
 /// sessions. The port is published before the server inside answers.
 pub const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The budget of one probe operation against a sandbox: the readiness
+/// wait, the staging of the fixtures and the measured commands are
+/// shares of this ONE deadline.
+pub const SANDBOX_OPERATION_BUDGET: Duration = Duration::from_secs(3600);
 
 /// Quote a value for the shell that runs inside the sandbox.
 ///
@@ -61,22 +68,25 @@ pub fn shell_quote(value: &str) -> String {
 ///
 /// The readiness wait uses a harmless probe, so the command runs
 /// EXACTLY ONCE. Without it, the first attempts are refused by the
-/// execd and the command is recorded as if it had failed.
+/// execd and the command is recorded as if it had failed. The command
+/// spends the share of the operation deadline it is given.
 pub async fn run_in_sandbox(
-    execd: &ExecdEndpoint,
+    client: &ExecdClient,
     command: &str,
-    timeout: Duration,
+    deadline: Deadline,
 ) -> OneshotOutcome {
-    opensandbox::execd::oneshot::run_when_ready(execd, command, timeout, EXECD_READY_TIMEOUT).await
+    oneshot::run_when_ready(client, command, deadline).await
 }
 
 /// Wait (BOUNDED) until the execd of a freshly created sandbox answers.
 ///
 /// The port is published before the server inside can accept sessions:
 /// without this wait, an upload or a session creation right after the
-/// create fails for a reason that has nothing to do with the work.
-pub async fn wait_for_execd(execd: &ExecdEndpoint) -> bool {
-    opensandbox::execd::oneshot::wait_until_ready(execd, EXECD_READY_TIMEOUT).await
+/// create fails for a reason that has nothing to do with the work. The
+/// readiness is observed once per sandbox generation and reused by the
+/// commands the same client runs.
+pub async fn wait_for_execd(client: &ExecdClient, deadline: Deadline) -> bool {
+    oneshot::ensure_ready(client, deadline).await
 }
 
 /// Same, returning captured output plus a trailing `EXIT:<code>` marker.

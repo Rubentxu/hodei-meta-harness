@@ -4,27 +4,35 @@
 //! large bundles, installs) never run without an immediate holder. Short
 //! commands survive the polling-first style, which is why the bug stayed
 //! hidden until a slow one-shot needed it.
+//!
+//! The transport spends ONE budget: the readiness wait, the session
+//! creation, the attach, the replay and the cleanup all derive their
+//! deadline from the same monotonic deadline. The readiness is observed
+//! ONCE per generation of the sandbox and reused by the commands that
+//! follow, and it is invalidated when the session is lost.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::api::{self, CreateSessionRequest};
-use super::endpoint::ExecdEndpoint;
+use super::api::{CreateSessionRequest, ExecdApiError};
+use super::client::ExecdClient;
+use super::deadline::Deadline;
 use super::frames::ServerEvent;
-use super::pipe;
+use super::pipe::{self, AttachOptions};
 
 /// How a one-shot ended when no terminal status was observed. The
-/// distinction matters: `NotAccepted` means the execd REFUSED the session,
-/// so the command never ran and it is safe to try again, while `TimedOut`
-/// means the command ran and never reported a terminal status — retrying
-/// it would run the command twice.
+/// distinction matters: `NotAccepted` means the execd REFUSED the
+/// session, so the command never ran and it is safe to try again, while
+/// `UncertainResult` means the session may exist and the command may
+/// have run — retrying it would run the command twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OneshotEnd {
     /// A terminal status was observed: the command ran.
     Completed,
     /// The execd refused the session: the command NEVER ran.
     NotAccepted,
-    /// The command ran but no terminal status arrived before the deadline.
-    TimedOut,
+    /// The session may exist and the command may have run: it is NOT
+    /// safe to run it again.
+    UncertainResult,
 }
 
 /// What a one-shot produced. `exit_code: None` means no terminal status was
@@ -60,16 +68,35 @@ impl OneshotOutcome {
     pub fn not_accepted(&self) -> bool {
         self.end == OneshotEnd::NotAccepted
     }
+
+    /// The result is uncertain: the command may have run, so it must not
+    /// be run again.
+    pub fn uncertain(&self) -> bool {
+        self.end == OneshotEnd::UncertainResult
+    }
+
+    /// Whether the attempt may be repeated without running the command
+    /// twice. Only a REFUSED session is safe to repeat.
+    pub fn repeatable(&self) -> bool {
+        self.not_accepted()
+    }
 }
+
+/// The command the readiness probe runs: it is harmless, so it can be
+/// repeated as many times as the boot of the sandbox needs.
+pub const READINESS_PROBE_COMMAND: &str = "true";
 
 /// Deadline of a single readiness attempt: it must fail fast while the
 /// sandbox is still booting.
-const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Interval between readiness attempts.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Grace window to drain the output the execd flushes AFTER the exit
 /// frame.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// Grace window given to a command that is killed at the deadline: it
+/// shares the budget of the operation.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How many bytes of command output are kept. A command that prints
 /// without end does not grow the memory of the harness: what does not
@@ -78,26 +105,36 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Wait (BOUNDED) until the execd accepts sessions.
 ///
-/// A freshly created sandbox publishes its execd port before the server
-/// inside is able to answer: the first attempts are refused. Polling
-/// here is what turns that boot delay into a wait instead of a false
-/// "the command failed".
-pub async fn wait_until_ready(endpoint: &ExecdEndpoint, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// The readiness of a sandbox generation is observed ONCE: the commands
+/// that follow reuse it. A lost session invalidates it, because the
+/// execd behind the address may be a different server now.
+pub async fn ensure_ready(client: &ExecdClient, deadline: Deadline) -> bool {
+    // A spent budget is a refusal, cached readiness or not: the command
+    // would start with no time left and could never finish inside the
+    // budget of the operation.
+    if deadline.expired() {
+        return false;
+    }
+    if client.readiness_is_current() {
+        return true;
+    }
     loop {
-        if api::session_accepted(endpoint, READY_ATTEMPT_TIMEOUT).await {
-            // Accepting a session is not enough: the pipe must attach
-            // too. The probe command is harmless, so it can be repeated
-            // as many times as needed.
-            let probe = run(endpoint, "true", Duration::from_secs(10)).await;
-            if probe.end == OneshotEnd::Completed {
-                return true;
-            }
+        // Each attempt is short: a bounded wait polls instead of
+        // spending the whole budget on one call.
+        let attempt = deadline.within(READY_ATTEMPT_TIMEOUT);
+        let probe = run(client, READINESS_PROBE_COMMAND, attempt).await;
+        if probe.end == OneshotEnd::Completed {
+            client.mark_ready();
+            return true;
         }
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return false;
         }
-        tokio::time::sleep(READY_POLL_INTERVAL).await;
+        let wait = READY_POLL_INTERVAL.min(deadline.remaining());
+        if wait.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -107,15 +144,14 @@ pub async fn wait_until_ready(endpoint: &ExecdEndpoint, timeout: Duration) -> bo
 /// executed EXACTLY ONCE: a command that ran and failed is returned as
 /// it is, never repeated.
 pub async fn run_when_ready(
-    endpoint: &ExecdEndpoint,
+    client: &ExecdClient,
     command: &str,
-    timeout: Duration,
-    ready_timeout: Duration,
+    deadline: Deadline,
 ) -> OneshotOutcome {
-    if !wait_until_ready(endpoint, ready_timeout).await {
+    if !ensure_ready(client, deadline).await {
         return OneshotOutcome {
             exit_code: None,
-            output: format!("[execd did not accept a session within {ready_timeout:?}]"),
+            output: "[execd did not accept a session within the budget]".to_string(),
             end: OneshotEnd::NotAccepted,
             expected_bytes: None,
             missing_bytes: 0,
@@ -124,7 +160,7 @@ pub async fn run_when_ready(
             replayed: false,
         };
     }
-    run(endpoint, command, timeout).await
+    run(client, command, deadline).await
 }
 
 /// The state of one-shot output collection.
@@ -252,62 +288,86 @@ pub fn apply_event(output: &mut Vec<u8>, collector: &mut Collector, event: Serve
     }
 }
 
-/// Run one command to its terminal state or to the timeout, whichever comes
-/// first. The pipe attaches IMMEDIATELY after session creation.
-pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> OneshotOutcome {
-    let session = match api::create_session(
-        endpoint,
-        CreateSessionRequest {
-            cwd: None,
-            command: Some(command),
-        },
-    )
-    .await
+/// The outcome of a session that was never created.
+///
+/// The refusal of the daemon is NOT ACCEPTED: the command never ran and
+/// the attempt may be repeated. A transport failure is UNCERTAIN: the
+/// session may exist and the command may have run.
+fn outcome_of_refusal(error: &ExecdApiError) -> OneshotOutcome {
+    let (end, output) = match error {
+        ExecdApiError::Status { .. } => (
+            OneshotEnd::NotAccepted,
+            format!("[the execd refused the session: {error}]"),
+        ),
+        _ => (
+            OneshotEnd::UncertainResult,
+            format!("[the session could not be confirmed: {error}]"),
+        ),
+    };
+    OneshotOutcome {
+        exit_code: None,
+        output,
+        end,
+        expected_bytes: None,
+        missing_bytes: 0,
+        dropped_bytes: 0,
+        truncated: false,
+        replayed: false,
+    }
+}
+
+/// Run one command to its terminal state or to the deadline, whichever
+/// comes first. The pipe attaches IMMEDIATELY after session creation.
+pub async fn run(client: &ExecdClient, command: &str, deadline: Deadline) -> OneshotOutcome {
+    let session = match client
+        .create_session(
+            CreateSessionRequest {
+                cwd: None,
+                command: Some(command),
+            },
+            deadline.remaining(),
+        )
+        .await
     {
         Ok(session) => session,
-        Err(err) => {
-            return OneshotOutcome {
-                exit_code: None,
-                output: format!("[create failed: {err}]"),
-                end: OneshotEnd::NotAccepted,
-                expected_bytes: None,
-                missing_bytes: 0,
-                dropped_bytes: 0,
-                truncated: false,
-                replayed: false,
-            };
-        }
+        Err(err) => return outcome_of_refusal(&err),
     };
 
-    let ws_url = endpoint.ws_url(&session.session_id);
+    let ws_url = client.ws_url(&session.session_id);
     let mut output: Vec<u8> = Vec::new();
     let mut collector = Collector::default();
 
-    let attach_outcome = pipe::attach(&ws_url, endpoint.attach_options()).await;
+    let attach_options = AttachOptions {
+        connect_timeout: Some(deadline.remaining()),
+        ..client.attach_options()
+    };
+    let attach_outcome = pipe::attach(&ws_url, attach_options).await;
     let attach_error = attach_outcome.as_ref().err().map(|e| e.to_string());
     if let Ok(mut pipe_session) = attach_outcome {
-        let started = Instant::now();
-        let deadline = started + timeout;
         // The exit frame does not close the stream: a short grace window
         // keeps the output the execd flushes after it.
         let mut wait_until = deadline;
         loop {
-            let now = Instant::now();
-            if now >= wait_until {
+            if wait_until.expired() {
                 break;
             }
-            let wait = wait_until.saturating_duration_since(now);
+            let wait = wait_until.remaining();
             match tokio::time::timeout(wait, pipe_session.next_event()).await {
                 Ok(Some(event)) => {
                     apply_event(&mut output, &mut collector, event);
                     if collector.draining {
                         // The exit frame arrived, or more output is still
                         // arriving: keep the window open.
-                        wait_until = std::cmp::min(deadline, Instant::now() + OUTPUT_DRAIN_GRACE);
+                        wait_until = wait_until.within(OUTPUT_DRAIN_GRACE);
                     }
                 }
                 // The pipe closed: no more events will ever arrive.
-                Ok(None) => break,
+                Ok(None) => {
+                    // The session was LOST: the execd may be a different
+                    // server now, so the readiness is invalidated.
+                    client.invalidate_readiness();
+                    break;
+                }
                 // A silent tick is NOT the deadline: long quiet commands
                 // (large extractions, installs) keep running. Only the
                 // wait deadline ends the wait.
@@ -317,18 +377,25 @@ pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> 
         if collector.terminal_code.is_none() {
             // Still running at the deadline: kill and record absence. A
             // negative code means death by signal — no terminal status.
+            // The grace of the kill is part of the same budget.
             let _ = pipe_session.send_signal("SIGKILL").await;
-            let grace = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < grace && collector.terminal_code.is_none() {
-                match tokio::time::timeout(Duration::from_millis(800), pipe_session.next_event())
-                    .await
-                {
+            let grace = deadline.within(KILL_GRACE);
+            while !grace.expired() && collector.terminal_code.is_none() {
+                let wait = grace.remaining().min(Duration::from_millis(800));
+                if wait.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(wait, pipe_session.next_event()).await {
                     Ok(Some(event)) => apply_event(&mut output, &mut collector, event),
                     Ok(None) | Err(_) => break,
                 }
             }
         }
         let _ = pipe_session.close().await;
+    } else {
+        // The attach failed: the session EXISTS, so the command may have
+        // run and the readiness cannot be trusted anymore.
+        client.invalidate_readiness();
     }
 
     // COMPLETION FROM THE REPLAY. The live stream can lose the tail of
@@ -337,7 +404,9 @@ pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> 
     // The execd keeps what it produced and replays it on a new attach,
     // and it says how many bytes it produced: a shorter collection is a
     // truncated output, never a complete one.
-    let expected = api::session_output_offset(endpoint, &session.session_id).await;
+    let expected = client
+        .session_output_offset(&session.session_id, deadline.remaining())
+        .await;
     // Two ways to know the output is short: the execd says it produced
     // more bytes than arrived, or the execd says nothing and the
     // command ended with no output at all — the signature of a tail
@@ -352,14 +421,18 @@ pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> 
     };
     let mut replay_error: Option<String> = None;
     if short && !collector.truncated {
-        match pipe::attach(&ws_url, endpoint.attach_options()).await {
+        let replay_options = AttachOptions {
+            connect_timeout: Some(deadline.remaining()),
+            ..client.attach_options()
+        };
+        match pipe::attach(&ws_url, replay_options).await {
             Ok(mut replay_pipe) => {
                 replay_missing(
                     &mut replay_pipe,
                     &mut output,
                     &mut collector,
                     expected.map(|value| value.max(0) as usize),
-                    timeout,
+                    deadline,
                 )
                 .await;
                 let _ = replay_pipe.close().await;
@@ -369,7 +442,23 @@ pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> 
             }
         }
     }
-    let _ = api::delete_session(endpoint, &session.session_id).await;
+
+    // The cleanup of the session shares the budget of the operation. A
+    // session lives inside its sandbox and dies with it, so a deletion
+    // that fails is NOT a host residue: it is reported and the operation
+    // does not pretend it was released.
+    let cleanup_budget = deadline.remaining();
+    if !cleanup_budget.is_zero()
+        && let Err(error) = client
+            .delete_session(&session.session_id, cleanup_budget)
+            .await
+    {
+        tracing::warn!(
+            session = %session.session_id,
+            %error,
+            "the execd session could not be deleted; it dies with its sandbox"
+        );
+    }
 
     // The completeness of the output, measured against what the execd
     // says it produced. The collection is a PREFIX of the session
@@ -420,7 +509,7 @@ pub async fn run(endpoint: &ExecdEndpoint, command: &str, timeout: Duration) -> 
             output: text,
             // The session EXISTED: the command may have started, so it is
             // NOT safe to run it again.
-            end: OneshotEnd::TimedOut,
+            end: OneshotEnd::UncertainResult,
             expected_bytes,
             missing_bytes,
             dropped_bytes,
@@ -441,21 +530,17 @@ async fn replay_missing(
     output: &mut Vec<u8>,
     collector: &mut Collector,
     expected: Option<usize>,
-    timeout: Duration,
+    deadline: Deadline,
 ) {
-    let deadline = Instant::now() + timeout;
     // The collection cannot grow past its quota: a replay that arrives
     // after that only confirms what is already known.
     while !collector.truncated
         && expected.is_none_or(|expected| collector.received_bytes < expected)
     {
-        let now = Instant::now();
-        if now >= deadline {
+        let wait = deadline.remaining().min(Duration::from_millis(500));
+        if wait.is_zero() {
             break;
         }
-        let wait = deadline
-            .saturating_duration_since(now)
-            .min(Duration::from_millis(500));
         match tokio::time::timeout(wait, pipe_session.next_event()).await {
             Ok(Some(event)) => apply_event(output, collector, event),
             // The pipe closed: no more events will ever arrive.
@@ -526,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_resumes_at_its_offset_without_duplicating() {
+    fn a_replay_that_resumes_at_its_offset_without_duplicating() {
         // The execd replays what it kept, starting at an offset: the
         // bytes already collected are not written twice.
         let mut output = Vec::new();
@@ -616,7 +701,7 @@ mod tests {
         let absent = OneshotOutcome {
             exit_code: None,
             output: String::new(),
-            end: OneshotEnd::TimedOut,
+            end: OneshotEnd::UncertainResult,
             expected_bytes: None,
             missing_bytes: 0,
             dropped_bytes: 0,
@@ -643,7 +728,7 @@ mod tests {
         // be repeated without running the command twice.
         let refused = OneshotOutcome {
             exit_code: None,
-            output: "[create failed: connection refused]".into(),
+            output: "[the execd refused the session]".into(),
             end: OneshotEnd::NotAccepted,
             expected_bytes: None,
             missing_bytes: 0,
@@ -652,6 +737,7 @@ mod tests {
             replayed: false,
         };
         assert!(refused.not_accepted());
+        assert!(refused.repeatable());
         assert!(!refused.succeeded());
 
         // The session existed and the command ran: repeating it would
@@ -667,18 +753,38 @@ mod tests {
             replayed: false,
         };
         assert!(!ran.not_accepted());
+        assert!(!ran.repeatable());
 
-        let silent = OneshotOutcome {
+        let uncertain = OneshotOutcome {
             exit_code: None,
             output: String::new(),
-            end: OneshotEnd::TimedOut,
+            end: OneshotEnd::UncertainResult,
             expected_bytes: None,
             missing_bytes: 0,
             dropped_bytes: 0,
             truncated: false,
             replayed: false,
         };
-        assert!(!silent.not_accepted());
+        assert!(!uncertain.not_accepted());
+        assert!(!uncertain.repeatable());
+        assert!(uncertain.uncertain());
+    }
+
+    #[test]
+    fn a_refusal_is_not_accepted_and_a_transport_failure_is_uncertain() {
+        let refused = outcome_of_refusal(&ExecdApiError::Status {
+            status: 500,
+            body: "no".to_string(),
+        });
+        assert!(refused.not_accepted());
+        assert!(!refused.uncertain());
+
+        let unreachable = outcome_of_refusal(&ExecdApiError::InvalidJson(
+            serde_json::from_str::<serde_json::Value>("{").expect_err("the body is not JSON"),
+        ));
+        assert!(!unreachable.not_accepted());
+        assert!(unreachable.uncertain());
+        assert!(!unreachable.repeatable());
     }
 
     #[test]
@@ -730,8 +836,8 @@ mod tests {
             ServerEvent::Stdout(b"0123456789".to_vec()),
         );
         // A replay that resumes at the position the stream reached adds
-        // bytes that are new to the stream: they arrive, and they do
-        // not fit either.
+        // bytes that are new to the stream: they arrive, and they do not
+        // fit either.
         apply_replay(&mut output, &mut collector, 10, b"more");
         assert_eq!(output, b"0123".to_vec(), "the quota still holds");
         assert_eq!(collector.dropped_bytes, 10);

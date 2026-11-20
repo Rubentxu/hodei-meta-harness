@@ -12,14 +12,18 @@
 //! candidate that fails any of those is rejected BEFORE the checks, so a
 //! wrong candidate never produces evidence.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use opensandbox::cleanup::{CleanupGuard, CleanupRegistry, cleanup_sandbox};
 use opensandbox::control::ControlPlane;
-use opensandbox::execd::api;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
+use opensandbox::execd::oneshot;
 
 use crate::evidence::{BoundResult, CheckBinding, EvidenceBinding, EvidenceSet};
 use crate::git::{GitRevision, GitTree, RevisionMatch, compare};
@@ -29,6 +33,9 @@ use crate::transport::TransportDigest;
 /// Bounded wait for the sandbox's execd to accept sessions. A fresh
 /// sandbox publishes its port before the server inside can answer.
 const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounded wait for the preparation of the checkout inside the sandbox.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounded wait for the observations of the checkout (head and files).
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -73,6 +80,10 @@ pub struct CleanRunner {
     /// Per-check timeout: expiry produces an ABSENT record, not a failure
     /// invented out of thin air.
     pub timeout: Duration,
+    /// The private journal of the residues of the sandboxes this runner
+    /// creates. It is opened BEFORE a new sandbox exists, so a residue a
+    /// previous run could not release is reconciled first.
+    pub journal: PathBuf,
 }
 
 impl CleanRunner {
@@ -103,6 +114,18 @@ impl CleanRunner {
         }
 
         let client = ControlPlane::new(&self.lifecycle_url);
+        // The ledger of the residues is DURABLE and is reconciled BEFORE a
+        // new sandbox exists: a sandbox a previous run could not release is
+        // released here, and one that cannot be released stays journaled and
+        // is reported. A ledger that is only reconciled by itself can never
+        // become empty.
+        let registry = CleanupRegistry::durable(&self.journal);
+        for residue in registry.reconcile_sandboxes(&client).await {
+            tracing::warn!(
+                residue = %residue.describe(),
+                "a residue of a previous run could not be released: it stays journaled"
+            );
+        }
         // Every sandbox of this run carries a unique token in its
         // metadata: a create that fails after the server created the
         // container is still findable, so no path leaves residue.
@@ -114,6 +137,10 @@ impl CleanRunner {
                 return Err(RunnerError(format!("{error}; orphan cleanup: {cleaned}")));
             }
         };
+        // The cleanup of the sandbox is REGISTERED while it is not
+        // confirmed: a cancelled verification never leaves a sandbox
+        // behind without a record to reconcile.
+        let mut cleanup = CleanupGuard::sandbox(sandbox_id.clone(), registry.clone());
         // Everything that can fail AFTER the sandbox exists runs inside
         // this block, so the sandbox is deleted on every path: a failure
         // in the checks must not leave the host with residue.
@@ -132,24 +159,46 @@ impl CleanRunner {
             Ok::<_, RunnerError>((bound, observed, image_id))
         }
         .await;
-        let deleted = client
-            .delete(&ControlPlane::sandbox_path(&sandbox_id))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
         // The deletion failure is logged BEFORE the outcome error: a
         // residue on the host must not hide behind the error that stopped
         // the verification. It does not invalidate the evidence: the
         // checks really ran in that sandbox.
-        if !deleted {
-            tracing::warn!(%sandbox_id, "clean sandbox deletion failed");
+        if cleanup_sandbox(&client, &mut cleanup).await.is_err() {
+            tracing::warn!(
+                %sandbox_id,
+                "clean sandbox deletion failed: it stays registered for reconciliation"
+            );
         }
-        let (bound, observed, image_id) = outcome?;
+        let (bound, observed, image_id) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let pending = registry.pending();
+                if pending.is_empty() {
+                    return Err(error);
+                }
+                let described = pending
+                    .iter()
+                    .map(|entry| entry.describe())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(RunnerError(format!(
+                    "{error}; pending cleanup: {described}"
+                )));
+            }
+        };
         // The evidence records what was OBSERVED, not what was declared:
         // the head and the content git reported in the checkout that ran,
         // and the bytes that really travelled. The declarations were
         // compared with them; a difference never reached this point.
+        //
+        // A residue that could not be released is reported here too: it
+        // stays journaled, and the next run reconciles it.
+        for residue in registry.pending() {
+            tracing::warn!(
+                residue = %residue.describe(),
+                "a residue could not be released: it stays journaled"
+            );
+        }
         let environment = format!("{image_id}::{sandbox_id}");
         let binding = EvidenceBinding {
             revision: observed.revision,
@@ -268,11 +317,19 @@ impl CleanRunner {
         let execd = ExecdEndpoint::from_contract(&value)
             .ok_or_else(|| RunnerError("no execd endpoint".into()))?;
         let environment = format!("{image_id}::{sandbox_id}");
+        // ONE transport for the whole verification: the connections are
+        // reused and the readiness is observed once.
+        let execd_client = ExecdClient::new(execd);
+        // ONE deadline for the whole verification: the readiness wait,
+        // the preparation of the checkout and every check share it.
+        let deadline = Deadline::in_budget(self.budget_of(checks.len()));
 
         // The sandbox publishes its execd port BEFORE the server inside
         // can answer: wait (bounded) for it, so the upload does not fail
-        // for a reason that has nothing to do with the candidate.
-        if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
+        // for a reason that has nothing to do with the candidate. The
+        // readiness is observed ONCE and reused by the commands.
+        let ready = deadline.within(EXECD_READY_TIMEOUT);
+        if !oneshot::ensure_ready(&execd_client, ready).await {
             return Err(RunnerError(
                 "the sandbox execd never became usable".to_string(),
             ));
@@ -282,7 +339,12 @@ impl CleanRunner {
         // right after creation; a short retry covers that window.
         let mut uploaded = Err(RunnerError("bundle upload not attempted".into()));
         for attempt in 0..5 {
-            uploaded = api::upload_file(&execd, candidate.bundle.clone(), "/tmp/candidate.bundle")
+            uploaded = execd_client
+                .upload_file(
+                    candidate.bundle.clone(),
+                    "/tmp/candidate.bundle",
+                    deadline.remaining(),
+                )
                 .await
                 .map_err(|e| RunnerError(format!("bundle upload: {e}")));
             if uploaded.is_ok() {
@@ -297,9 +359,9 @@ impl CleanRunner {
         // fails here instead of producing bogus verdicts. The product flow
         // normalizes candidate repos to branch `main`.
         let prepared = run_with_timeout(
-            &execd,
+            &execd_client,
             "git init -q -b main /workspace/checkout && git -C /workspace/checkout fetch -q /tmp/candidate.bundle 'refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/checkout checkout -q -f -B main refs/remotes/bundle/main",
-            Duration::from_secs(60),
+            deadline.within(PREPARE_TIMEOUT),
         )
         .await;
         if prepared.exit_code != Some(0) {
@@ -312,7 +374,7 @@ impl CleanRunner {
         // What was actually checked out must be what the candidate claims:
         // the head and the content it carries. Both are observed in the
         // sandbox, and both are compared BEFORE any check runs.
-        let observed_head = observe(&execd, "git rev-parse HEAD").await?;
+        let observed_head = observe(&execd_client, "git rev-parse HEAD", deadline).await?;
         let observed_revision = GitRevision::parse(&observed_head)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable head: {e}")))?;
         if let RevisionMatch::Differs { declared, observed } =
@@ -324,7 +386,7 @@ impl CleanRunner {
                 observed.as_str()
             )));
         }
-        let observed_tree = observe(&execd, "git rev-parse HEAD^{tree}").await?;
+        let observed_tree = observe(&execd_client, "git rev-parse HEAD^{tree}", deadline).await?;
         let observed_tree = GitTree::parse(&observed_tree)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable tree: {e}")))?;
         if observed_tree != candidate.tree {
@@ -338,7 +400,8 @@ impl CleanRunner {
         let mut bound = Vec::new();
         for check in checks {
             let command = format!("cd {CHECKOUT} && {}", check.command);
-            let record = run_with_timeout(&execd, &command, self.timeout).await;
+            let record =
+                run_with_timeout(&execd_client, &command, deadline.within(self.timeout)).await;
             bound.push(BoundResult {
                 check_id: check.id.clone(),
                 environment: environment.clone(),
@@ -356,6 +419,15 @@ impl CleanRunner {
                 tree: observed_tree,
             },
         ))
+    }
+
+    /// The end-to-end budget of a verification: the readiness wait, the
+    /// preparation of the checkout and every check share it.
+    fn budget_of(&self, checks: usize) -> Duration {
+        let checks = u32::try_from(checks).unwrap_or(u32::MAX);
+        EXECD_READY_TIMEOUT
+            .saturating_add(PREPARE_TIMEOUT)
+            .saturating_add(self.timeout.saturating_mul(checks))
     }
 }
 
@@ -401,12 +473,15 @@ fn observed_image_id(created: &serde_json::Value) -> Result<String, RunnerError>
 
 /// Run one command and read its output: a command that does not succeed is
 /// an observation failure, never an empty observation.
-async fn observe(execd: &ExecdEndpoint, command: &str) -> Result<String, RunnerError> {
-    let outcome = opensandbox::execd::oneshot::run_when_ready(
-        execd,
+async fn observe(
+    transport: &ExecdClient,
+    command: &str,
+    deadline: Deadline,
+) -> Result<String, RunnerError> {
+    let outcome = oneshot::run_when_ready(
+        transport,
         &format!("cd {CHECKOUT} && {command}"),
-        OBSERVE_TIMEOUT,
-        EXECD_READY_TIMEOUT,
+        deadline.within(OBSERVE_TIMEOUT),
     )
     .await;
     if outcome.exit_code != Some(0) {
@@ -426,13 +501,11 @@ async fn observe(execd: &ExecdEndpoint, command: &str) -> Result<String, RunnerE
 /// execd refuses the first attempts. The readiness wait runs a harmless
 /// probe, so the check command itself runs EXACTLY ONCE.
 async fn run_with_timeout(
-    execd: &ExecdEndpoint,
+    transport: &ExecdClient,
     command: &str,
-    timeout: Duration,
+    deadline: Deadline,
 ) -> ExecutionRecord {
-    let outcome =
-        opensandbox::execd::oneshot::run_when_ready(execd, command, timeout, EXECD_READY_TIMEOUT)
-            .await;
+    let outcome = oneshot::run_when_ready(transport, command, deadline).await;
     match outcome.exit_code {
         Some(code) => ExecutionRecord::terminal(command, code, outcome.output),
         None => ExecutionRecord::absent(
@@ -449,12 +522,65 @@ async fn run_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opensandbox::cleanup::PendingCleanup;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn absent_records_never_carry_an_exit_code() {
         let timeout = ExecutionRecord::absent("cmd", "timed out");
         assert_eq!(timeout.exit_code, None);
         assert!(!timeout.stream_completed);
+    }
+
+    /// A control plane that answers the deletion with success, refuses the
+    /// create and records the request lines it received.
+    async fn control_plane_refusing_create() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the listener binds");
+        let addr = listener.local_addr().expect("the listener has an address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 2048];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    recorded
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(line.clone());
+                    let (status, body) = if line.starts_with("DELETE") {
+                        ("200 OK", "{}")
+                    } else if line.starts_with("GET") {
+                        ("200 OK", r#"{"items":[]}"#)
+                    } else {
+                        ("500 Internal Server Error", "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A journal inside the temporary directory, with its own directory.
+    fn test_journal(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("hodei-mh-verify-{}-{name}", std::process::id()))
+            .join("cleanup-journal.json")
+    }
+
+    fn clear_journal(journal: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(journal.parent().unwrap_or(journal));
     }
 
     /// The transport is checked BEFORE the sandbox exists: the control
@@ -466,6 +592,7 @@ mod tests {
             lifecycle_url: "http://127.0.0.1:1".to_string(),
             image: "no-such-image".to_string(),
             timeout: Duration::from_secs(1),
+            journal: test_journal("transport-digest"),
         };
         let candidate = Candidate {
             revision: GitRevision::parse("1f0c3a5b7d9e246183a5c7e9b0d3f5a7c9e1b3d5")
@@ -489,5 +616,59 @@ mod tests {
             error.to_string().contains("transport"),
             "the transport is refused before the sandbox: {error}"
         );
+    }
+
+    /// A residue a previous run could not release is reconciled BEFORE the
+    /// new sandbox is created, and the journal reflects the release.
+    #[tokio::test]
+    async fn a_previous_residue_is_reconciled_before_the_new_sandbox() {
+        let journal = test_journal("reconcile-first");
+        clear_journal(&journal);
+        CleanupRegistry::durable(&journal).register(PendingCleanup {
+            sandbox_id: "sbx-of-a-previous-run".to_string(),
+            reason: "the control plane was unreachable".to_string(),
+        });
+        let (origin, requests) = control_plane_refusing_create().await;
+        let runner = CleanRunner {
+            lifecycle_url: origin,
+            image: "no-such-image".to_string(),
+            timeout: Duration::from_secs(1),
+            journal: journal.clone(),
+        };
+        let bytes = b"the candidate".to_vec();
+        let candidate = Candidate {
+            revision: GitRevision::parse("1f0c3a5b7d9e246183a5c7e9b0d3f5a7c9e1b3d5")
+                .expect("a revision"),
+            tree: GitTree::parse("3d5f1b7c9e1b3d51f0c3a5b7d9e246183a5c7e9b").expect("a tree"),
+            transport_digest: TransportDigest::of(&bytes),
+            bundle: bytes,
+        };
+        let error = runner
+            .verify("TASK-31", &candidate, &[])
+            .await
+            .expect_err("the create is refused");
+        assert!(
+            error.to_string().contains("sandbox create"),
+            "the create was attempted: {error}"
+        );
+        let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let deletion = requests
+            .iter()
+            .position(|line| line == "DELETE /v1/sandboxes/sbx-of-a-previous-run HTTP/1.1")
+            .unwrap_or_else(|| panic!("the residue was not reconciled: {requests:?}"));
+        let creation = requests
+            .iter()
+            .position(|line| line.starts_with("POST /v1/sandboxes"))
+            .unwrap_or_else(|| panic!("the create was not attempted: {requests:?}"));
+        assert!(
+            deletion < creation,
+            "the reconciliation runs BEFORE the create: {requests:?}"
+        );
+        drop(requests);
+        assert!(
+            CleanupRegistry::durable(&journal).is_empty(),
+            "the released residue leaves the journal"
+        );
+        clear_journal(&journal);
     }
 }

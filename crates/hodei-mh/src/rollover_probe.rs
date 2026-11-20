@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use opensandbox::acp::{self, AcpAssembler};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions};
@@ -194,9 +196,16 @@ pub async fn run(server: &str, image: &str) -> i32 {
             .unwrap_or_default(),
         Err(_) => ExecdEndpoint::default(),
     };
+    // ONE transport for the work on this sandbox: the readiness is
+    // observed once for the generation the endpoint addresses.
+    let transport = ExecdClient::new(execd.clone());
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd).await;
+    crate::probe_util::wait_for_execd(
+        &transport,
+        Deadline::in_budget(crate::probe_util::EXECD_READY_TIMEOUT),
+    )
+    .await;
     let encoded = base64::engine::general_purpose::STANDARD.encode(MOCK_AGENT_JS);
     let _ = crate::probe_util::run_command_session_with_output(
         &execd,

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use hodei_mh_workspace::git as workspace_git;
 use opensandbox::control::ControlPlane;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use release::idle::{IdleGate, ReleaseDecision, release_on_idle};
 use release::reconcile::{
@@ -25,9 +27,10 @@ use verify::digest::CandidateDigest;
 const CANDIDATE_CONTENT: &str = "durable-candidate-payload-v1\n";
 const ORPHAN_THRESHOLD_SECS: u64 = 1_800;
 
-/// Bounded wait for a freshly created sandbox's execd to start
-/// answering. The port is published before the server inside is ready.
-const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The budget of one write-then-read operation on a freshly created
+/// sandbox: the readiness wait and the commands share it, so a sandbox
+/// that never answers fails the operation instead of hanging it.
+const ONESHOT_OPERATION_BUDGET: Duration = Duration::from_secs(120);
 
 /// The facts of a one-shot, as they are: a failure must be
 /// DIAGNOSTICABLE from the report, never a static sentence.
@@ -185,7 +188,10 @@ async fn delete_sandbox(client: &ControlPlane, id: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn execd_for(client: &ControlPlane, id: &str) -> ExecdEndpoint {
+/// The transport of the execd behind an environment: ONE client per
+/// sandbox, so the connections are reused and the readiness is observed
+/// once for the generation the endpoint addresses.
+async fn execd_for(client: &ControlPlane, id: &str) -> ExecdClient {
     let response = client
         .get(&ControlPlane::endpoint_path(id, 44772))
         .send()
@@ -195,7 +201,7 @@ async fn execd_for(client: &ControlPlane, id: &str) -> ExecdEndpoint {
         Some(r) => r.json().await.unwrap_or_default(),
         None => Value::Null,
     };
-    ExecdEndpoint::from_contract(&value).unwrap_or_default()
+    ExecdClient::new(ExecdEndpoint::from_contract(&value).unwrap_or_default())
 }
 
 /// Minimal but REAL tracker fixture: one backlog project with one task, so
@@ -424,11 +430,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
         let kept = matches!(keep, ReleaseDecision::Keep { .. })
             && sandbox_exists(&client, &candidate_id).await;
         let execd = execd_for(&client, &candidate_id).await;
+        let deadline = Deadline::in_budget(ONESHOT_OPERATION_BUDGET);
         let write = opensandbox::execd::oneshot::run_when_ready(
                 &execd,
                 &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt && cat /workspace/candidate.txt"),
-                Duration::from_secs(30),
-                EXECD_READY_TIMEOUT,
+                deadline,
             )
             .await;
         let digest = CandidateDigest::from_bytes(CANDIDATE_CONTENT.as_bytes());
@@ -484,11 +490,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
         )
     } else {
         let execd = execd_for(&client, &resume_id).await;
+        let deadline = Deadline::in_budget(ONESHOT_OPERATION_BUDGET);
         let seeded = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             &format!("printf %s '{CANDIDATE_CONTENT}' > /workspace/candidate.txt"),
-            Duration::from_secs(30),
-            EXECD_READY_TIMEOUT,
+            deadline,
         )
         .await;
         // Durable export BEFORE the loss: bytes + digest survive the sandbox.
@@ -533,6 +539,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                     )
                 } else {
                     let fresh_execd = execd_for(&client, &fresh).await;
+                    let deadline = Deadline::in_budget(ONESHOT_OPERATION_BUDGET);
                     let encoded = base64::engine::general_purpose::STANDARD
                         .encode(CANDIDATE_CONTENT.as_bytes());
                     let restored = opensandbox::execd::oneshot::run_when_ready(
@@ -540,8 +547,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                         &format!(
                             "echo {encoded} | base64 -d > /workspace/candidate.txt && cat /workspace/candidate.txt"
                         ),
-                        Duration::from_secs(30),
-                        EXECD_READY_TIMEOUT,
+                        deadline,
                     )
                     .await;
                     let mut matches = restored.succeeded()
@@ -557,8 +563,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
                         let reread = opensandbox::execd::oneshot::run_when_ready(
                             &fresh_execd,
                             "cat /workspace/candidate.txt",
-                            Duration::from_secs(30),
-                            EXECD_READY_TIMEOUT,
+                            deadline,
                         )
                         .await;
                         matches = reread.succeeded()
@@ -613,11 +618,11 @@ pub async fn run(server: &str, image: &str) -> i32 {
         (false, false, "the sandbox was never created".to_string())
     } else {
         let execd = execd_for(&client, &no_export_id).await;
+        let deadline = Deadline::in_budget(ONESHOT_OPERATION_BUDGET);
         let wrote = opensandbox::execd::oneshot::run_when_ready(
             &execd,
             "echo in-progress > /workspace/half-edited.rs && echo scratch > /workspace/scratch.sh && ls /workspace",
-            Duration::from_secs(30),
-            EXECD_READY_TIMEOUT,
+            deadline,
         )
         .await;
         let files_present = wrote.output.contains("half-edited.rs");
