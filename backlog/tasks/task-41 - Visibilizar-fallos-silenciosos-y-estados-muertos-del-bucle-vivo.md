@@ -4,7 +4,7 @@ title: Visibilizar fallos silenciosos y estados muertos del bucle vivo
 status: To Do
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T13:44:00Z'
+updated_date: '2026-11-20T14:01:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -40,4 +40,6 @@ Ronda 1 entregada en rama task/task-41-visibility (commits a7153e3, 052be7c, cdf
 - (1) StoreClaims::release NO se tocó conscientemente: la firma ClaimPort (runner/live.rs:46), el call site en ClaimGuard::release_now/Drop (live.rs:178,184) y AttemptEnd/outcome_of (live.rs:63-148) están en runner/live.rs, ocupado por el worker de TASK-35. Pasa a ronda 2 junto con (2) NoNewCommit y (3) install stops.
 - Hallazgo nuevo dentro del mismo tema: main.rs:704-712 tiene el mismo patrón mirror-tail (chars().rev().take(400) sin devolver) en el detalle del probe acp-prompt-response. No es crítico pero es un mensaje engañoso igual que (4); va en ronda 2.
 - Hallazgo nuevo: drive_agent (agent.rs:660-669) hace busy-spin si pipe.next_event() devuelve None inmediatamente (socket cerrado limpio) — el timeout interno de 10 s envuelve la espera, no el reintento; hay que dormir o cortar el loop en Ok(None). Va en ronda 2, con prueba del corte.
+
+Ronda 1 integrada en main (merge fa7dde5). Reconciliación tras el rebase sobre 2986261: el worker de TASK-35 había refactorizado interaction_answer(-> Option<(Value,String)>), la r1 introduce el refusal como tercer elemento Option<Value>. Shape final: permission_answer -> (Value,String,Option<Value>) y interaction_answer -> Option<(String,String,Option<Value>)>; AcpTurn { completed, summary, interactions, refusal }; refusal exit anexa también interactions (commit 5459479) para que ambas salidas sean comparables. fast-check --all PASS; 22 tests live::agent; 122 binarios. Ninguna llamada externa cambió (permission_answer/interaction_answer/AcpTurn no se usan fuera de agent.rs). Ronda 2 en curso (ab332294) en task/task-41-round2 sobre main: (A) StoreClaims::release propaga error, (B) NoNewCommit decidir producir/eliminar, (C) install stops pendientes, (D) main.rs:704 mirrored tail, (E) busy-spin Ok(None).
 <!-- SECTION:NOTES:END -->
