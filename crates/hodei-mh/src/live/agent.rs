@@ -25,7 +25,7 @@ use verify::transport::TransportDigest;
 
 use runner::ports::{AgentError, AgentPort, Objective};
 
-use crate::live::session::SandboxSession;
+use crate::live::session::{AgentHandshake, SandboxSession};
 use crate::live::{GitIdentity, LiveConfig, LiveError, PermissionMode};
 
 /// The worktree the agent works in, inside the sandbox.
@@ -261,8 +261,20 @@ impl AcpAgent {
             .map_err(|error| Self::failure(work_ref, error))?;
         self.stage_adapter(session, work_ref).await?;
         let command = self.agent_command();
+        let wrapper_path = adapter_wrapper_path();
+        let credential_line = self.credential_line().ok_or_else(|| {
+            Self::failure(
+                work_ref,
+                "the credential cannot travel as one stdin line: it carries a tab or a line break",
+            )
+        })?;
+        let handshake = AgentHandshake {
+            wrapper_path: &wrapper_path,
+            wrapper_script: AcpAgent::wrapper_script(),
+            credential_line: &credential_line,
+        };
         let (mut conversation, agent_session) = session
-            .attach_agent(&command, WORKTREE)
+            .attach_agent(&command, WORKTREE, &handshake)
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
         let instruction = instruction_for(&objective.instruction);
@@ -412,27 +424,61 @@ impl AcpAgent {
 
     /// The command that starts the ACP adapter.
     ///
-    /// It carries the credentials, so it is NEVER logged: the detector
-    /// proves the command is secret-bearing (see the tests), which is why
-    /// it travels into the session and nowhere else.
+    /// It carries NO credential: the token reaches the adapter through
+    /// the stdin handshake that [`AcpAgent::wrapper_script`] consumes,
+    /// so the create_session body, the sandbox process table and every
+    /// log or error built from this command stay secret-free.
     pub fn agent_command(&self) -> String {
-        let base_prefix = self
-            .credentials
-            .base_url
-            .as_ref()
-            .map(|base| {
-                format!(
-                    "ANTHROPIC_BASE_URL={} ",
-                    crate::probe_util::shell_quote(base)
-                )
-            })
-            .unwrap_or_default();
         format!(
-            "PATH={ADAPTER_ROOT}/node_modules/.bin:$PATH HTTPS_PROXY={proxy} {base_prefix}ANTHROPIC_AUTH_TOKEN={token} claude-code-acp",
+            "PATH={ADAPTER_ROOT}/node_modules/.bin:$PATH HTTPS_PROXY={proxy} sh {wrapper} claude-code-acp",
             proxy = crate::probe_util::shell_quote(&self.config.proxy_url),
-            token = crate::probe_util::shell_quote(&self.credentials.token),
+            wrapper = crate::probe_util::shell_quote(&adapter_wrapper_path()),
         )
     }
+
+    /// The single stdin line the wrapper consumes: the base URL (empty
+    /// when unset) and the token, separated by one tab and terminated
+    /// by exactly one newline.
+    ///
+    /// The line IS the whole credential transport. A token or base URL
+    /// carrying a tab or a line break would split the framing and hand
+    /// half a secret to the adapter, so it is refused instead of
+    /// truncated.
+    pub fn credential_line(&self) -> Option<String> {
+        let base = self.credentials.base_url.as_deref().unwrap_or_default();
+        let token = self.credentials.token.as_str();
+        (!base.contains(['\n', '\r', '\t']) && !token.contains(['\n', '\r', '\t']))
+            .then(|| format!("{base}\t{token}\n"))
+    }
+
+    /// The POSIX wrapper staged beside the adapter inside the sandbox.
+    ///
+    /// It reads exactly ONE stdin line (the credential handshake),
+    /// exports it, and execs the adapter, so the token lives only in the
+    /// environment of the agent's process and never in an argv. A POSIX
+    /// `read` consumes its line without buffering the rest of the pipe,
+    /// so the ACP stream that follows reaches the exec'd adapter whole.
+    pub fn wrapper_script() -> &'static str {
+        r#"#!/bin/sh
+IFS="$(printf '\t')" read -r base token
+if [ -z "$token" ]; then
+  exit 1
+fi
+ANTHROPIC_AUTH_TOKEN="$token"
+export ANTHROPIC_AUTH_TOKEN
+if [ -n "$base" ]; then
+  ANTHROPIC_BASE_URL="$base"
+  export ANTHROPIC_BASE_URL
+fi
+exec "$@"
+"#
+    }
+}
+
+/// Where the credential wrapper travels inside the sandbox: the staged
+/// adapter directory, private by construction since its staging.
+fn adapter_wrapper_path() -> String {
+    format!("{ADAPTER_ROOT}/run-agent.sh")
 }
 
 #[async_trait::async_trait]
@@ -706,6 +752,7 @@ fn permission_answer(message: &Value, permission: PermissionMode) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
@@ -735,18 +782,143 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_command_is_recognised_as_secret_bearing_and_is_never_logged() {
+    fn the_launch_command_carries_no_credential_in_its_body_or_its_views() {
         let agent = AcpAgent::new(
             config(),
             Credentials::new("sk-ant-test-token", Some("http://model.local".into())),
         );
         let command = agent.agent_command();
         assert_eq!(
-            profiles::credentials::secret_leak_positions(&[command]),
-            vec![0],
-            "the command carries credentials: it must never reach a log"
+            profiles::credentials::secret_leak_positions(std::slice::from_ref(&command)),
+            Vec::<usize>::new(),
+            "the command is no longer recognised as secret-bearing: {command}"
         );
+        assert!(
+            !command.contains("ANTHROPIC_AUTH_TOKEN=") && !command.contains("sk-ant-test-token"),
+            "no credential name and no credential value in the command: {command}"
+        );
+        assert!(
+            command.contains("run-agent.sh"),
+            "the command starts the credential wrapper: {command}"
+        );
+        assert!(
+            command.contains("claude-code-acp"),
+            "and the adapter is still the process that answers the ACP stream"
+        );
+        // The persisted request body: the exact bytes the daemon keeps
+        // for the session, not only the shell string.
+        let body = serde_json::to_string(&opensandbox::execd::api::CreateSessionRequest {
+            cwd: Some(WORKTREE),
+            command: Some(&command),
+        })
+        .expect("the create_session request serializes");
+        assert!(
+            profiles::credentials::secret_leak_positions(std::slice::from_ref(&body)).is_empty(),
+            "the create_session body carries no credential: {body}"
+        );
+        // The views an error or a log may print.
         assert!(format!("{:?}", agent.credentials).contains("<redacted>"));
+        let error = crate::live::session::SessionError::Uncertain { command };
+        assert!(
+            !error.to_string().contains("sk-ant-test-token")
+                && !format!("{error:?}").contains("sk-ant-test-token"),
+            "the failure surface of a command repeats no credential"
+        );
+    }
+
+    #[test]
+    fn the_credential_line_frames_exactly_one_stdin_handshake() {
+        let agent = AcpAgent::new(
+            config(),
+            Credentials::new("sk-ant-test-token", Some("http://model.local".into())),
+        );
+        assert_eq!(
+            agent.credential_line().as_deref(),
+            Some("http://model.local\tsk-ant-test-token\n"),
+            "the base URL comes first: the token keeps the whole tail of the line"
+        );
+        let no_base = AcpAgent::new(config(), Credentials::new("tok-2", None));
+        assert_eq!(no_base.credential_line().as_deref(), Some("\ttok-2\n"));
+        // A secret that breaks the one-line framing is refused, never truncated.
+        for broken in ["bad\ntoken", "bad\ttoken", "bad\r\ntoken"] {
+            let agent = AcpAgent::new(config(), Credentials::new(broken, None));
+            assert_eq!(
+                agent.credential_line(),
+                None,
+                "a credential with a line break or a tab cannot travel this way"
+            );
+        }
+    }
+
+    /// Simulate the handshake over a real POSIX shell and a fake stdin
+    /// channel: the wrapper, then exec, then the ACP bytes that follow.
+    #[test]
+    fn the_wrapper_hands_the_credential_to_the_child_environment_only() {
+        let dir = staging_dir("wrapper");
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        std::fs::write(dir.join("run-agent.sh"), AcpAgent::wrapper_script()).expect("the wrapper");
+        // The stand-in adapter: it prints its argv and the two credential
+        // variables of its environment, then EVERY remaining stdin byte.
+        std::fs::write(
+            dir.join("adapter.sh"),
+            "#!/bin/sh\nprintf 'argv=%s\\n' \"$*\"\nprintf 'token=%s\\n' \"$ANTHROPIC_AUTH_TOKEN\"\nprintf 'base=%s\\n' \"${ANTHROPIC_BASE_URL:-unset}\"\ncat\n",
+        )
+        .expect("the adapter stand-in");
+        let command = format!(
+            "env -i PATH=/usr/bin:/bin HTTPS_PROXY=http://127.0.0.1:8888 sh {} sh {}",
+            dir.join("run-agent.sh").display(),
+            dir.join("adapter.sh").display(),
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh is available");
+        {
+            let mut stdin = child.stdin.take().expect("the fake stdin channel");
+            stdin
+                .write_all("http://model.local\tsk-ant-test-token\n".as_bytes())
+                .expect("the credential line");
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}\n")
+                .expect("the ACP stream");
+        }
+        let output = child.wait_with_output().expect("the adapter exits");
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("token=sk-ant-test-token"),
+            "the child environment carries the credential: {text}"
+        );
+        assert!(
+            text.contains("base=http://model.local"),
+            "and the gateway base URL too: {text}"
+        );
+        assert!(
+            text.contains(r#"{"jsonrpc":"2.0","method":"initialize"}"#),
+            "the ACP stream reaches the exec'd adapter whole: {text}"
+        );
+        let argv = text
+            .lines()
+            .find(|line| line.starts_with("argv="))
+            .expect("the adapter printed its argv");
+        assert!(
+            !argv.contains("sk-ant-test-token"),
+            "the credential never entered an argv: {argv}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wrapper_script_itself_carries_no_credential_value() {
+        let script = AcpAgent::wrapper_script();
+        assert!(
+            !script.contains("sk-"),
+            "the staged script is static: only the stdin line carries values"
+        );
+        assert!(script.contains("exec"), "and it execs, it does not fork");
     }
 
     #[test]

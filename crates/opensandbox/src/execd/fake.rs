@@ -3,14 +3,17 @@
 //! for, offline and without a daemon.
 //!
 //! It is a test double, not a daemon: it answers what the transport
-//! needs to observe (a session id, an output offset, an exit frame) and
-//! counts every request it received.
+//! needs to observe (a session id, an output offset, an exit frame),
+//! counts every request it received and records the bodies (uploads) and
+//! the client pipe frames (unmasked stdin payloads) so a test can assert
+//! on the exact bytes a transport put on the wire.
 
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 /// How the fake answers.
@@ -47,6 +50,11 @@ pub struct FakeCounts {
     pub pipes: usize,
     /// The commands the fake was asked to run, in order.
     pub commands: Vec<String>,
+    /// The raw bodies of the `/files/upload` requests, in order.
+    pub uploads: Vec<Vec<u8>>,
+    /// The client pipe WebSocket frames, in order: the opcode and the
+    /// unmasked payload of every frame the pipe received.
+    pub pipe_frames: Vec<(u8, Vec<u8>)>,
 }
 
 impl FakeCounts {
@@ -64,6 +72,8 @@ pub struct FakeExecd {
     /// The address the transport talks to.
     pub base_url: String,
     counts: Arc<Mutex<FakeCounts>>,
+    /// One token per pipe connection the fake saw close.
+    closures: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
 }
 
 impl FakeExecd {
@@ -75,12 +85,14 @@ impl FakeExecd {
         let addr = listener.local_addr().expect("the fake has an address");
         let counts = Arc::new(Mutex::new(FakeCounts::default()));
         let served = counts.clone();
+        let (closures_tx, closures_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            serve(listener, served, behavior).await;
+            serve(listener, served, behavior, closures_tx).await;
         });
         Self {
             base_url: format!("http://{addr}"),
             counts,
+            closures: tokio::sync::Mutex::new(closures_rx),
         }
     }
 
@@ -88,17 +100,36 @@ impl FakeExecd {
     pub fn counts(&self) -> FakeCounts {
         self.counts.lock().expect("the counts are readable").clone()
     }
+
+    /// Wait until `count` pipe connections were closed by the client.
+    /// The wait is on the close event itself, never on a timeout: the
+    /// frames recorded by the fake are complete once this returns.
+    pub async fn await_pipes_closed(&self, count: usize) {
+        let mut closures = self.closures.lock().await;
+        for _ in 0..count {
+            closures
+                .recv()
+                .await
+                .expect("the fake records every pipe closure");
+        }
+    }
 }
 
-async fn serve(listener: TcpListener, counts: Arc<Mutex<FakeCounts>>, behavior: FakeBehavior) {
+async fn serve(
+    listener: TcpListener,
+    counts: Arc<Mutex<FakeCounts>>,
+    behavior: FakeBehavior,
+    closures: mpsc::UnboundedSender<()>,
+) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
         count_connection(&counts);
         let counts = counts.clone();
+        let closures = closures.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(socket, counts, behavior).await;
+            let _ = serve_connection(socket, counts, behavior, closures).await;
         });
     }
 }
@@ -106,6 +137,7 @@ async fn serve(listener: TcpListener, counts: Arc<Mutex<FakeCounts>>, behavior: 
 /// What the fake answers to a request.
 enum Route {
     Create,
+    Upload,
     Status(String),
     Delete(String),
     Pipe(String),
@@ -154,6 +186,7 @@ impl RequestHead {
         let session = path.strip_prefix("/pty/").unwrap_or_default();
         match (self.method.as_str(), path) {
             ("POST", "/pty") => Route::Create,
+            ("POST", "/files/upload") => Route::Upload,
             ("GET", _) if session.ends_with("/ws") => {
                 Route::Pipe(session.trim_end_matches("/ws").to_string())
             }
@@ -171,6 +204,7 @@ async fn serve_connection(
     mut socket: TcpStream,
     counts: Arc<Mutex<FakeCounts>>,
     behavior: FakeBehavior,
+    closures: mpsc::UnboundedSender<()>,
 ) -> io::Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
@@ -217,6 +251,10 @@ async fn serve_connection(
                     }
                 }
             }
+            Route::Upload => {
+                count_upload(&counts, body);
+                respond(&mut socket, "200 OK", "{}").await?;
+            }
             Route::Status(session) => {
                 let produced = count_status(&counts);
                 let body = format!(
@@ -231,7 +269,16 @@ async fn serve_connection(
             }
             Route::Pipe(session) => {
                 let first_pipe = count_pipe(&counts) == 1;
-                serve_pipe(&mut socket, &request, &session, behavior, first_pipe).await?;
+                serve_pipe(
+                    &mut socket,
+                    &request,
+                    &session,
+                    behavior,
+                    first_pipe,
+                    &counts,
+                )
+                .await?;
+                let _ = closures.send(());
                 return Ok(());
             }
             Route::Unknown => {
@@ -317,12 +364,20 @@ fn count_pipe(counts: &Arc<Mutex<FakeCounts>>) -> usize {
     counts.pipes
 }
 
+/// Count one uploaded file and keep its raw body: the bytes the
+/// transport put on the wire are observable, not only their count.
+fn count_upload(counts: &Arc<Mutex<FakeCounts>>, body: Vec<u8>) {
+    let mut counts = counts.lock().expect("the counts are writable");
+    counts.uploads.push(body);
+}
+
 async fn serve_pipe(
     socket: &mut TcpStream,
     request: &RequestHead,
     session: &str,
     behavior: FakeBehavior,
     first_pipe: bool,
+    counts: &Arc<Mutex<FakeCounts>>,
 ) -> io::Result<()> {
     let Some(key) = request.header("sec-websocket-key") else {
         respond(socket, "400 Bad Request", "{}").await?;
@@ -355,16 +410,89 @@ async fn serve_pipe(
     }
 
     // The client closes the pipe: its frames are read until the socket
-    // ends, so the close is orderly.
+    // ends, so the close is orderly. Every complete client frame is
+    // unmasked and recorded: the order of the payloads is what the
+    // transport promised to put on the wire.
     let mut chunk = [0u8; 1024];
+    let mut pending = Vec::new();
     loop {
         let read = socket.read(&mut chunk).await?;
         if read == 0 {
             break;
         }
+        pending.extend_from_slice(&chunk[..read]);
+        let frames = take_client_frames(&mut pending);
+        if !frames.is_empty() {
+            let mut counts = counts.lock().expect("the counts are writable");
+            counts.pipe_frames.extend(frames);
+        }
     }
     let _ = session;
     Ok(())
+}
+
+/// The WebSocket opcode of a binary payload frame, as tungstenite sends it.
+pub const CLIENT_FRAME_BINARY: u8 = 0x2;
+
+/// Pop every complete client WebSocket frame from the buffer: the
+/// transports mask their payloads, so the fake unmasks them here.
+fn take_client_frames(buffer: &mut Vec<u8>) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    loop {
+        if buffer.len() < 2 {
+            return frames;
+        }
+        let opcode = buffer[0] & 0x0f;
+        let masked = buffer[1] & 0x80 != 0;
+        let mut length = usize::from(buffer[1] & 0x7f);
+        let mut offset = 2;
+        if length == 126 {
+            if buffer.len() < offset + 2 {
+                return frames;
+            }
+            length = usize::from(u16::from_be_bytes([buffer[offset], buffer[offset + 1]]));
+            offset += 2;
+        } else if length == 127 {
+            if buffer.len() < offset + 8 {
+                return frames;
+            }
+            let wide = [
+                buffer[offset],
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+                buffer[offset + 4],
+                buffer[offset + 5],
+                buffer[offset + 6],
+                buffer[offset + 7],
+            ];
+            let Ok(wide) = usize::try_from(u64::from_be_bytes(wide)) else {
+                return frames;
+            };
+            length = wide;
+            offset += 8;
+        }
+        // A client that does not mask is not this transport: record nothing.
+        if !masked {
+            return frames;
+        }
+        if buffer.len() < offset + 4 + length {
+            return frames;
+        }
+        let key = [
+            buffer[offset],
+            buffer[offset + 1],
+            buffer[offset + 2],
+            buffer[offset + 3],
+        ];
+        let payload: Vec<u8> = buffer[offset + 4..offset + 4 + length]
+            .iter()
+            .enumerate()
+            .map(|(position, byte)| byte ^ key[position % 4])
+            .collect();
+        buffer.drain(..offset + 4 + length);
+        frames.push((opcode, payload));
+    }
 }
 
 /// A server frame: the final bit is set and the payload is not masked.
@@ -394,4 +522,73 @@ async fn respond(socket: &mut TcpStream, status: &str, body: &str) -> io::Result
         body.len()
     );
     socket.write_all(response.as_bytes()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client frame, masked the way the transports mask them.
+    fn masked_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let key = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x80 | opcode];
+        match payload.len() {
+            0..=125 => frame.push(0x80 | u8::try_from(payload.len()).expect("short payload")),
+            other => {
+                frame.push(0x80 | 126);
+                let wide = u16::try_from(other).expect("payload fits the widened length");
+                frame.extend_from_slice(&wide.to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(&key);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(position, byte)| byte ^ key[position % 4]),
+        );
+        frame
+    }
+
+    #[test]
+    fn client_frames_are_unmasked_in_order() {
+        let mut wire = masked_client_frame(CLIENT_FRAME_BINARY, b"one\n");
+        wire.extend(masked_client_frame(CLIENT_FRAME_BINARY, b"two\n"));
+        let mut buffer = wire;
+        let frames = take_client_frames(&mut buffer);
+        assert_eq!(
+            frames,
+            vec![
+                (CLIENT_FRAME_BINARY, b"one\n".to_vec()),
+                (CLIENT_FRAME_BINARY, b"two\n".to_vec()),
+            ]
+        );
+        assert!(buffer.is_empty(), "the whole wire was consumed");
+    }
+
+    #[test]
+    fn an_incomplete_client_frame_waits_for_the_rest_of_its_bytes() {
+        let mut wire = masked_client_frame(CLIENT_FRAME_BINARY, b"payload");
+        let cut = wire.len() - 3;
+        let missing = wire.split_off(cut);
+        assert!(
+            take_client_frames(&mut wire).is_empty(),
+            "a half frame is not a frame"
+        );
+        wire.extend(missing);
+        assert_eq!(
+            take_client_frames(&mut wire),
+            vec![(CLIENT_FRAME_BINARY, b"payload".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_long_client_frame_uses_the_widened_length() {
+        let payload = vec![b'x'; 300];
+        let mut buffer = masked_client_frame(CLIENT_FRAME_BINARY, &payload);
+        let frames = take_client_frames(&mut buffer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, payload);
+        assert!(buffer.is_empty());
+    }
 }
