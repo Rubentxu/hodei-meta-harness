@@ -3,7 +3,7 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
-updated_date: '2026-11-19T22:57:00Z'
+updated_date: '2026-11-20T08:08:00Z'
 ---
 # Handoff
 
@@ -12,58 +12,48 @@ updated_date: '2026-11-19T22:57:00Z'
 
 ## Ahora
 
-- **TASK-33 (MH-A12) está CERRADA.** 4/4 AC comprobados, PR #42 fusionado, `main` en
-  `34ce234`. La promoción Git y el cierre del ticket se reconcilian desde una intención durable
-  (`crates/hodei-mh-promote/{intent,flow,journal,writer}.rs` + payload en el store del
-  coordinador), con la fase derivada de la observación de las dos autoridades y cada paso
-  idempotente.
-- **Aviso operativo (política `git-control`):** el mensaje del commit de merge de PR #42
-  llevaba un trailer `Co-authored-by` que la política prohíbe. El hook `reference-transaction`
-  juzga **commit por commit** los que entran en una rama, así que bloqueaba el fast-forward local
-  y **todo push** (también de ramas nuevas que contuvieran ese commit). Remediado sin reescribir
-  contenido: `git commit --amend --reset-author -F <mensaje>` (mismo árbol) y
-  `git push --force-with-lease`. Si vuelve a salir un trailer, el mismo camino: **nunca**
-  `--no-verify`. La rama `main` de GitHub no está protegida.
-- **En curso, tres workers en worktrees aislados** (uno por tarea; no se tocan entre sí):
-  - TASK-31 (MH-A08, deadline único y cleanup del transporte) → `../wt-task31`, rama
-    `task/task-31-work`.
-  - TASK-38 (la credencial del execd no viaja en el handshake de `run-probe`) → `../wt-task38`,
-    rama `task/task-38-work`.
-  - TASK-39 (las sondas dejan sockets de supervisor en `/tmp`) → `../wt-task39`, rama
-    `task/task-39-work`.
-- **La siguiente por prioridad es TASK-34 (MH-A06, HIGH)**: conectar el supervisor de producto al
-  bucle real de objetivos ACP. Depende de TASK-33 (cerrada) y de TASK-31 (en curso), así que su
-  encargo sale en cuanto TASK-34 quede cableado sobre el transporte unificado. Después:
-  TASK-35 (MH-A13) y TASK-36 (MH-A10).
-- Tablero: 33 tareas `Done`; en curso TASK-31, TASK-38, TASK-39; pendientes TASK-34, TASK-35,
-  TASK-36.
-
-## Última tarea cerrada
-
-- **TASK-33 (MH-A12) — Reconciliar promoción Git y cierre de ticket con una intención durable.**
-  - `PromotionIntent` guarda los hechos inmutables del intento (operación derivada de
-    `work_ref:epoch:candidate`, proyecto, `work_ref`, `epoch`, rama gestionada, SHA base y
-    candidato esperados, estado destino, nota marcada `[hodei-mh:op:{operation_id}]`). El
-    coordinador lo conserva como payload opaco del intent de efecto: un solo store, una sola
-    autoridad.
-  - `decide()` es una función pura: la fase **no se persiste**, se deriva de observar las dos
-    autoridades (la ref de Git y el JSON del ticket). Por eso una caída se reconcilia en vez de
-    dejar un estado intermedio que nadie sabe leer.
-  - Conflicto real (ref movida, epoch caducada, proyecto o SHA distintos, ticket tocado por una
-    persona) se registra y **no** se adopta ni se sobrescribe nada; el cierre humano no se pisa.
-  - Verificación: 34 unitarias, 7 de recuperación con repo Git temporal y tracker falso, 2 de
-    contrato contra la CLI real sin LLM, gate local `scripts/fast-check.sh` en PASS y
-    `workspace gate` de CI en SUCCESS.
+- **TASK-38 y TASK-39 están CERRADAS.** `main` lleva el código de ambas (TASK-38 en `e9829ed`,
+  TASK-39 en `045fded`) y el cierre del tablero en `c536081`.
+  - TASK-38: `run-probe` entrega la credencial del execd por la cabecera del handshake
+    (`ExecdEndpoint::attach_options`) y un 401 aparece como check FALLIDO, no omitido.
+  - TASK-39: la sonda multiproyecto registra los sockets de supervisor que nombra, los elimina
+    tras matar a los supervisores y publica el paso `no-supervisor-socket-survives-the-probe`
+    (cleanup completo Y recuento de `/tmp` igual antes/después). Evidencia: probe real 14/14,
+    `all_passed=true`, 0 residuo, 4/4 sockets eliminados, 0 antes y 0 después.
+- **TASK-31 (MH-A08) en corrección.** El worker entregó `a004c59` con gate `--all` PASS y smoke
+  real 12/12, pero la revisión goldfish confirmó cuatro defectos que un corrector está
+  arreglando en `../wt-task31`:
+  1. AC2: `ensure_ready` devuelve `true` con la readiness cacheada aunque el deadline ya esté
+     agotado; la llamada bloqueada debe ser `NotAccepted` sin ejecutar el comando.
+  2. AC3: `reconcile_sandboxes` no tiene llamador productivo; el registro se pierde al salir o
+     al cancelar, y las entradas de sesión nunca se liberan. Hace falta diario durable y
+     reconciliación al entrar en los caminos que crean sandboxes.
+  3. AC4: la medición imprime p50/p95 pero no compara contra un baseline explícito.
+  4. Política: `expect()` en producción en `execd/client.rs` y `cleanup.rs`.
+- **TASK-36 (MH-A10, LOW) en curso** en `../wt-task36`: caché de build opt-in y segura
+  (módulo puro `cache.rs`, montaje/GC en `profile_run`, doc de perfiles), con benchmark
+  frío/caliente y la regla de que una caché escribible no puede producir PASS.
+- **La siguiente por prioridad es TASK-34 (MH-A06, HIGH)**: conectar el supervisor de producto
+  al bucle real de objetivos ACP. Depende de TASK-31, así que su encargo sale en cuanto TASK-31
+  se acepte y mergee. Después TASK-35 (MH-A13), que depende de TASK-34.
+- Tablero: 34 tareas `Done`; en curso TASK-31 y TASK-36; pendientes TASK-34 y TASK-35.
 
 ## Aprendido
 
-- **La política `git-control` juzga el historial completo, no solo el commit que escribes.** Un
-  mensaje malo creado en GitHub (squash merge) deja la rama local sin poder avanzar y sin poder
-  pushear nada, aunque el árbol sea correcto. Es el primer sitio donde mirar si `git` se niega.
-- **Un `MERGE_HEAD` a medias es una operación viva**: estaban la fusión del PR #42 y su
-  `MERGE_MSG` ya tenía el mensaje limpio que la política admitía. `git merge --abort` + rama
-  temporal + `amend` resolvió la operación en vez de relanzarla.
-- `backlog task edit` escribe las notas y el resumen final en el fichero de la tarea; el
-  handoff se actualiza con `backlog doc update doc-1 --content ...`.
-- Las sondas (`run-probe`, `multiproject-probe`) **no están** en `scripts/probes.sh`: por eso un
-  fallo en ellas no lo detecta ninguna lane. TASK-38 y TASK-39 nacen de esa laguna.
+- **Un registro sin consumidor no es reconciliación.** `CleanupRegistry` con `Drop` cumple la
+  parte de "no se pierde la intención", pero si nadie llama a `reconcile_sandboxes` y el diario
+  vive solo en memoria, el residuo se pierde igual. La evidencia tiene que ser un llamador
+  productivo y un diario durable, no una API y su test.
+- **La sonda multiproyecto necesita el entorno completo del lane**: contenedor de egreso con
+  puerto publicado (`-p 127.0.0.1:18888:8888`, `scripts/egress-proxy.py` en `rust:1-bookworm`),
+  `HODEI_MH_EGRESS_PROXY_CONTAINER`, `HODEI_MH_PROXY_CHECK_URL` y `PORT=8082` si el servidor
+  adoptado ocupa 8081. Sin eso fallan pasos que no tienen que ver con el cambio.
+- **El gate de workspace puede fallar por flake del propio test**: `supervisor_cli` agotó sus
+  20 s esperando `phase: idle` en CI y pasó 3/3 en local y en la reejecución. Se reejecuta el job
+  y se registra; no se toca el test sin causa demostrada.
+- **La política `git-control` juzga commit por commit al actualizar una ref.** Un trailer
+  `Co-authored-by` en un squash de GitHub bloquea el fast-forward y todo push de ramas que lo
+  contengan. Remedio: mensaje limpio con el mismo árbol y `--force-with-lease`; nunca
+  `--no-verify`.
+- Las sondas siguen fuera de `scripts/probes.sh`; TASK-38 y TASK-39 nacieron de esa laguna y
+  ahora se ejecutan a mano con el entorno del lane.
