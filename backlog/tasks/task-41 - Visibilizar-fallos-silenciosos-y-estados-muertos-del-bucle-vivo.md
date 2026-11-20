@@ -4,7 +4,7 @@ title: Visibilizar fallos silenciosos y estados muertos del bucle vivo
 status: Done
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T14:22:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -20,9 +20,9 @@ Descubrimiento de la revisión independiente de TASK-34 (linea base f3dcec5), fu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Un fallo al liberar un claim deja de descartarse: se propaga al resultado del run como estado incierto visible y queda cubierto por una prueba con un store que falla.
-- [ ] #2 El estado NoNewCommit deja de ser código muerto: un agente sin cambios se reporta como rechazo con causa (o el estado se elimina) y el match queda exhaustivo sin ramas inalcanzables, con prueba.
-- [ ] #3 Los stops pendientes de runs anteriores no se pierden en silencio al instalar uno nuevo: o se retienen, o una prueba demuestra que ningún intento retrasado puede arrancar después del install.
+- [x] #1 Un fallo al liberar un claim deja de descartarse: se propaga al resultado del run como estado incierto visible y queda cubierto por una prueba con un store que falla.
+- [x] #2 El estado NoNewCommit deja de ser código muerto: un agente sin cambios se reporta como rechazo con causa (o el estado se elimina) y el match queda exhaustivo sin ramas inalcanzables, con prueba.
+- [x] #3 Los stops pendientes de runs anteriores no se pierden en silencio al instalar uno nuevo: o se retienen, o una prueba demuestra que ningún intento retrasado puede arrancar después del install.
 <!-- AC:END -->
 
 ## Implementation Notes

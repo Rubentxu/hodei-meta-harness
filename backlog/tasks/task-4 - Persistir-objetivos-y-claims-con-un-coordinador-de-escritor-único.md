@@ -4,7 +4,7 @@ title: Persistir objetivos y claims con un coordinador de escritor único
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T15:53:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-04
@@ -31,7 +31,7 @@ Clave de incorporación: GC-04.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Ejecutar pruebas de propiedades de reducer y fallos inducidos en transacciones.
+- [x] #1 Ejecutar pruebas de propiedades de reducer y fallos inducidos en transacciones.
 <!-- DOD:END -->
 
 ## Implementation Notes

@@ -4,7 +4,7 @@ title: Preparar un workspace Git aislado y recuperar sus cambios
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T15:39:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-02
@@ -31,7 +31,7 @@ Clave de incorporación: GC-02.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Probar cambios nuevos borrados binarios y checkout sucio con repositorios Git temporales.
+- [x] #1 Probar cambios nuevos borrados binarios y checkout sucio con repositorios Git temporales.
 <!-- DOD:END -->
 
 ## Implementation Notes

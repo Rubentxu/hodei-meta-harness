@@ -4,7 +4,7 @@ title: Controlar un run ACP desde START hasta STOP
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T15:59:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-05
@@ -33,7 +33,7 @@ Clave de incorporación: GC-05.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Prueba E2E real de start/pause/resume/stop y carrera Stop contra una respuesta pendiente.
+- [x] #1 Prueba E2E real de start/pause/resume/stop y carrera Stop contra una respuesta pendiente.
 <!-- DOD:END -->
 
 ## Implementation Notes

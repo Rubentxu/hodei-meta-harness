@@ -3,6 +3,13 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
+updated_date: '2026-11-20T20:24:00Z'
+---
+---
+id: doc-1
+title: handoff
+type: other
+created_date: '2026-11-18T21:38:00Z'
 updated_date: '2026-11-20T20:13:00Z'
 ---
 # Handoff
@@ -12,10 +19,16 @@ updated_date: '2026-11-20T20:13:00Z'
 
 ## Ahora
 
-- **El tablero está cerrado: 54/54 tareas `Done`, ninguna elegible pendiente.** Y el CI de
-  `main` está en verde de verdad: run `44808413572` con `workspace gate` SUCCESS y
-  `probe lane` SUCCESS (las seis sondas). PRs fusionados en las últimas 48 h: 15; commits:
-  136.
+- **El tablero está cerrado: 54/54 tareas `Done`, ninguna elegible pendiente, 0 AC y 0 DoD
+  sin marcar.** Ese recuento sale de `backlog task list --plain` (la salida que trae el
+  `ac: X/Y`), NO del `--json`: el JSON omite las marcas de algunas tareas y hace creer que
+  todo está marcado cuando no lo está. Al auditar con el JSON se afirmó "0 AC sin marcar" y
+  era falso: TASK-35 (4 AC), TASK-40 (3 AC) y TASK-41 (3 AC) estaban `Done` con sus AC sin
+  marcar, y TASK-1..TASK-7 con su DoD sin marcar. Las 17 cajas se marcaron tras comprobar
+  que la evidencia que ya estaba registrada en sus notas existe en el código.
+  El CI de `main` está en verde de verdad: run `44808413572` y run `44810008735` con
+  `workspace gate` SUCCESS y `probe lane` SUCCESS (las seis sondas). PRs fusionados en las
+  últimas 48 h: 15; commits: 136.
 - **Repo**: `hodei-meta-harness` (`/home/rdcabrera/Proyectos/rust/goal-cycle-mh`), en `main`
   (`8d20acb`), sincronizado con `origin/main`, árbol limpio. Sin stashes, sin worktrees, sin
   ramas de tarea, sin PRs abiertos. Otra sesión trabaja en paralelo en este mismo repo
@@ -70,3 +83,10 @@ updated_date: '2026-11-20T20:13:00Z'
   ocupa el puerto y hace fallar la siguiente corrida por un motivo que no es del producto.
 - **Los workers también dejan residuos**: un contenedor de proxy y una rama sin borrar. El
   cierre del supervisor tiene que mirarlos.
+- **"El tablero dice Done" y "el tablero está satisfecho" son cosas distintas.** El estado de
+  una tarea (`Done`) no implica que sus AC y DoD estén marcados: 17 cajas de tres tareas
+  cerradas y de las siete primeras seguían sin marcar. Auditar el estado (`task list --plain`)
+  y auditar las cajas (`grep '^- \[ \]'`) son dos comprobaciones distintas, y las dos hacen
+  falta para poder decir que el backlog está completo.
+- **Marcar una caja es una afirmación**: solo se marca si la evidencia existe, y la evidencia
+  se cita con `fichero:línea` o con el nombre del test que la demuestra.

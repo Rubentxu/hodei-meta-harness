@@ -4,7 +4,7 @@ title: Transportar la credencial del agente al execd sin incrustarla en el coman
 status: Done
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T14:44:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -20,9 +20,9 @@ Descubrimiento de la revisión independiente de TASK-34 (linea base f3dcec5). El
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 El comando de create_session y el estado o log persistido no contienen la credencial: secret_leak_positions vacío sobre ambos y una prueba determinista lo impide.
-- [ ] #2 El proceso del agente recibe ANTHROPIC_AUTH_TOKEN solo por su entorno; ninguna ruta de producto lo incluye en argv, archivo persistido, evento ni handoff.
-- [ ] #3 Los consumidores heredados (main.rs, interact_probe, autonomous_probe) usan el transporte nuevo o quedan fuera de alcance con justificación registrada; las probes existentes siguen verdes.
+- [x] #1 El comando de create_session y el estado o log persistido no contienen la credencial: secret_leak_positions vacío sobre ambos y una prueba determinista lo impide.
+- [x] #2 El proceso del agente recibe ANTHROPIC_AUTH_TOKEN solo por su entorno; ninguna ruta de producto lo incluye en argv, archivo persistido, evento ni handoff.
+- [x] #3 Los consumidores heredados (main.rs, interact_probe, autonomous_probe) usan el transporte nuevo o quedan fuera de alcance con justificación registrada; las probes existentes siguen verdes.
 <!-- AC:END -->
 
 ## Implementation Notes

@@ -4,7 +4,7 @@ title: Seleccionar y encadenar tickets con un objetivo recurrente
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T16:03:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-06
@@ -33,7 +33,7 @@ Clave de incorporación: GC-06.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Pruebas con FakeTracker y Backlog real de reapertura y alta durante Idle.
+- [x] #1 Pruebas con FakeTracker y Backlog real de reapertura y alta durante Idle.
 <!-- DOD:END -->
 
 ## Implementation Notes

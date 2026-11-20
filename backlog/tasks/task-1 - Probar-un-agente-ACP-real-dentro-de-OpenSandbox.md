@@ -4,7 +4,7 @@ title: Probar un agente ACP real dentro de OpenSandbox
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T21:01:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-01
@@ -32,7 +32,7 @@ Clave de incorporación: GC-01.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Registrar comandos versiones exactas y resultado real de cada caso en esta tarea.
+- [x] #1 Registrar comandos versiones exactas y resultado real de cada caso en esta tarea.
 <!-- DOD:END -->
 
 ## Implementation Plan

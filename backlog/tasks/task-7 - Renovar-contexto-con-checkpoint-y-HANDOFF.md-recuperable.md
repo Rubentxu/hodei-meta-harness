@@ -4,7 +4,7 @@ title: Renovar contexto con checkpoint y HANDOFF.md recuperable
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T16:11:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-07
@@ -33,7 +33,7 @@ Clave de incorporación: GC-07.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Prueba canario de contexto real y fallos inyectados en cada frontera de persistencia.
+- [x] #1 Prueba canario de contexto real y fallos inyectados en cada frontera de persistencia.
 <!-- DOD:END -->
 
 ## Implementation Notes

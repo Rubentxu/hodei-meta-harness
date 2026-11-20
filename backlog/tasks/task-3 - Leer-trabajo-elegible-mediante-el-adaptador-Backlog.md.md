@@ -4,7 +4,7 @@ title: Leer trabajo elegible mediante el adaptador Backlog.md
 status: Done
 assignee: []
 created_date: '2026-11-17T14:20:00Z'
-updated_date: '2026-11-17T15:47:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - gc-mvp
   - gc-03
@@ -31,7 +31,7 @@ Clave de incorporación: GC-03.
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Probar contra una instalación Backlog fijada y fixtures con dependencias archivadas y ambiguas.
+- [x] #1 Probar contra una instalación Backlog fijada y fixtures con dependencias archivadas y ambiguas.
 <!-- DOD:END -->
 
 ## Implementation Notes

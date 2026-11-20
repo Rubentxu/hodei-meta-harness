@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T14:44:00Z'
+updated_date: '2026-11-20T20:24:00Z'
 labels:
   - audit-v0.2
   - product
@@ -34,10 +34,10 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Checkpoint durable conserva identidad/estado del objetivo y candidato; reinicio crea nueva sesión sin duplicar claims ni efectos confirmados.
-- [ ] #2 Solicitud ACP de permiso o formulario usa política autorizada y no hereda permiso por handoff; interacción no soportada queda pendiente o denegada explícitamente.
-- [ ] #3 Objetivo recurrente sin trabajo espera sin sandbox; objetivo personalizado termina sin mutar Backlog si no tiene ticket.
-- [ ] #4 Test determinista de pérdida de contexto y espera, más una UAT de recuperación real cuando este flujo cambie; no repetir toda la matriz de probes.
+- [x] #1 Checkpoint durable conserva identidad/estado del objetivo y candidato; reinicio crea nueva sesión sin duplicar claims ni efectos confirmados.
+- [x] #2 Solicitud ACP de permiso o formulario usa política autorizada y no hereda permiso por handoff; interacción no soportada queda pendiente o denegada explícitamente.
+- [x] #3 Objetivo recurrente sin trabajo espera sin sandbox; objetivo personalizado termina sin mutar Backlog si no tiene ticket.
+- [x] #4 Test determinista de pérdida de contexto y espera, más una UAT de recuperación real cuando este flujo cambie; no repetir toda la matriz de probes.
 <!-- AC:END -->
 
 ## Implementation Notes
