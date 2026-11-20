@@ -164,7 +164,11 @@ fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How long one ACP conversation may take.
+/// How long one ACP conversation may take. The turn carries the whole
+/// objective — model latency, tool calls and all — so a conversation that
+/// has not ended its turn by now has no result left to wait for: the
+/// attempt ends and the sandbox goes away. Fixed on purpose; there is no
+/// per-run override.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How many characters of agent text a timeout summary keeps. The tail is
@@ -304,6 +308,11 @@ impl AcpAgent {
                 // The refusal travels with the failure: whoever reads the
                 // record sees the structured event, not only its prose.
                 Some(event) => format!("{}: {event}{interactions_part}", turn.summary),
+                None if turn.summary.starts_with("timeout") => format!(
+                    "{}{interactions_part}: the agent did not finish its turn within AGENT_TIMEOUT ({}s); retry or shorten the task",
+                    turn.summary,
+                    AGENT_TIMEOUT.as_secs()
+                ),
                 None => format!("{}{interactions_part}", turn.summary),
             };
             return Err(Self::failure(
@@ -707,12 +716,15 @@ pub async fn drive_agent(
                             // The denial is a fact worth a log line of its
                             // own: emit it structured, then end the turn.
                             eprintln!("{event}");
-                            let tool = event["tool"].as_str().unwrap_or("unknown tool");
-                            turn.interactions = interactions;
-                            turn.refusal = Some(event);
+                            let tool = event["tool"]
+                                .as_str()
+                                .unwrap_or("unknown tool")
+                                .to_string();
                             turn.summary = format!(
                                 "the permission policy refused {tool:?}: the attempt ends as a refusal"
                             );
+                            turn.interactions = interactions;
+                            turn.refusal = Some(event);
                             return turn;
                         }
                     }
@@ -770,7 +782,8 @@ pub async fn drive_agent(
         }
     }
     turn.summary = format!(
-        "timeout, text_tail={:?}",
+        "timeout after {}s, text_tail={:?}",
+        timeout.as_secs(),
         readable_tail(&agent_text, TEXT_TAIL_LIMIT)
     );
     turn.interactions = interactions;
@@ -1253,6 +1266,11 @@ mod tests {
         assert!(
             !turn.summary.contains(&mirrored),
             "the tail is not printed reversed"
+        );
+        assert!(
+            turn.summary.contains("timeout after 60s"),
+            "the summary names the window it ran out of: {}",
+            turn.summary
         );
     }
 
