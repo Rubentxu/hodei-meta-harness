@@ -156,12 +156,20 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
         .map_err(|error| LiveError::Claims(error.to_string()))?,
     );
     // A restart reads the durable record before any effect: a confirmed
-    // attempt is not redone, and a pending one is reported as uncertain
-    // instead of being executed again.
+    // attempt is not redone, a refusal that left no effect is settled,
+    // and a pending one is reported as uncertain instead of being
+    // executed again.
     match config.checkpoints().recover() {
         Ok(Recovery::Fresh) => {}
         Ok(Recovery::NothingToRedo(record)) => eprintln!(
             "live checkpoint: {} is confirmed (epoch {}, session {}): nothing to redo; handoff={}",
+            record.checkpoint.work_ref,
+            record.checkpoint.epoch,
+            record.checkpoint.session_id,
+            config.checkpoints().handoff_path().display()
+        ),
+        Ok(Recovery::SettledNoEffect(record)) => eprintln!(
+            "live checkpoint: {} was refused before any effect (epoch {}, session {}): the record is settled and a new attempt may open; handoff={}",
             record.checkpoint.work_ref,
             record.checkpoint.epoch,
             record.checkpoint.session_id,

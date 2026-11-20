@@ -190,12 +190,58 @@ pub trait AgentPort: Send + Sync {
     async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError>;
 }
 
+/// What a failed agent turn left behind, as far as the agent adapter can
+/// tell. The durable record needs the distinction: an attempt that was
+/// refused before it moved anything can be settled by the runtime, while
+/// one whose effects are unknown must stay pending for an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnEffects {
+    /// The turn ended in a way that may have moved effects: the durable
+    /// record stays uncertain until somebody resolves it.
+    #[default]
+    Unknown,
+    /// The turn was refused before any effect: no candidate was produced,
+    /// nothing was promoted and no ticket was closed.
+    RefusedNoEffect,
+}
+
 /// The agent could not run the objective.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the agent could not run {work_ref}: {reason}")]
 pub struct AgentError {
+    /// The work the turn was for.
     pub work_ref: String,
+    /// What the agent reported as the cause, in its own words.
     pub reason: String,
+    /// What the failed turn is known to have left behind.
+    pub effects: TurnEffects,
+}
+
+impl AgentError {
+    /// A failure whose effects nobody can state: the record stays pending.
+    pub fn new(work_ref: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::with_effects(work_ref, reason, TurnEffects::Unknown)
+    }
+
+    /// The failure of a turn the policy refused before it had any effect.
+    pub fn refused_no_effect(
+        work_ref: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::with_effects(work_ref, reason, TurnEffects::RefusedNoEffect)
+    }
+
+    fn with_effects(
+        work_ref: impl Into<String>,
+        reason: impl Into<String>,
+        effects: TurnEffects,
+    ) -> Self {
+        Self {
+            work_ref: work_ref.into(),
+            reason: reason.into(),
+            effects,
+        }
+    }
 }
 
 /// The verifier that judges the candidate against the objective.

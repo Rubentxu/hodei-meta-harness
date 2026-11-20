@@ -49,6 +49,10 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub enum LivePhase {
     /// The turn may have run: its effects are not known to be applied.
     Pending,
+    /// The turn was refused before it had any effect: no candidate was
+    /// observed, nothing was promoted and no ticket was closed. The
+    /// record is settled, so the next attempt opens without an operator.
+    SettledNoEffect,
     /// The attempt reached a terminal effect: nothing must be redone.
     Confirmed,
 }
@@ -83,17 +87,22 @@ pub enum Recovery {
     /// A pending attempt: it is uncertain whether it happened, and it is
     /// never silently executed again.
     Uncertain(LiveRecord),
+    /// An attempt the policy refused before any effect: the record is
+    /// settled, so the next attempt opens without an operator.
+    SettledNoEffect(LiveRecord),
 }
+
+/// The handoff a settled refusal writes: the record states what it is,
+/// and a boot that reads it never has to guess why the attempt ended.
+pub const NO_EFFECT_REFUSAL: &str = "the attempt refused; no candidate, no promotion, no closure";
 
 /// Read a record (or its absence) as a recovery classification.
 pub fn classify(record: Option<&LiveRecord>) -> Recovery {
-    match record {
-        None => Recovery::Fresh,
-        Some(record) => match record.phase {
-            LivePhase::Confirmed => Recovery::NothingToRedo(record.clone()),
-            LivePhase::Pending => Recovery::Uncertain(record.clone()),
-        },
-    }
+    record.map_or(Recovery::Fresh, |record| match record.phase {
+        LivePhase::Confirmed => Recovery::NothingToRedo(record.clone()),
+        LivePhase::Pending => Recovery::Uncertain(record.clone()),
+        LivePhase::SettledNoEffect => Recovery::SettledNoEffect(record.clone()),
+    })
 }
 
 /// The goal identity a record keeps across rollovers.
@@ -134,6 +143,8 @@ pub enum CheckpointError {
     SameSession { session: String },
     #[error("the handoff of {goal} could not be rendered: {reason}")]
     Handoff { goal: String, reason: String },
+    #[error("the record of {work_ref} is not a refusal without effects: {reason}")]
+    NotEffectless { work_ref: String, reason: String },
 }
 
 /// The instruction as it is persisted: the handoff's own redactor passes
@@ -281,6 +292,54 @@ impl LiveCheckpoints {
         Ok(record)
     }
 
+    /// Settle a Pending record whose attempt was refused BEFORE it had
+    /// any effect: no candidate observed, nothing promoted, no ticket
+    /// closed. The settled record states that fact in its next action, so
+    /// the handoff a boot reads says why there is nothing to resolve.
+    ///
+    /// Only a Pending record with no candidate settles. A record that did
+    /// observe a candidate, or that already reached its effect, describes
+    /// effects somebody must account for, so the settlement refuses and the
+    /// record stays exactly as it was. Settling an already settled record
+    /// is idempotent.
+    pub fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<LiveRecord, CheckpointError> {
+        let refusal = |reason: String| CheckpointError::NotEffectless {
+            work_ref: work_ref.to_string(),
+            reason,
+        };
+        let record = self
+            .load()?
+            .ok_or_else(|| refusal("there is no record of this project".into()))?;
+        if record.checkpoint.work_ref != work_ref {
+            return Err(refusal(format!(
+                "the record describes {}",
+                record.checkpoint.work_ref
+            )));
+        }
+        match record.phase {
+            LivePhase::SettledNoEffect => return Ok(record),
+            LivePhase::Confirmed => {
+                return Err(refusal("the attempt already reached its effect".into()))
+            }
+            LivePhase::Pending => {}
+        }
+        if record.candidate.is_some() {
+            return Err(refusal(
+                "the attempt observed a candidate, so its effects are unknown".into(),
+            ));
+        }
+        let statement = if detail.trim().is_empty() {
+            NO_EFFECT_REFUSAL.to_string()
+        } else {
+            format!("{NO_EFFECT_REFUSAL}: {detail}")
+        };
+        let mut settled = record;
+        settled.checkpoint.next_action = redacted(&statement);
+        settled.phase = LivePhase::SettledNoEffect;
+        self.persist(&settled)?;
+        Ok(settled)
+    }
+
     /// Render the handoff of `record` and return its path.
     ///
     /// The handoff travels WITH the record: it is written before the
@@ -364,7 +423,9 @@ impl CheckpointRecords {
 impl AttemptRecordPort for CheckpointRecords {
     fn recover(&self) -> Result<(), AttemptRecordError> {
         match self.checkpoints.recover() {
-            Ok(Recovery::Fresh) | Ok(Recovery::NothingToRedo(_)) => Ok(()),
+            Ok(Recovery::Fresh)
+            | Ok(Recovery::NothingToRedo(_))
+            | Ok(Recovery::SettledNoEffect(_)) => Ok(()),
             Ok(Recovery::Uncertain(record)) => Err(AttemptRecordError {
                 work_ref: record.checkpoint.work_ref.clone(),
                 reason: "the previous attempt is recorded as pending: its effects are unknown, \
@@ -403,6 +464,23 @@ impl AttemptRecordPort for CheckpointRecords {
                 work_ref: goal.work_ref.clone(),
                 reason: error.to_string(),
             })?;
+        Ok(())
+    }
+
+    fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<(), AttemptRecordError> {
+        let failure =
+            |error: CheckpointError| AttemptRecordError {
+                work_ref: work_ref.to_string(),
+                reason: error.to_string(),
+            };
+        // The handoff is rewritten WITH the settled record: a boot that
+        // reads it finds "refused, no effects", never the instruction of
+        // the attempt that never ran.
+        let record = self
+            .checkpoints
+            .settle_no_effect(work_ref, detail)
+            .map_err(failure)?;
+        self.checkpoints.write_handoff(&record).map_err(failure)?;
         Ok(())
     }
 }
@@ -681,6 +759,115 @@ mod tests {
         let dir = dir("records-fresh");
         let records = CheckpointRecords::under(&dir);
         records.recover().expect("nothing to recover");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settled_refusal_replaces_the_pending_phase_and_is_visible_in_the_record() {
+        let dir = dir("settle-no-effect");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        checkpoints
+            .begin(&goal("TASK-7"), Some(1), "session-1")
+            .expect("the pending record");
+
+        let settled = checkpoints
+            .settle_no_effect("TASK-7", "the permission policy refused \"bash\"")
+            .expect("the refusal settles");
+        assert_eq!(settled.phase, LivePhase::SettledNoEffect);
+        assert_eq!(settled.candidate, None);
+
+        // The settlement is a fact of the record, not only of memory: a
+        // restart classifies it as settled, never as uncertain.
+        let raw = std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).expect("the record");
+        assert!(raw.contains("\"settled_no_effect\""), "{raw}");
+        assert!(
+            matches!(
+                LiveCheckpoints::under(&dir).recover().expect("recover"),
+                Recovery::SettledNoEffect(_)
+            ),
+            "the restart sees the settled refusal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_that_observed_a_candidate_is_never_settled_as_effectless() {
+        let dir = dir("settle-with-candidate");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        checkpoints
+            .begin(&goal("TASK-7"), Some(1), "session-1")
+            .expect("the pending record");
+        checkpoints.observe(candidate()).expect("the candidate");
+
+        // A candidate means effects somebody must account for: the
+        // settlement refuses and the record stays pending.
+        let error = checkpoints
+            .settle_no_effect("TASK-7", "the permission policy refused \"bash\"")
+            .expect_err("a record with a candidate is not effectless");
+        assert!(
+            error.to_string().contains("observed a candidate"),
+            "{error}"
+        );
+        let raw = std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).expect("the record");
+        assert!(raw.contains("\"pending\""), "{raw}");
+
+        // A confirmed effect is settled too: a refusal never rewrites it.
+        checkpoints.confirm(None).expect("the confirmation");
+        let error = checkpoints
+            .settle_no_effect("TASK-7", "the permission policy refused \"bash\"")
+            .expect_err("a confirmed record is not a refusal");
+        assert!(error.to_string().contains("already"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settling_a_record_of_another_work_is_refused() {
+        let dir = dir("settle-other-work");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        checkpoints
+            .begin(&goal("TASK-7"), Some(1), "session-1")
+            .expect("the pending record");
+
+        let error = checkpoints
+            .settle_no_effect("TASK-8", "the permission policy refused \"bash\"")
+            .expect_err("a refusal settles its own work only");
+        assert!(error.to_string().contains("TASK-7"), "{error}");
+
+        // The record of the first work is untouched: it still blocks.
+        let raw = std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).expect("the record");
+        assert!(raw.contains("\"pending\""), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_settled_refusal_opens_the_next_attempt_and_rewrites_the_handoff() {
+        let dir = dir("settle-attempt");
+        let records = CheckpointRecords::under(&dir);
+        let goal = AttemptGoal {
+            work_ref: "TASK-7".into(),
+            instruction: "do the work".into(),
+            run: 3,
+        };
+        records.begin_attempt(&goal).expect("the attempt opens");
+
+        // Until the refusal settles, the Pending record refuses.
+        let refused = records.recover();
+        assert!(refused.is_err(), "{refused:?}");
+
+        records
+            .settle_no_effect("TASK-7", "the permission policy refused \"bash\"")
+            .expect("the refusal settles");
+        records.recover().expect("a settled record opens");
+        records
+            .begin_attempt(&AttemptGoal { run: 4, ..goal })
+            .expect("the next attempt opens without an operator");
+
+        // The handoff tells the truth about what never happened.
+        let handoff = std::fs::read_to_string(dir.join(HANDOFF_FILE)).expect("the handoff");
+        assert!(
+            handoff.contains("the attempt refused; no candidate, no promotion, no closure"),
+            "{handoff}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

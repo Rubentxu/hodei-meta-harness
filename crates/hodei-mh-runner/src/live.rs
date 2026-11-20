@@ -21,7 +21,7 @@ use tracker::core::TrackerRead;
 use crate::core::{GoalRunner, RunnerError};
 use crate::ports::{
     AgentPort, Checkpointed, Closed, Closes, Objective, ObjectiveCheck, PublisherPort,
-    RequirementsPort, VerifierPort,
+    RequirementsPort, TurnEffects, VerifierPort,
 };
 
 /// The claim this runtime holds on the work it selected.
@@ -104,6 +104,14 @@ pub trait AttemptRecordPort: Send + Sync {
 
     /// Open the Pending record of this attempt, with its handoff.
     fn begin_attempt(&self, goal: &AttemptGoal) -> Result<(), AttemptRecordError>;
+
+    /// Settle the Pending record of an attempt that ended WITHOUT any
+    /// effect: no candidate was observed, nothing was promoted and no
+    /// ticket was closed. The next attempt may then open with no operator
+    /// involved. A record that does describe a candidate, or that already
+    /// reached its effect, refuses to settle: only an operator may
+    /// resolve what may have moved.
+    fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<(), AttemptRecordError>;
 }
 
 /// The record nobody keeps: for runtimes that own no durable state (the
@@ -117,6 +125,10 @@ impl AttemptRecordPort for NoAttemptRecord {
     }
 
     fn begin_attempt(&self, _goal: &AttemptGoal) -> Result<(), AttemptRecordError> {
+        Ok(())
+    }
+
+    fn settle_no_effect(&self, _work_ref: &str, _detail: &str) -> Result<(), AttemptRecordError> {
         Ok(())
     }
 }
@@ -152,6 +164,19 @@ pub enum AttemptEnd {
     /// vocabulary keeps no separate no-change state — it could only
     /// duplicate a cause that already travels with the reason.
     AgentFailed { work_ref: String, reason: String },
+    /// The policy refused the turn BEFORE it had any effect: no candidate
+    /// was observed, nothing was promoted and no ticket was closed. The
+    /// run fails like any other agent failure, and the attempt's own
+    /// Pending record settles with it, so the next Start needs no
+    /// operator.
+    RefusedNoEffect { work_ref: String, reason: String },
+    /// The attempt ended, but the durable record could not be settled:
+    /// the verdict travels with the record failure, so an operator sees
+    /// both halves and the record is never left uncertain in silence.
+    UnsettledRecord {
+        record: String,
+        end: Box<AttemptEnd>,
+    },
     /// The infrastructure failed around the attempt.
     InfraFailed { reason: String },
     /// The candidate could not be promoted.
@@ -213,6 +238,9 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
         AttemptEnd::AgentFailed { work_ref, reason } => ObjectiveOutcome::Failed {
             reason: format!("the agent could not run {work_ref}: {reason}"),
         },
+        AttemptEnd::RefusedNoEffect { work_ref, reason } => ObjectiveOutcome::Failed {
+            reason: format!("the agent refused {work_ref} before any effect: {reason}"),
+        },
         AttemptEnd::InfraFailed { reason } => ObjectiveOutcome::Failed { reason },
         AttemptEnd::PromotionFailed { work_ref, reason } => ObjectiveOutcome::Failed {
             reason: format!("the candidate of {work_ref} could not be promoted: {reason}"),
@@ -232,6 +260,37 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
                 outcome_of(*end).describe()
             ),
         },
+        // The record is the headline here: an attempt whose effects are
+        // unknown must not be re-run on the strength of a verdict that
+        // could not be written down.
+        AttemptEnd::UnsettledRecord { record, end } => ObjectiveOutcome::Failed {
+            reason: format!(
+                "the attempt record could not be settled: {record}; the attempt itself ended as: {}",
+                outcome_of(*end).describe()
+            ),
+        },
+    }
+}
+
+/// Settle the durable record of an attempt that ended without any effect.
+///
+/// Only the bare refusal settles: once a failed release wrapped it in an
+/// uncertain release, the work may still be claimed, and a record that
+/// settles over a held claim would hide that. A settlement the durable
+/// store refused travels with the refusal instead of being swallowed, so
+/// the next Start still says the record is unresolved.
+fn settle_refusal(records: &dyn AttemptRecordPort, end: AttemptEnd) -> AttemptEnd {
+    match end {
+        AttemptEnd::RefusedNoEffect { work_ref, reason } => {
+            match records.settle_no_effect(&work_ref, &reason) {
+                Ok(()) => AttemptEnd::RefusedNoEffect { work_ref, reason },
+                Err(error) => AttemptEnd::UnsettledRecord {
+                    record: error.to_string(),
+                    end: Box::new(AttemptEnd::RefusedNoEffect { work_ref, reason }),
+                },
+            }
+        }
+        other => other,
     }
 }
 
@@ -607,6 +666,7 @@ impl LiveRuntime {
         let agent = self.agent.clone();
         let verifier = self.verifier.clone();
         let publisher = self.publisher.clone();
+        let records = self.records.clone();
         ObjectiveHandle::new(async move {
             let end = if cancelled.load(Ordering::SeqCst) {
                 AttemptEnd::Cancelled {
@@ -630,6 +690,9 @@ impl LiveRuntime {
                 },
                 None => end,
             };
+            // The claim is back before the record is touched: a settled
+            // record must never describe work somebody still holds.
+            let end = settle_refusal(records.as_ref(), end);
             outcome_of(end)
         })
     }
@@ -712,9 +775,19 @@ async fn attempt(
     let candidate = match agent.execute(objective).await {
         Ok(candidate) => candidate,
         Err(error) => {
-            return AttemptEnd::AgentFailed {
-                work_ref,
-                reason: error.to_string(),
+            // The agent states what its failed turn left behind. A
+            // refusal without effects is a different fact from a failure
+            // whose effects are unknown, and only the first one may
+            // settle the durable record.
+            return match error.effects {
+                TurnEffects::RefusedNoEffect => AttemptEnd::RefusedNoEffect {
+                    work_ref,
+                    reason: error.reason,
+                },
+                TurnEffects::Unknown => AttemptEnd::AgentFailed {
+                    work_ref,
+                    reason: error.to_string(),
+                },
             };
         }
     };
@@ -2466,10 +2539,10 @@ mod tests {
     #[async_trait::async_trait]
     impl AgentPort for NoChangesAgent {
         async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError> {
-            Err(AgentError {
-                work_ref: objective.work_ref.clone(),
-                reason: "the agent produced no changes to the managed state: the staged worktree is still the base tree".into(),
-            })
+            Err(AgentError::new(
+                objective.work_ref.clone(),
+                "the agent produced no changes to the managed state: the staged worktree is still the base tree",
+            ))
         }
     }
 
@@ -2514,9 +2587,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_stop_superseded_by_a_newer_install_starts_and_cancels_nothing() {
-        // The superseded stop of a run whose attempt never installed a
-        // flag is dropped by the newer install. That is inert by proof,
-        // not by promise: the newer attempt runs untouched, and a stop
         // addressed to the older run afterwards reaches neither one.
         let agent = Arc::new(CountingAgent::default());
         let publisher = Arc::new(CountingPublisher::confirm_closing());
@@ -2565,5 +2635,275 @@ mod tests {
             claims.releases(),
             vec![("T-1".to_string(), 41), ("T-2".to_string(), 41)]
         );
+    }
+
+    /// The agent the permission policy stopped: it reports a refusal that
+    /// left NO effect behind, never a failure whose effects are unknown.
+    struct RefusalAgent;
+
+    #[async_trait::async_trait]
+    impl AgentPort for RefusalAgent {
+        async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError> {
+            Err(AgentError::refused_no_effect(
+                objective.work_ref.clone(),
+                "the permission policy refused \"bash\": the attempt ends as a refusal",
+            ))
+        }
+    }
+
+    /// The durable record an offline runtime writes to: the record of a
+    /// pending attempt blocks the next one until the runtime settles it
+    /// as a refusal without effects.
+    #[derive(Default)]
+    struct PendingRecords {
+        state: Mutex<PendingRecord>,
+    }
+
+    #[derive(Default)]
+    struct PendingRecord {
+        held: Option<String>,
+        settled: Option<String>,
+    }
+
+    impl PendingRecords {
+        /// Whether the record is still pending: opened, and never settled.
+        fn is_pending(&self) -> bool {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.held.is_some() && state.settled.is_none()
+        }
+
+        /// The refusal the record was settled with, once it was settled.
+        fn settled_with(&self) -> Option<String> {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .settled
+                .clone()
+        }
+    }
+
+    impl AttemptRecordPort for PendingRecords {
+        fn recover(&self) -> Result<(), AttemptRecordError> {
+            if self.is_pending() {
+                return Err(AttemptRecordError {
+                    work_ref: "T-1".to_string(),
+                    reason: "the previous attempt is recorded as pending".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        fn begin_attempt(&self, goal: &AttemptGoal) -> Result<(), AttemptRecordError> {
+            self.recover()?;
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .held = Some(goal.work_ref.clone());
+            Ok(())
+        }
+
+        fn settle_no_effect(
+            &self,
+            work_ref: &str,
+            detail: &str,
+        ) -> Result<(), AttemptRecordError> {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.held.as_deref() != Some(work_ref) {
+                return Err(AttemptRecordError {
+                    work_ref: work_ref.to_string(),
+                    reason: "there is no pending record of this work".to_string(),
+                });
+            }
+            state.settled = Some(detail.to_string());
+            Ok(())
+        }
+    }
+
+    /// The durable record that refuses to settle: the settlement failure
+    /// must reach the verdict instead of being swallowed.
+    struct UnsettledRecords;
+
+    impl AttemptRecordPort for UnsettledRecords {
+        fn recover(&self) -> Result<(), AttemptRecordError> {
+            Ok(())
+        }
+
+        fn begin_attempt(&self, _goal: &AttemptGoal) -> Result<(), AttemptRecordError> {
+            Ok(())
+        }
+
+        fn settle_no_effect(
+            &self,
+            work_ref: &str,
+            _detail: &str,
+        ) -> Result<(), AttemptRecordError> {
+            Err(AttemptRecordError {
+                work_ref: work_ref.to_string(),
+                reason: "the record store is unreachable".to_string(),
+            })
+        }
+    }
+
+    fn refused_runtime(
+        agent: Arc<dyn AgentPort>,
+        claims: Arc<FakeClaims>,
+        publisher: Arc<CountingPublisher>,
+        records: Arc<dyn AttemptRecordPort>,
+    ) -> LiveRuntime {
+        LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item(
+                "T-1",
+                WorkStatus::Open,
+            )])),
+            Arc::new(FixedRequirements),
+            agent,
+            Arc::new(HoldingVerifier),
+            publisher,
+            claims,
+        )
+        .with_records(records)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_without_effects_settles_the_record_and_the_next_start_is_accepted() {
+        let records = Arc::new(PendingRecords::default());
+        let claims = Arc::new(FakeClaims::granting(9));
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let runtime = refused_runtime(
+            Arc::new(RefusalAgent),
+            claims.clone(),
+            publisher.clone(),
+            records.clone(),
+        );
+
+        let outcome = outcome_of_start(&runtime, None).await;
+        match &outcome {
+            ObjectiveOutcome::Failed { reason } => {
+                assert!(reason.contains("refused"), "the refusal is the verdict: {reason}");
+                assert!(
+                    reason.contains("before any effect"),
+                    "the absence of effects is part of the verdict: {reason}"
+                );
+            }
+            other => panic!("a refusal must fail the run, got {other:?}"),
+        }
+        assert_eq!(
+            publisher.calls(),
+            0,
+            "a refusal never promotes anything"
+        );
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 9)],
+            "the claim goes back with the refusal"
+        );
+        assert!(
+            records
+                .settled_with()
+                .expect("the refusal settles its own record")
+                .contains("refused"),
+            "the settlement names the refusal it settles"
+        );
+
+        // The next Start sees no pending record: it runs to its
+        // publication instead of being refused by the recovery.
+        let next = refused_runtime(
+            Arc::new(CountingAgent::default()),
+            claims.clone(),
+            publisher.clone(),
+            records.clone(),
+        );
+        let outcome = outcome_of_start(&next, None).await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { .. }),
+            "the settled record lets the next attempt run: {outcome:?}"
+        );
+        assert_eq!(publisher.calls(), 1, "the next attempt publishes its work");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_whose_claim_release_failed_never_settles_the_record() {
+        let records = Arc::new(PendingRecords::default());
+        let runtime = refused_runtime(
+            Arc::new(RefusalAgent),
+            Arc::new(FakeClaims::granting_but_refusing_release(4)),
+            Arc::new(CountingPublisher::confirm_closing()),
+            records.clone(),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match &outcome {
+            ObjectiveOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("the claim release did not complete"),
+                    "the release failure is the headline: {reason}"
+                );
+                assert!(
+                    reason.contains("refused"),
+                    "the refusal travels with it: {reason}"
+                );
+            }
+            other => panic!("a refused release must fail the run, got {other:?}"),
+        }
+        assert!(
+            records.settled_with().is_none(),
+            "work somebody still holds is never settled as effectless"
+        );
+        assert!(records.is_pending(), "the record stays pending");
+        assert!(
+            records.recover().is_err(),
+            "the pending record still refuses the next attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_whose_effects_are_unknown_never_settles_the_record() {
+        // The no-change turn ends as an agent failure whose effects are
+        // unknown: exactly the uncertainty an operator must resolve.
+        let records = Arc::new(PendingRecords::default());
+        let runtime = refused_runtime(
+            Arc::new(NoChangesAgent),
+            Arc::new(FakeClaims::granting(3)),
+            Arc::new(CountingPublisher::confirm_closing()),
+            records.clone(),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Failed { .. }),
+            "an unknown effect fails the run: {outcome:?}"
+        );
+        assert!(
+            records.settled_with().is_none(),
+            "an attempt whose effects are unknown is never settled"
+        );
+        assert!(records.is_pending(), "the record stays pending");
+    }
+
+    #[tokio::test]
+    async fn a_settlement_the_record_refused_is_reported_not_swallowed() {
+        let runtime = refused_runtime(
+            Arc::new(RefusalAgent),
+            Arc::new(FakeClaims::granting(2)),
+            Arc::new(CountingPublisher::confirm_closing()),
+            Arc::new(UnsettledRecords),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match &outcome {
+            ObjectiveOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("the attempt record could not be settled"),
+                    "the settlement failure is the headline: {reason}"
+                );
+                assert!(
+                    reason.contains("the record store is unreachable"),
+                    "the store's reason travels: {reason}"
+                );
+                assert!(
+                    reason.contains("refused"),
+                    "the refusal itself is never lost: {reason}"
+                );
+            }
+            other => panic!("an unsettled record must fail the run, got {other:?}"),
+        }
     }
 }
