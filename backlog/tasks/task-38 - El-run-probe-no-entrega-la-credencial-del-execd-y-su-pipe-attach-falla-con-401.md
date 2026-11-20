@@ -1,11 +1,11 @@
 ---
 id: TASK-38
 title: El run-probe no entrega la credencial del execd y su pipe-attach falla con 401
-status: In Progress
+status: Done
 assignee:
   - '@rubentxu'
 created_date: '2026-11-18T22:13:00Z'
-updated_date: '2026-11-19T22:56:00Z'
+updated_date: '2026-11-20T07:51:00Z'
 labels:
   - descubrimiento
   - bug
@@ -23,6 +23,18 @@ Descubierto al medir TASK-26: la sonda 'hodei-mh run-probe' sigue el camino prev
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 La sonda run-probe entrega la credencial del execd que el contrato del endpoint devuelve y su check pipe-attach pasa contra un execd real.
-- [ ] #2 El fallo aparece como FALLO de la sonda y no como un check omitido.
+- [x] #1 La sonda run-probe entrega la credencial del execd que el contrato del endpoint devuelve y su check pipe-attach pasa contra un execd real.
+- [x] #2 El fallo aparece como FALLO de la sonda y no como un check omitido.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+La sonda run-probe adjunta el pipe con las opciones del contrato del endpoint (ExecdEndpoint::attach_options), de modo que la credencial EXECD_ACCESS_TOKEN del sandbox viaja en la cabecera del handshake WebSocket y no en la URL. La credencial y el attach se informan como checks propios; una negativa del execd es un check FALLIDO y una sonda sin checks nunca es verde. Evidencia: corrida real de 'hodei-mh run-probe' contra el lifecycle-server vivo y la imagen opensandbox/code-interpreter:v1.1.0, con execd-credential-delivered y pipe-attach en passed=true y all_passed=true (exit 0, 11.85 s); pruebas offline con execd falso que responde 401 (sin tokens ni sleeps) para la negativa y el caso sin credencial; scripts/fast-check.sh crates/hodei-mh/src/run_probe.rs en PASS y workspace gate de CI en PASS. PR #43 fusionado en main (e9829ed, mensaje reescrito sin el trailer que la política git-control prohíbe).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+run-probe entrega la credencial del execd por cabecera y verifica el attach contra un execd real; 2/2 AC comprobados, gate local y workspace en verde, PR #43 fusionado.
+<!-- SECTION:FINAL_SUMMARY:END -->

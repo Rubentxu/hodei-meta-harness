@@ -1,9 +1,10 @@
 ---
 id: TASK-36
 title: '[MH-A10] Reutilizar cachés de compilación sin compartir estado de agentes'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
+updated_date: '2026-11-20T08:01:00Z'
 labels:
   - audit-v0.2
   - performance
