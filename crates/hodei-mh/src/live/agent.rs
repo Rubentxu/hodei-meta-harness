@@ -716,10 +716,7 @@ pub async fn drive_agent(
                             // The denial is a fact worth a log line of its
                             // own: emit it structured, then end the turn.
                             eprintln!("{event}");
-                            let tool = event["tool"]
-                                .as_str()
-                                .unwrap_or("unknown tool")
-                                .to_string();
+                            let tool = event["tool"].as_str().unwrap_or("unknown tool").to_string();
                             turn.summary = format!(
                                 "the permission policy refused {tool:?}: the attempt ends as a refusal"
                             );
@@ -1034,8 +1031,10 @@ mod tests {
 
     #[test]
     fn an_ordinary_read_is_granted_by_the_policy_under_allow_once() {
-        let (answer, detail, refusal) =
-            answered(&permission("read", "Read", allow_once()), PermissionMode::AllowOnce);
+        let (answer, detail, refusal) = answered(
+            &permission("read", "Read", allow_once()),
+            PermissionMode::AllowOnce,
+        );
         assert_eq!(answer["outcome"]["optionId"], json!("a"));
         assert!(detail.contains("policy"), "{detail}");
         assert!(refusal.is_none(), "a grant refuses nothing");
@@ -1043,8 +1042,10 @@ mod tests {
 
     #[test]
     fn a_write_is_routed_to_the_sandbox_and_still_answers_allow_once() {
-        let (answer, detail, refusal) =
-            answered(&permission("edit", "Edit", allow_once()), PermissionMode::AllowOnce);
+        let (answer, detail, refusal) = answered(
+            &permission("edit", "Edit", allow_once()),
+            PermissionMode::AllowOnce,
+        );
         assert_eq!(answer["outcome"]["optionId"], json!("a"));
         assert!(detail.contains("sandbox"), "{detail}");
         assert!(refusal.is_none(), "a routed grant refuses nothing");
@@ -1053,8 +1054,10 @@ mod tests {
     #[test]
     fn a_reviewed_or_unknown_tool_is_refused_with_its_reason() {
         for (kind, title) in [("fetch", "WebFetch"), ("other", "mystery")] {
-            let (answer, detail, refusal) =
-                answered(&permission(kind, title, allow_once()), PermissionMode::AllowOnce);
+            let (answer, detail, refusal) = answered(
+                &permission(kind, title, allow_once()),
+                PermissionMode::AllowOnce,
+            );
             assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
             assert!(detail.starts_with("permission refused:"), "{detail}");
             let event = refusal.expect("a policy denial is a refusal event");
@@ -1065,8 +1068,10 @@ mod tests {
     #[test]
     fn the_deny_mode_refuses_every_kind_including_reads() {
         for kind in ["read", "edit", "execute", "fetch"] {
-            let (answer, detail, refusal) =
-                answered(&permission(kind, "tool", allow_once()), PermissionMode::Deny);
+            let (answer, detail, refusal) = answered(
+                &permission(kind, "tool", allow_once()),
+                PermissionMode::Deny,
+            );
             assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
             assert!(detail.contains("refused"), "{detail}");
             let event = refusal.expect("the deny mode is a refusal event");
@@ -1077,8 +1082,10 @@ mod tests {
     #[test]
     fn a_grant_without_an_allow_once_option_is_an_explicit_refusal() {
         let options = json!([{"optionId": "x", "name": "Other", "kind": "allow_always"}]);
-        let (answer, detail, refusal) =
-            answered(&permission("read", "Read", options), PermissionMode::AllowOnce);
+        let (answer, detail, refusal) = answered(
+            &permission("read", "Read", options),
+            PermissionMode::AllowOnce,
+        );
         assert_eq!(answer["outcome"]["outcome"], json!("cancelled"));
         assert!(detail.contains("no allow_once option"), "{detail}");
         let event = refusal.expect("no grant to select is a refusal event");
@@ -1325,6 +1332,19 @@ mod tests {
             pipe.script.len(),
             2,
             "the turn returned AT the refusal: the rest of the script was never waited for"
+        );
+        // The record is complete on both exits: the refusal carries the
+        // interaction it ended on, not only the structured event.
+        assert_eq!(
+            turn.interactions.len(),
+            1,
+            "the denied interaction is recorded: {:?}",
+            turn.interactions
+        );
+        assert!(
+            turn.interactions[0].starts_with("permission refused:"),
+            "the record says the interaction was refused: {}",
+            turn.interactions[0]
         );
     }
 
