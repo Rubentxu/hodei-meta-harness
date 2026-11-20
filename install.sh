@@ -135,6 +135,7 @@ asset=$(awk -v os="$os" -v arch="$arch" \
     "the release SHA256SUMS has no ${os}-${arch} bundle line — this platform is not published for ${display}"
 # The bundle name carries the concrete version: report it once known.
 display=$(printf '%s' "$asset" | sed 's/^hodei-mh-//; s/-[a-z]*-.*$//')
+printf 'resolved: hodei-mh %s\n' "$display"
 bundle_want=$(recorded_digest "$work/SHA256SUMS" "$asset")
 
 # 2. The bundle, verified against the release checksums. The install
