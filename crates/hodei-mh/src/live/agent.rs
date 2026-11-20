@@ -295,17 +295,20 @@ impl AcpAgent {
             .await;
         if !turn.completed {
             let interactions = turn.interactions.join("; ");
+            let interactions_part = if interactions.is_empty() {
+                String::new()
+            } else {
+                format!("; interactions: {interactions}")
+            };
+            let detail = match &turn.refusal {
+                // The refusal travels with the failure: whoever reads the
+                // record sees the structured event, not only its prose.
+                Some(event) => format!("{}: {event}{interactions_part}", turn.summary),
+                None => format!("{}{interactions_part}", turn.summary),
+            };
             return Err(Self::failure(
                 work_ref,
-                format!(
-                    "the agent did not finish its turn: {}{}",
-                    turn.summary,
-                    if interactions.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; interactions: {interactions}")
-                    }
-                ),
+                format!("the agent did not finish its turn: {detail}"),
             ));
         }
         // The harness authors the candidate commit: whatever the agent
@@ -584,6 +587,10 @@ pub struct AcpTurn {
     /// How the client answered the interactions the agent raised. Every
     /// decision is recorded with its reason, so a refusal is never silent.
     pub interactions: Vec<String>,
+    /// The structured event of an interaction the POLICY refused, when
+    /// the turn ended on that refusal. A denial is a verdict, not a
+    /// stall: the record says which tool, which rule, and what stopped.
+    pub refusal: Option<Value>,
 }
 
 impl AcpTurn {
@@ -603,6 +610,7 @@ impl AcpTurn {
             completed: stop_reason == END_TURN,
             summary: format!("{stop_reason}, text_len={text_len}"),
             interactions: Vec::new(),
+            refusal: None,
         }
     }
 }
@@ -644,6 +652,10 @@ fn readable_tail(text: &str, limit: usize) -> String {
 /// Drive one ACP conversation: initialize, open a session, send the
 /// prompt, answer the permission requests by protocol and wait for the
 /// end of the turn.
+///
+/// A permission the POLICY refuses ends the conversation AT ONCE with a
+/// refusal: the agent cannot do the work the policy just denied, and
+/// waiting out the timeout would hide that verdict behind a "timeout".
 pub async fn drive_agent(
     pipe: &mut dyn AcpPipe,
     instruction: &str,
@@ -673,6 +685,7 @@ pub async fn drive_agent(
         completed: false,
         summary: String::new(),
         interactions: Vec::new(),
+        refusal: None,
     };
     while Instant::now() < deadline {
         let Some(event) = tokio::time::timeout(Duration::from_secs(10), pipe.next_event())
@@ -685,9 +698,23 @@ pub async fn drive_agent(
         match event {
             ServerEvent::Stdout(bytes) => {
                 for message in assembler.push(&bytes).unwrap_or_default() {
-                    if let Some((response, detail)) = interaction_answer(&message, permission) {
+                    if let Some((response, detail, refusal)) =
+                        interaction_answer(&message, permission)
+                    {
                         interactions.push(detail);
                         let _ = pipe.send_stdin(response.as_bytes()).await;
+                        if let Some(event) = refusal {
+                            // The denial is a fact worth a log line of its
+                            // own: emit it structured, then end the turn.
+                            eprintln!("{event}");
+                            let tool = event["tool"].as_str().unwrap_or("unknown tool");
+                            turn.interactions = interactions;
+                            turn.refusal = Some(event);
+                            turn.summary = format!(
+                                "the permission policy refused {tool:?}: the attempt ends as a refusal"
+                            );
+                            return turn;
+                        }
                     }
                     if let Some(chunk) = message["params"]["update"]["content"]["text"].as_str()
                         && agent_text.len() < 3000
@@ -806,23 +833,31 @@ fn grant_label(source: Option<&GrantSource>) -> &'static str {
     }
 }
 
-/// The encoded answer an interaction message needs, with its record.
+/// The encoded answer an interaction message needs, with its record and
+/// the structured refusal event when the interaction was denied.
 ///
 /// Only REQUESTS are answered: a response or a notification is not an
 /// interaction. A request this client does not implement is answered with
 /// an explicit error, so the agent never waits for a reply that would
 /// never come.
-pub fn interaction_answer(message: &Value, permission: PermissionMode) -> Option<(String, String)> {
+pub fn interaction_answer(
+    message: &Value,
+    permission: PermissionMode,
+) -> Option<(String, String, Option<Value>)> {
     let method = message.get("method").and_then(Value::as_str)?;
     let id = message.get("id").cloned()?;
     if method == "session/request_permission" {
-        let (answer, detail) = permission_answer(message, permission);
-        return Some((opensandbox::acp::encode_response(id, answer), detail));
+        let (answer, detail, refusal) = permission_answer(message, permission);
+        return Some((
+            opensandbox::acp::encode_response(id, answer),
+            detail,
+            refusal,
+        ));
     }
     let reason = format!(
         "{method} is not a supported interaction: this client answers permission requests only"
     );
-    Some((encode_error(id, METHOD_NOT_FOUND, &reason), reason))
+    Some((encode_error(id, METHOD_NOT_FOUND, &reason), reason, None))
 }
 
 /// The option the agent offers for an `allow_once` answer.
@@ -834,12 +869,16 @@ fn allow_once_option(message: &Value) -> Option<&str> {
         .and_then(|option| option["optionId"].as_str())
 }
 
-/// The ACP answer to a permission request and how it was decided.
+/// The ACP answer to a permission request, how it was decided, and the
+/// structured refusal event when the POLICY denied it (`None` otherwise).
 ///
 /// The decision comes from the typed interaction policy, never from the
 /// handoff of another session; a request the policy does not cover is
 /// refused with its reason instead of being answered on trust.
-pub fn permission_answer(message: &Value, permission: PermissionMode) -> (Value, String) {
+pub fn permission_answer(
+    message: &Value,
+    permission: PermissionMode,
+) -> (Value, String, Option<Value>) {
     let request = permission_request(message);
     let resolution = resolve(&policy_for(permission), &request);
     let granted = match &resolution {
@@ -853,17 +892,39 @@ pub fn permission_answer(message: &Value, permission: PermissionMode) -> (Value,
             Some(option) => (
                 json!({"outcome": {"outcome": "selected", "optionId": option}}),
                 format!("permission {detail}"),
+                None,
             ),
             None => (
                 json!({"outcome": {"outcome": "cancelled"}}),
                 format!("permission refused: the request offers no allow_once option ({detail})"),
+                Some(permission_refusal_event(message, permission)),
             ),
         },
         Err(reason) => (
             json!({"outcome": {"outcome": "cancelled"}}),
             format!("permission refused: {reason}"),
+            Some(permission_refusal_event(message, permission)),
         ),
     }
+}
+
+/// The structured event of a denied interaction: the tool that was asked
+/// for, the rule that refused it, and the effect that stops. A consumer
+/// must be able to tell "the policy refused" from "the model was slow".
+fn permission_refusal_event(message: &Value, permission: PermissionMode) -> Value {
+    let tool = message["params"]["toolCall"]["title"]
+        .as_str()
+        .or_else(|| message["params"]["toolCall"]["kind"].as_str())
+        .unwrap_or("unknown tool");
+    json!({
+        "event": "agent.permission_refused",
+        "tool": tool,
+        "policy": match permission {
+            PermissionMode::Deny => "deny",
+            PermissionMode::AllowOnce => "allow_once",
+        },
+        "effect": "the attempt ends as a refusal before the agent can continue",
+    })
 }
 
 #[cfg(test)]
@@ -948,59 +1009,67 @@ mod tests {
         ])
     }
 
+    /// The decision the client's interaction entry point makes: the
+    /// outcome as it goes on the wire, the interaction record, and the
+    /// structured refusal event when the policy denied the request.
+    fn answered(message: &Value, mode: PermissionMode) -> (Value, String, Option<Value>) {
+        let (response, detail, refusal) =
+            interaction_answer(message, mode).expect("a request is answered");
+        let envelope: Value = serde_json::from_str(&response).expect("an encoded response");
+        (envelope["result"].clone(), detail, refusal)
+    }
+
     #[test]
     fn an_ordinary_read_is_granted_by_the_policy_under_allow_once() {
-        let (answer, detail) = permission_answer(
-            &permission("read", "Read", allow_once()),
-            PermissionMode::AllowOnce,
-        );
+        let (answer, detail, refusal) =
+            answered(&permission("read", "Read", allow_once()), PermissionMode::AllowOnce);
         assert_eq!(answer["outcome"]["optionId"], json!("a"));
         assert!(detail.contains("policy"), "{detail}");
+        assert!(refusal.is_none(), "a grant refuses nothing");
     }
 
     #[test]
     fn a_write_is_routed_to_the_sandbox_and_still_answers_allow_once() {
-        let (answer, detail) = permission_answer(
-            &permission("edit", "Edit", allow_once()),
-            PermissionMode::AllowOnce,
-        );
+        let (answer, detail, refusal) =
+            answered(&permission("edit", "Edit", allow_once()), PermissionMode::AllowOnce);
         assert_eq!(answer["outcome"]["optionId"], json!("a"));
         assert!(detail.contains("sandbox"), "{detail}");
+        assert!(refusal.is_none(), "a routed grant refuses nothing");
     }
 
     #[test]
     fn a_reviewed_or_unknown_tool_is_refused_with_its_reason() {
         for (kind, title) in [("fetch", "WebFetch"), ("other", "mystery")] {
-            let (answer, detail) = permission_answer(
-                &permission(kind, title, allow_once()),
-                PermissionMode::AllowOnce,
-            );
+            let (answer, detail, refusal) =
+                answered(&permission(kind, title, allow_once()), PermissionMode::AllowOnce);
             assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
             assert!(detail.starts_with("permission refused:"), "{detail}");
+            let event = refusal.expect("a policy denial is a refusal event");
+            assert_eq!(event["event"], json!("agent.permission_refused"));
         }
     }
 
     #[test]
     fn the_deny_mode_refuses_every_kind_including_reads() {
         for kind in ["read", "edit", "execute", "fetch"] {
-            let (answer, detail) = permission_answer(
-                &permission(kind, "tool", allow_once()),
-                PermissionMode::Deny,
-            );
+            let (answer, detail, refusal) =
+                answered(&permission(kind, "tool", allow_once()), PermissionMode::Deny);
             assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
             assert!(detail.contains("refused"), "{detail}");
+            let event = refusal.expect("the deny mode is a refusal event");
+            assert_eq!(event["event"], json!("agent.permission_refused"));
         }
     }
 
     #[test]
     fn a_grant_without_an_allow_once_option_is_an_explicit_refusal() {
         let options = json!([{"optionId": "x", "name": "Other", "kind": "allow_always"}]);
-        let (answer, detail) = permission_answer(
-            &permission("read", "Read", options),
-            PermissionMode::AllowOnce,
-        );
+        let (answer, detail, refusal) =
+            answered(&permission("read", "Read", options), PermissionMode::AllowOnce);
         assert_eq!(answer["outcome"]["outcome"], json!("cancelled"));
         assert!(detail.contains("no allow_once option"), "{detail}");
+        let event = refusal.expect("no grant to select is a refusal event");
+        assert_eq!(event["event"], json!("agent.permission_refused"));
     }
 
     #[test]
@@ -1011,12 +1080,16 @@ mod tests {
             "method": "session/request_form",
             "params": {},
         });
-        let (response, detail) =
+        let (response, detail, refusal) =
             interaction_answer(&request, PermissionMode::AllowOnce).expect("an answer");
         let value: Value = serde_json::from_str(&response).expect("encoded");
         assert_eq!(value["id"], json!(8));
         assert_eq!(value["error"]["code"], json!(METHOD_NOT_FOUND));
         assert!(detail.contains("not a supported interaction"), "{detail}");
+        assert!(
+            refusal.is_none(),
+            "an unsupported interaction stalls nothing: it is answered with an error"
+        );
         // Notifications and responses are not interactions.
         assert!(
             interaction_answer(
@@ -1039,36 +1112,40 @@ mod tests {
         // The decision takes the request and the CLI mode only, so a grant
         // taken in one session cannot be inherited by the next one.
         let message = permission("read", "Read", allow_once());
-        let (allowed, granted) = permission_answer(&message, PermissionMode::AllowOnce);
+        let (allowed, granted, _) = permission_answer(&message, PermissionMode::AllowOnce);
         assert_eq!(allowed["outcome"]["optionId"], json!("a"));
-        let (refused, denial) = permission_answer(&message, PermissionMode::Deny);
+        let (refused, denial, _) = permission_answer(&message, PermissionMode::Deny);
         assert_eq!(refused["outcome"]["outcome"], json!("cancelled"));
         assert_ne!(
             granted, denial,
             "the deny mode re-decides, it does not inherit"
         );
         // And the same request decides the same way with no history.
-        let (_, again) = permission_answer(&message, PermissionMode::AllowOnce);
+        let (_, again, _) = permission_answer(&message, PermissionMode::AllowOnce);
         assert_eq!(granted, again);
     }
 
     #[test]
-    fn only_an_end_turn_completes_the_turn() {
-        let ended = AcpTurn::of_prompt_result(&json!({"stopReason": "end_turn"}), 42);
-        assert!(ended.completed);
-        assert_eq!(ended.summary, "end_turn, text_len=42");
+    fn a_denied_permission_is_answered_with_a_cancellation_and_a_refusal_event() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {"title": "write file", "kind": "edit"},
+                "options": [{"kind": "allow_once", "optionId": "a"}]
+            }
+        });
+        let (answer, _detail, refusal) = answered(&message, PermissionMode::Deny);
+        assert_eq!(answer, json!({"outcome": {"outcome": "cancelled"}}));
+        let event = refusal.expect("the denial is recorded as a refusal event");
+        assert_eq!(event["event"], json!("agent.permission_refused"));
+        assert_eq!(event["tool"], json!("write file"));
+        assert_eq!(event["policy"], json!("deny"));
 
-        // A refusal (what `--permission deny` produces) or a cancellation
-        // answers the prompt, but the work was not done.
-        for reason in ["refusal", "cancelled"] {
-            let turn = AcpTurn::of_prompt_result(&json!({"stopReason": reason}), 42);
-            assert!(!turn.completed, "{reason} is not a completed turn");
-            assert!(
-                turn.summary.contains(reason),
-                "the actual stop reason is kept: {}",
-                turn.summary
-            );
-        }
+        let (answer, _detail, refusal) = answered(&message, PermissionMode::AllowOnce);
+        assert_eq!(answer["outcome"]["optionId"], json!("a"));
+        assert!(refusal.is_none(), "an allowed permission refuses nothing");
     }
 
     #[test]
@@ -1177,6 +1254,79 @@ mod tests {
             !turn.summary.contains(&mirrored),
             "the tail is not printed reversed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_denied_permission_ends_the_turn_as_a_refusal_without_waiting() {
+        let mut pipe = scripted(
+            hello_initialize()
+                .into_iter()
+                .chain([
+                    stdout(
+                        json!({"jsonrpc": "2.0", "id": 5, "method": "session/request_permission",
+                        "params": {
+                            "toolCall": {"title": "run: git push", "kind": "execute"},
+                            "options": [{"kind": "allow_once", "optionId": "a"}]}}),
+                    ),
+                    stdout(json!({"params": {"update": {"content": {"text": "still going"}}}})),
+                    ServerEvent::Exit { exit_code: None },
+                ])
+                .collect(),
+        );
+        let turn = drive_agent(
+            &mut pipe,
+            "do it",
+            WORKTREE,
+            Duration::from_secs(60),
+            PermissionMode::Deny,
+        )
+        .await;
+        assert!(!turn.completed, "a refusal is not a completed turn");
+        let event = turn.refusal.expect("the refusal is a structured event");
+        assert_eq!(event["event"], json!("agent.permission_refused"));
+        assert_eq!(event["tool"], json!("run: git push"));
+        assert_eq!(event["policy"], json!("deny"));
+        assert!(
+            turn.summary.contains("permission policy refused")
+                && turn.summary.contains("run: git push"),
+            "the outcome text says the policy refused: {}",
+            turn.summary
+        );
+        assert!(
+            !turn.summary.contains("timeout"),
+            "a refusal is never reported as a timeout: {}",
+            turn.summary
+        );
+        let sent = pipe.sent.lock().expect("the fake records stdin");
+        assert!(
+            sent.iter()
+                .any(|written| written.contains("\"outcome\":\"cancelled\"")),
+            "the wire answer stays the protocol cancellation: {sent:?}"
+        );
+        assert_eq!(
+            pipe.script.len(),
+            2,
+            "the turn returned AT the refusal: the rest of the script was never waited for"
+        );
+    }
+
+    #[test]
+    fn only_an_end_turn_completes_the_turn() {
+        let ended = AcpTurn::of_prompt_result(&json!({"stopReason": "end_turn"}), 42);
+        assert!(ended.completed);
+        assert_eq!(ended.summary, "end_turn, text_len=42");
+
+        // A refusal (what `--permission deny` produces) or a cancellation
+        // answers the prompt, but the work was not done.
+        for reason in ["refusal", "cancelled"] {
+            let turn = AcpTurn::of_prompt_result(&json!({"stopReason": reason}), 42);
+            assert!(!turn.completed, "{reason} is not a completed turn");
+            assert!(
+                turn.summary.contains(reason),
+                "the actual stop reason is kept: {}",
+                turn.summary
+            );
+        }
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
