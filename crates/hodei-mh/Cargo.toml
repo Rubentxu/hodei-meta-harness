@@ -28,6 +28,9 @@ profiles = { path = "../hodei-mh-profiles", package = "hodei-mh-profiles" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }

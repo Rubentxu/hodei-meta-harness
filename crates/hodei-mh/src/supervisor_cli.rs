@@ -3,6 +3,7 @@
 //! read-only, its disconnect does not alter the objective) and the Ratatui
 //! TUI. ALL of them are clients of the SAME socket contract.
 
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,18 +39,72 @@ fn opt_flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Write one line of client output.
+///
+/// A reader that closed the pipe (`sup-events | head`) ends the command
+/// the way a shell pipeline ends, not with a panic; any other write
+/// failure is reported and fails the command.
+fn say(line: &str) -> Result<(), i32> {
+    let mut stdout = std::io::stdout().lock();
+    write_line(&mut stdout, line)
+}
+
+fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<(), i32> {
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Err(0),
+        Err(error) => {
+            eprintln!("cannot write the supervisor output: {error}");
+            Err(1)
+        }
+    }
+}
+
 /// `hodei-mh supervisor`: THE controller. One per machine/project; serves
 /// the socket until interrupted. Every event is logged to stdout WITH its
 /// provenance and AFTER credential redaction (AC-4).
 ///
 /// `--rehearsal` wires the rehearsal runtime: a deterministic run with no
-/// external effects, which says so in every snapshot. Without it the
-/// controller has NO runtime and refuses to start, because a run nobody
-/// can execute is not a run.
+/// external effects, which says so in every snapshot. `--live` wires the
+/// live runtime: the real tracker, the real sandboxes and the real managed
+/// branch. The two are exclusive, and a live boot that cannot execute
+/// refuses with its reason instead of starting a controller that would
+/// accept a run it can never carry out. Without either, the controller has
+/// NO runtime and refuses to start, because a run nobody can execute is
+/// not a run.
 pub async fn run_supervisor(args: &[String]) -> i32 {
     let socket = flag(args, "--socket", &default_socket());
     let project = flag(args, "--project", "hodei-mh");
     let rehearsal = args.iter().any(|a| a == "--rehearsal");
+    let live = args.iter().any(|a| a == "--live");
+    if live && rehearsal {
+        eprintln!(
+            "refusing to start: --live and --rehearsal are exclusive (a rehearsal measures nothing; a live run executes)"
+        );
+        return 1;
+    }
+    // The runtime is wired BEFORE the socket is bound: a controller whose
+    // configuration cannot execute must not own the identity of a project.
+    let runtime: Option<Arc<dyn ObjectiveRuntime>> = if live {
+        let config = match crate::live::config_from_args(args, &project) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("refusing the live supervisor: {error}");
+                return 1;
+            }
+        };
+        match crate::live::real_ports(&config).await {
+            Ok(runtime) => Some(Arc::new(runtime)),
+            Err(error) => {
+                eprintln!("refusing the live supervisor: {error}");
+                return 1;
+            }
+        }
+    } else if rehearsal {
+        Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
+    } else {
+        None
+    };
     // The identity of this controller is the project it serves, and the
     // path it serves: both are taken as EXCLUSIVE locks, so a second
     // controller can never assume either of them.
@@ -64,11 +119,6 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // it when the controller stops, and only if it is still the same file.
     // The CLI does not unlink it: that would be the same fact in two
     // places, and the two could disagree.
-    let runtime: Option<Arc<dyn ObjectiveRuntime>> = if rehearsal {
-        Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
-    } else {
-        None
-    };
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new({
         // The runtime is NOT declared here: the server that serves it
         // writes it into the core, so the runtime the snapshot names and
@@ -92,13 +142,13 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
         );
         core
     }));
-    println!(
+    let _ = say(&format!(
         "supervisor listening on {socket}; logs identify provenance, credentials are redacted; runtime: {}",
         runtime
             .as_ref()
             .map(|runtime| runtime.identity().label())
             .unwrap_or_else(|| "(none wired — a Start is refused)".to_string())
-    );
+    ));
     let log_core = core.clone();
     // The log watcher prints every event as it is recorded — provenance
     // included, credentials already redacted by the engine. Flush after
@@ -136,7 +186,6 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
             if pending.is_empty() {
                 continue;
             }
-            use std::io::Write as _;
             let mut out = std::io::stdout().lock();
             for line in &pending {
                 let _ = out.write_all(line.as_bytes());
@@ -197,7 +246,9 @@ pub async fn run_status(args: &[String]) -> i32 {
     match client.snapshot().await {
         Ok(snapshot) => {
             for line in render_snapshot(&snapshot) {
-                println!("{line}");
+                if let Err(code) = say(&line) {
+                    return code;
+                }
             }
             0
         }
@@ -250,7 +301,7 @@ pub async fn run_action(args: &[String]) -> i32 {
     };
     match client.action(action).await {
         Ok(outcome) => {
-            println!(
+            if let Err(code) = say(&format!(
                 "{}: {} ({})",
                 if outcome.applied {
                     "applied"
@@ -263,7 +314,9 @@ pub async fn run_action(args: &[String]) -> i32 {
                 } else {
                     "this was NOT executed"
                 }
-            );
+            )) {
+                return code;
+            }
             if outcome.applied { 0 } else { 1 }
         }
         Err(e) => {
@@ -319,14 +372,20 @@ pub async fn run_events(args: &[String]) -> i32 {
             if let Some(oldest) = oldest_lost {
                 // The history the client asked for had a hole: it is said
                 // out loud, not papered over.
-                println!("history lost: the events before #{oldest} are no longer retained");
+                if let Err(code) = say(&format!(
+                    "history lost: the events before #{oldest} are no longer retained"
+                )) {
+                    return code;
+                }
             }
             for event in &events {
-                println!(
+                if let Err(code) = say(&format!(
                     "[{}] {}",
                     provenance_label(&event.provenance),
                     render_event(event)
-                );
+                )) {
+                    return code;
+                }
             }
             0
         }
@@ -347,9 +406,11 @@ pub async fn run_attach_terminal(args: &[String]) -> i32 {
     // deadline turns a dead supervisor into an explicit failure.
     let deadline_secs: u64 = flag(args, "--deadline-seconds", "60").parse().unwrap_or(60);
     let started = std::time::Instant::now();
-    println!(
-        "attached terminal viewer: read-only event tail; leaving does not affect the objective"
-    );
+    if let Err(code) =
+        say("attached terminal viewer: read-only event tail; leaving does not affect the objective")
+    {
+        return code;
+    }
     let mut seen: u64 = 1;
     let mut delivered: u64 = 0;
     loop {
@@ -359,25 +420,37 @@ pub async fn run_attach_terminal(args: &[String]) -> i32 {
                 drop(client);
                 match result {
                     Ok(page) => {
-                        if page.history_lost {
-                            println!(
+                        if page.history_lost
+                            && let Err(code) = say(&format!(
                                 "[viewer] history lost: the events before #{} are no longer retained",
                                 page.oldest_seq
-                            );
+                            ))
+                        {
+                            return code;
                         }
                         for event in page.events {
-                            println!("[viewer] {}", render_event(&event));
+                            if let Err(code) = say(&format!("[viewer] {}", render_event(&event))) {
+                                return code;
+                            }
                             seen = event.seq + 1;
                             delivered += 1;
                         }
                     }
-                    Err(e) => println!("[viewer] supervisor rejected the poll: {e}"),
+                    Err(e) => {
+                        if let Err(code) =
+                            say(&format!("[viewer] supervisor rejected the poll: {e}"))
+                        {
+                            return code;
+                        }
+                    }
                 }
             }
             Err(e) => {
-                println!(
+                if let Err(code) = say(&format!(
                     "[viewer] supervisor not reachable ({e}); still attached, still read-only"
-                );
+                )) {
+                    return code;
+                }
             }
         }
         if max_events > 0 && delivered >= max_events {
@@ -466,4 +539,47 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
             provenance: supervisor::protocol::Provenance::Telemetry { unknown: true },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_line;
+    use std::io;
+
+    struct Failing(io::ErrorKind);
+
+    impl io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_line_is_written_verbatim() {
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(write_line(&mut out, "[auto] started"), Ok(()));
+        assert_eq!(String::from_utf8(out).expect("utf-8"), "[auto] started\n");
+    }
+
+    #[test]
+    fn a_closed_reader_ends_the_output_without_error() {
+        // `sup-events | head` closes stdout: the pipeline ending is not a
+        // failure of the client.
+        assert_eq!(
+            write_line(&mut Failing(io::ErrorKind::BrokenPipe), "line"),
+            Err(0)
+        );
+    }
+
+    #[test]
+    fn any_other_write_failure_fails_the_command() {
+        assert_eq!(
+            write_line(&mut Failing(io::ErrorKind::StorageFull), "line"),
+            Err(1)
+        );
+    }
 }

@@ -52,6 +52,25 @@ impl RuntimeIdentity {
     }
 }
 
+/// The identity of one run: a number the controller assigns when the run
+/// starts and carries to the runtime.
+///
+/// The controller numbers its runs monotonically, and a stop NAMES the run
+/// it was raised for. A stop that belongs to an older run therefore can
+/// never reach the attempt of a newer one, and a stop that arrives before
+/// the runtime installed the attempt is still delivered to that attempt.
+/// The engine tags the events of the run with the same number (its epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(pub u64);
+
+impl RunId {
+    /// The number the run is known by.
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
 /// What the controller asks the runtime to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectiveRequest {
@@ -93,6 +112,19 @@ impl ObjectiveOutcome {
             ObjectiveOutcome::Idle { reason } => format!("idle: {reason}"),
         }
     }
+}
+
+/// What the runtime answered when asked to extend a managed ttl.
+///
+/// Only a runtime can confirm a renewal: the engine records what it
+/// answered and never invents the new value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "renewal", rename_all = "snake_case")]
+pub enum RenewOutcome {
+    /// The runtime extended the environment and states the ttl it now has.
+    Confirmed { ttl_seconds: u64 },
+    /// The runtime has no renewable ttl, with the reason it does not.
+    Unsupported { reason: String },
 }
 
 /// A runtime that could not take the objective.
@@ -154,13 +186,58 @@ pub trait ObjectiveRuntime: Send + Sync {
     /// Which runtime this is. The identity is never hidden.
     fn identity(&self) -> RuntimeIdentity;
 
-    /// Take the objective and confirm it.
-    async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError>;
+    /// Take the objective for `run` and confirm it.
+    ///
+    /// `run` is the identity the controller assigned: every stop names it,
+    /// so the runtime can tell which attempt the stop belongs to.
+    async fn start(
+        &self,
+        run: RunId,
+        request: ObjectiveRequest,
+    ) -> Result<ObjectiveHandle, RuntimeError>;
+
+    /// Ask the attempt of `run` to stop.
+    ///
+    /// This is a SIGNAL, not a drop: the attempt is expected to wind down
+    /// on its own and return its outcome, so it can release what it owns
+    /// (a sandbox, a session, a claim). The controller keeps a bounded
+    /// grace and aborts the attempt only when the signal is ignored.
+    ///
+    /// A stop for a run that is no longer the current one is not delivered
+    /// to the attempt in flight: one run's stop never cancels another.
+    ///
+    /// The default does nothing: a runtime whose attempts cannot be
+    /// interrupted cooperatively has no signal to offer, and the
+    /// controller's grace is what ends them.
+    fn cancel(&self, _run: RunId) {}
+
+    /// Extend the ttl of the managed environment by `added_seconds`.
+    ///
+    /// The default is honest about what most runtimes can do: without a
+    /// renewable environment the answer is `Unsupported` with its reason,
+    /// never a simulated confirmation.
+    async fn renew(&self, _added_seconds: u64) -> RenewOutcome {
+        RenewOutcome::Unsupported {
+            reason: format!("{} does not support a ttl renewal", self.identity().label()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_identity_orders_and_survives_the_wire() {
+        // Run identities are ordered: a stop can be compared with the run
+        // in flight to know whether it belongs to it.
+        assert!(RunId(1) < RunId(2));
+        assert_eq!(RunId(7).number(), 7);
+        let encoded = serde_json::to_string(&RunId(7)).expect("encode");
+        assert_eq!(encoded, "7");
+        let back: RunId = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(back, RunId(7));
+    }
 
     #[test]
     fn a_rehearsal_never_looks_like_a_live_runtime() {
@@ -195,5 +272,42 @@ mod tests {
         assert!(encoded.contains("\"outcome\":\"rejected\""), "{encoded}");
         let back: ObjectiveOutcome = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(back, outcome);
+    }
+
+    struct NonRenewableRuntime;
+
+    #[async_trait::async_trait]
+    impl ObjectiveRuntime for NonRenewableRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::live("non-renewable")
+        }
+
+        async fn start(
+            &self,
+            _run: RunId,
+            _request: ObjectiveRequest,
+        ) -> Result<ObjectiveHandle, RuntimeError> {
+            Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
+                reason: "nothing to do".into(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_a_renewable_ttl_says_so() {
+        let renewal = NonRenewableRuntime.renew(300).await;
+        assert!(
+            matches!(renewal, RenewOutcome::Unsupported { ref reason } if reason.contains("ttl renewal")),
+            "{renewal:?}"
+        );
+    }
+
+    #[test]
+    fn a_renewal_survives_the_wire_with_its_kind() {
+        let confirmed = RenewOutcome::Confirmed { ttl_seconds: 420 };
+        let encoded = serde_json::to_string(&confirmed).expect("encode");
+        assert!(encoded.contains("\"renewal\":\"confirmed\""), "{encoded}");
+        let back: RenewOutcome = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(back, confirmed);
     }
 }

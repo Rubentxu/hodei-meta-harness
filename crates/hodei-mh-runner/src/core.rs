@@ -56,8 +56,21 @@ impl GoalRunner {
     /// The selection is a pure decision over an observed snapshot: the
     /// same snapshot always yields the same choice.
     pub async fn select(&self, work_ref: Option<&str>) -> Result<Option<WorkItem>, RunnerError> {
+        self.select_in(work_ref, &BTreeMap::new()).await
+    }
+
+    /// The work to do, given the claims other agents already hold.
+    ///
+    /// A named work that is claimed is not eligible, and the chain skips
+    /// the claimed work: the caller does not receive work somebody else
+    /// owns.
+    pub async fn select_in(
+        &self,
+        work_ref: Option<&str>,
+        claims: &BTreeMap<String, String>,
+    ) -> Result<Option<WorkItem>, RunnerError> {
         let items = self.tracker.snapshot().await?;
-        let explained = explain_selection(&items, &BTreeMap::new());
+        let explained = explain_selection(&items, claims);
         if let Some(work_ref) = work_ref {
             let Some(entry) = explained.iter().find(|entry| entry.item.id == work_ref) else {
                 return Err(RunnerError::Requirements(format!(
@@ -72,7 +85,7 @@ impl GoalRunner {
             }
             return Ok(Some(entry.item.clone()));
         }
-        match next_decision(&explained, &BTreeMap::new()) {
+        match next_decision(&explained, claims) {
             SupervisorDecision::Work { ticket_id } => Ok(explained
                 .iter()
                 .find(|entry| entry.item.id == ticket_id)
@@ -279,6 +292,22 @@ mod tests {
         let named = runner.select(Some("T-2")).await.expect("select named");
         assert_eq!(named.map(|item| item.id), Some("T-2".to_string()));
         assert!(runner.select(Some("T-404")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_claimed_work_is_neither_selected_nor_accepted_by_name() {
+        let runner = runner(
+            Arc::new(FixedAgent),
+            Arc::new(HoldingVerifier),
+            Arc::new(RecordingPublisher {
+                published: Mutex::new(Vec::new()),
+            }),
+        );
+        let claims = BTreeMap::from([("T-1".to_string(), "another-agent".to_string())]);
+        let next = runner.select_in(None, &claims).await.expect("select");
+        assert_eq!(next.map(|item| item.id), Some("T-2".to_string()));
+        let named = runner.select_in(Some("T-1"), &claims).await;
+        assert!(named.is_err(), "{named:?}");
     }
 
     #[tokio::test]

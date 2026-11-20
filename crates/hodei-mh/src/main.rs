@@ -27,6 +27,7 @@ mod docs;
 mod elf;
 mod goal_probe;
 mod interact_probe;
+mod live;
 mod multiproject_probe;
 mod oneshot_debug;
 mod package;
@@ -69,6 +70,13 @@ product:
                                        the controller has no runtime and refuses
                                        to start, because a run nobody can
                                        execute is not a run
+  supervisor --live --server <url> --image <ref>
+             --project-dir <path> --tracker-dir <path>
+             --managed-branch <branch>
+             [--proxy-url <url>] [--permission allow-once|deny]
+                                       the live runtime: the real tracker, the
+                                       real sandboxes and the real managed branch
+                                       (credentials only from the environment)
   sup-status | sup-action | sup-events | attach-terminal | tui
                                        observe and drive the supervisor
   package                              build the installable bundle

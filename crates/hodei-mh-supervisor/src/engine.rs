@@ -5,7 +5,7 @@
 
 use run::grant::Grant;
 use run::run::{Phase, RunState};
-use run::runtime::{ObjectiveOutcome, ObjectiveReport, RuntimeIdentity};
+use run::runtime::{ObjectiveOutcome, ObjectiveReport, RenewOutcome, RuntimeIdentity};
 
 use crate::protocol::{
     ActionOutcome, EventPage, PROTOCOL_VERSION, ResourceObservation, Snapshot, StructuredEvent,
@@ -29,6 +29,13 @@ pub const MAX_EVENT_PAYLOAD_BYTES: usize = 4 * 1024;
 /// The ceiling of the TTL of a managed environment. A renewal that would
 /// go beyond it is refused with its reason.
 pub const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Why a stopped run is reported as uncertain: no verdict was recorded
+/// when the stop landed.
+const STOP_UNCERTAIN: &str = "the objective is cancelled and its outcome is uncertain";
+
+/// Why a stopped run is NOT uncertain: a verdict stands beside the stop.
+const STOP_VERDICT_STANDS: &str = "the recorded verdict of the objective stands";
 
 /// Whether a transition the engine applies took effect. A refusal is a
 /// real answer with its reason, never a silent no-op.
@@ -64,6 +71,15 @@ pub struct SupervisorCore {
     /// What the last objective did. The verdict of an objective is a
     /// recorded fact, not a phase: the session outlives it.
     pub objective: Option<ObjectiveReport>,
+    /// Why the objective was cancelled. A stop never claims that the
+    /// work held: the outcome of an interrupted objective is uncertain
+    /// and the snapshot says why it is not known.
+    pub stop_reason: Option<String>,
+    /// Whether an attempt the controller started is still winding down
+    /// after a Stop. A Start is refused while one is, so two attempts are
+    /// never in flight together; whoever owns the attempt clears it once
+    /// the attempt has ended.
+    pub winding_down: bool,
     pub resources: ResourceObservation,
     pub context_available: bool,
     pub ttl_remaining_seconds: Option<u64>,
@@ -92,6 +108,8 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         revision: None,
         runtime: None,
         objective: None,
+        stop_reason: None,
+        winding_down: false,
         resources: ResourceObservation::Unknown {
             reason: "no telemetry yet".into(),
         },
@@ -235,6 +253,64 @@ fn outcome(action: &SupervisorAction, applied: bool, detail: impl Into<String>) 
     }
 }
 
+/// Record the answer of an action: it becomes the last answer and one
+/// event. One place, so an action answered by `apply` and an action
+/// answered by the runtime read the same in the record.
+fn record_action(core: &mut SupervisorCore, action_outcome: ActionOutcome) -> ActionOutcome {
+    let detail = action_outcome.detail.clone();
+    let applied = action_outcome.applied;
+    let action = action_outcome.action.clone();
+    core.last_action = Some(action_outcome.clone());
+    emit_event(
+        core,
+        "supervisor/action",
+        serde_json::json!({
+            "action": action,
+            "applied": applied,
+            "detail": detail,
+        }),
+        Provenance::Human,
+    );
+    action_outcome
+}
+
+/// Record the renewal the runtime answered.
+///
+/// A renewal is applied ONLY when the runtime confirmed the new ttl. An
+/// unsupported renewal is a real answer with its reason, and the tracked
+/// ttl does not move; a confirmed ttl beyond the ceiling is refused the
+/// same way.
+pub fn apply_renewal(
+    core: &mut SupervisorCore,
+    added_seconds: u64,
+    renewal: RenewOutcome,
+) -> ActionOutcome {
+    let action = SupervisorAction::Renew { added_seconds };
+    let answer = match renewal {
+        RenewOutcome::Confirmed { ttl_seconds } if ttl_seconds > MAX_TTL_SECONDS => outcome(
+            &action,
+            false,
+            format!(
+                "the runtime confirmed {ttl_seconds}s, beyond the ceiling of {MAX_TTL_SECONDS}s"
+            ),
+        ),
+        RenewOutcome::Confirmed { ttl_seconds } => {
+            core.ttl_remaining_seconds = Some(ttl_seconds);
+            outcome(
+                &action,
+                true,
+                format!("ttl set to {ttl_seconds}s as the runtime confirmed"),
+            )
+        }
+        RenewOutcome::Unsupported { reason } => outcome(
+            &action,
+            false,
+            format!("the renewal of {added_seconds}s was not applied: {reason}"),
+        ),
+    };
+    record_action(core, answer)
+}
+
 /// Apply a client action. Every refusal is a REAL answer with its reason —
 /// never a silent no-op dressed as success.
 pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutcome {
@@ -273,6 +349,14 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                     false,
                     "a run is already in flight: not a second controller",
                 )
+            } else if core.winding_down {
+                // The stopped attempt may still be releasing its sandbox
+                // and its session: a new one would run beside it.
+                outcome(
+                    &action,
+                    false,
+                    "the previous attempt is still winding down: one attempt at a time",
+                )
             } else {
                 core.epoch += 1;
                 let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
@@ -285,6 +369,7 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                 // The verdict of the PREVIOUS objective is not this run's
                 // verdict: a snapshot in `starting` must not show it.
                 core.objective = None;
+                core.stop_reason = None;
                 outcome(
                     &action,
                     true,
@@ -327,68 +412,73 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                 outcome(&action, false, "not paused")
             }
         }
-        SupervisorAction::Stop => match core.run.as_mut() {
-            // A run that is still starting is stopped too: nobody is left
-            // waiting for a confirmation that will never arrive.
-            Some(run) if run.is_live() => {
-                let was_starting = *run.phase() == Phase::Starting;
-                let cancelled = run.stop();
-                core.paused = false;
-                let detail = format!(
-                    "stopped{}; cancelled_processes={:?}; irreversible={:?}",
-                    if was_starting {
-                        " before the runtime confirmed"
-                    } else {
-                        ""
-                    },
-                    cancelled,
-                    run.initiated_irreversible
-                );
-                outcome(&action, true, detail)
-            }
-            _ => outcome(&action, false, "no running run to stop"),
-        },
-        SupervisorAction::Renew { added_seconds } => match core.ttl_remaining_seconds {
-            Some(remaining) => {
-                // The addition is CHECKED: an unchecked one overflows (and
-                // a debug build panics on it), and the result is bounded:
-                // a renewal cannot push the environment past its ceiling.
-                match remaining.checked_add(*added_seconds) {
-                    None => outcome(
-                        &action,
-                        false,
-                        "the ttl cannot be extended: it would overflow",
-                    ),
-                    Some(extended) if extended > MAX_TTL_SECONDS => outcome(
-                        &action,
-                        false,
-                        format!(
-                            "the ttl cannot be extended: {extended}s is beyond the ceiling of {MAX_TTL_SECONDS}s"
-                        ),
-                    ),
-                    Some(extended) => {
-                        core.ttl_remaining_seconds = Some(extended);
-                        outcome(&action, true, format!("ttl extended by {added_seconds}s"))
-                    }
+        SupervisorAction::Stop => {
+            let stopped = match core.run.as_mut() {
+                // A run that is still starting is stopped too: nobody is
+                // left waiting for a confirmation that will never arrive.
+                Some(run) if run.is_live() => {
+                    let was_starting = *run.phase() == Phase::Starting;
+                    let cancelled = run.stop();
+                    Some((was_starting, cancelled, run.initiated_irreversible.clone()))
                 }
+                _ => None,
+            };
+            match stopped {
+                Some((was_starting, cancelled, irreversible)) => {
+                    core.paused = false;
+                    // A Stop ends the session: it does not un-say what
+                    // already happened. A recorded verdict — a confirmed
+                    // effect above all — stands beside the stop; only a run
+                    // that produced NO verdict is reported as uncertain.
+                    let uncertain = core.objective.is_none();
+                    core.winding_down = true;
+                    let reason = match (was_starting, uncertain) {
+                        (true, true) => {
+                            format!("stopped before the runtime confirmed: {STOP_UNCERTAIN}")
+                        }
+                        (false, true) => format!("stopped by the user: {STOP_UNCERTAIN}"),
+                        (true, false) => format!(
+                            "stopped before the runtime confirmed: the session ended and {STOP_VERDICT_STANDS}"
+                        ),
+                        (false, false) => format!(
+                            "stopped by the user: the session ended and {STOP_VERDICT_STANDS}"
+                        ),
+                    };
+                    core.stop_reason = Some(reason.clone());
+                    emit_event(
+                        core,
+                        "objective/cancelled",
+                        serde_json::json!({
+                            "reason": reason,
+                            "uncertain": uncertain,
+                        }),
+                        Provenance::Human,
+                    );
+                    outcome(
+                        &action,
+                        true,
+                        format!(
+                            "{reason}; cancelled_processes={cancelled:?}; irreversible={irreversible:?}"
+                        ),
+                    )
+                }
+                None => outcome(&action, false, "no running run to stop"),
             }
-            None => outcome(&action, false, "no managed environment ttl to renew"),
-        },
+        }
+        SupervisorAction::Renew { added_seconds } => {
+            // The runtime owns the ttl. An action that arrives without
+            // its confirmation is answered as not applied, with the
+            // reason, instead of inflating a ttl nobody extended.
+            return apply_renewal(
+                core,
+                *added_seconds,
+                RenewOutcome::Unsupported {
+                    reason: "no runtime confirmation was received".into(),
+                },
+            );
+        }
     };
-    let event_detail = outcome.detail.clone();
-    let applied = outcome.applied;
-    core.last_action = Some(outcome.clone());
-    emit_event(
-        core,
-        "supervisor/action",
-        serde_json::json!({
-            "action": action,
-            "applied": applied,
-            "detail": event_detail,
-        }),
-        Provenance::Human,
-    );
-    outcome
+    record_action(core, outcome)
 }
 
 /// The runtime CONFIRMED the objective: the run is running now.
@@ -453,6 +543,13 @@ pub fn confirm_runtime(
 /// The verdict is RECORDED, and every outcome has a transition: a
 /// confirmed objective leaves the session alive, a rejected or failed
 /// one ends it, and an idle objective returns the supervisor to waiting.
+///
+/// A CONFIRMED effect that completes after a Stop is a fact of the past:
+/// it is recorded beside the stop instead of being discarded as an
+/// outcome nobody can trust. The run is NOT resurrected — it stays
+/// stopped — and the stop reason is corrected to say the verdict stands.
+/// Every other outcome of a stopped run is refused: nothing reopens a
+/// session that was ended.
 pub fn record_outcome(
     core: &mut SupervisorCore,
     epoch: u64,
@@ -464,11 +561,28 @@ pub fn record_outcome(
             core.epoch
         ));
     }
-    // The outcome belongs to a LIVE run: a run that was stopped or
-    // dropped does not get a verdict afterwards.
+    // The outcome is the attempt telling us it has ended: whether the
+    // verdict is recorded or not, no attempt of this run is winding down
+    // any more, and the next Start may proceed.
+    core.winding_down = false;
     let live = core.run.as_ref().is_some_and(|run| run.is_live());
+    // A run that a Stop ended, as opposed to one that ended by its own
+    // verdict: only a stop can stand beside a confirmed effect.
+    let stopped_by_the_user = core.stop_reason.is_some()
+        && core
+            .run
+            .as_ref()
+            .is_some_and(|run| *run.phase() == Phase::Stopped);
     if !live {
-        return Transition::refused("the run is no longer live: the outcome is not recorded");
+        if !(stopped_by_the_user && matches!(outcome, ObjectiveOutcome::Confirmed { .. })) {
+            return Transition::refused("the run is no longer live: the outcome is not recorded");
+        }
+        // The effect completed after the stop. The recorded reason is
+        // corrected: the stop ended the session, it did not make the
+        // effect unknown.
+        core.stop_reason = Some(format!(
+            "the session ended by a stop and {STOP_VERDICT_STANDS}"
+        ));
     }
     let work_ref = match &outcome {
         ObjectiveOutcome::Confirmed { work_ref, .. }
@@ -754,14 +868,51 @@ mod tests {
     }
 
     #[test]
-    fn an_outcome_of_a_stopped_run_is_not_recorded() {
+    fn a_verdict_of_a_stopped_run_is_refused_unless_it_is_a_confirmed_effect() {
         let mut core = wired("gc");
         let epoch = started(&mut core);
         apply(&mut core, SupervisorAction::Stop);
+        for refused in [
+            ObjectiveOutcome::Rejected {
+                work_ref: "TASK-1".into(),
+                reason: "the evidence did not hold".into(),
+            },
+            ObjectiveOutcome::Failed {
+                reason: "the sandbox could not be created".into(),
+            },
+            ObjectiveOutcome::Idle {
+                reason: "no eligible work".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    record_outcome(&mut core, epoch, refused.clone()),
+                    Transition::Refused { .. }
+                ),
+                "{refused:?} must not reopen a stopped run"
+            );
+        }
+        assert!(
+            core.objective.is_none(),
+            "a refused verdict is never recorded"
+        );
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+
+        // A run that ended by its own verdict is not a stopped run: a
+        // second, contradictory verdict is refused instead of recorded.
+        let mut ended = wired("gc");
+        let ended_epoch = started(&mut ended);
+        record_outcome(
+            &mut ended,
+            ended_epoch,
+            ObjectiveOutcome::Failed {
+                reason: "the sandbox could not be created".into(),
+            },
+        );
         assert!(matches!(
             record_outcome(
-                &mut core,
-                epoch,
+                &mut ended,
+                ended_epoch,
                 ObjectiveOutcome::Confirmed {
                     work_ref: "TASK-1".into(),
                     detail: "published".into(),
@@ -769,6 +920,53 @@ mod tests {
             ),
             Transition::Refused { .. }
         ));
+    }
+
+    #[test]
+    fn a_confirmed_effect_that_lands_after_a_stop_is_recorded_as_a_fact() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        apply(&mut core, SupervisorAction::Stop);
+        assert!(
+            core.stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("uncertain")),
+            "before the verdict arrives the outcome is honestly uncertain"
+        );
+
+        // The effect had already been moved when the stop landed: it
+        // completed, and it is a fact.
+        assert_eq!(
+            record_outcome(
+                &mut core,
+                epoch,
+                ObjectiveOutcome::Confirmed {
+                    work_ref: "TASK-1".into(),
+                    detail: "published 1f0c3a5b".into(),
+                },
+            ),
+            Transition::Applied
+        );
+        let snapshot = snapshot(&core);
+        assert_eq!(snapshot.phase, Phase::Stopped, "the run stays stopped");
+        let objective = snapshot.objective.expect("the verdict is recorded");
+        assert_eq!(objective.work_ref.as_deref(), Some("TASK-1"));
+        assert!(matches!(
+            objective.outcome,
+            ObjectiveOutcome::Confirmed { .. }
+        ));
+        let reason = core.stop_reason.as_deref().expect("the stop reason");
+        assert!(reason.contains("verdict"), "{reason}");
+        assert!(
+            !reason.contains("uncertain"),
+            "a recorded fact is no longer uncertain: {reason}"
+        );
+        assert!(!core.winding_down, "the attempt has ended");
+        // Nothing is running: the session was ended by the stop.
+        assert_eq!(
+            core.run.as_ref().map(|run| run.phase().clone()),
+            Some(Phase::Stopped)
+        );
     }
 
     #[test]
@@ -900,6 +1098,8 @@ mod tests {
         assert_eq!(core.epoch, epoch_after_start);
         // A new run after a stop advances it again.
         apply(&mut core, SupervisorAction::Stop);
+        // The stopped attempt has ended: its wind-down is over.
+        core.winding_down = false;
         let second = started(&mut core);
         assert_eq!(core.epoch, 2);
         assert_eq!(second, 2);
@@ -1019,33 +1219,162 @@ mod tests {
     }
 
     #[test]
-    fn renew_works_only_with_a_tracked_ttl() {
-        let mut core = default_core("gc");
-        let renew = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
-        assert!(!renew.applied);
-        core.ttl_remaining_seconds = Some(120);
-        let renew = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
-        assert!(renew.applied);
+    fn a_renewal_is_applied_only_when_the_runtime_confirmed_it() {
+        let mut core = wired("gc");
+        let confirmed = apply_renewal(&mut core, 300, RenewOutcome::Confirmed { ttl_seconds: 420 });
+        assert!(confirmed.applied, "{}", confirmed.detail);
         assert_eq!(core.ttl_remaining_seconds, Some(420));
+        assert_eq!(
+            confirmed.action,
+            SupervisorAction::Renew { added_seconds: 300 }
+        );
+
+        let unsupported = apply_renewal(
+            &mut core,
+            300,
+            RenewOutcome::Unsupported {
+                reason: "the lifecycle backend has no ttl renewal".into(),
+            },
+        );
+        assert!(!unsupported.applied);
+        assert!(
+            unsupported.detail.contains("no ttl renewal"),
+            "{}",
+            unsupported.detail
+        );
+        assert_eq!(
+            core.ttl_remaining_seconds,
+            Some(420),
+            "an unsupported renewal does not move the ttl"
+        );
     }
 
     #[test]
-    fn a_renewal_that_would_overflow_or_pass_the_ceiling_is_refused() {
+    fn a_renewal_action_without_a_runtime_answer_is_refused() {
         let mut core = default_core("gc");
-        // The addition is CHECKED: an unchecked one overflows, and a
-        // debug build panics on it.
-        core.ttl_remaining_seconds = Some(u64::MAX - 10);
-        let overflow = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
-        assert!(!overflow.applied);
-        assert!(overflow.detail.contains("overflow"), "{}", overflow.detail);
-        assert_eq!(core.ttl_remaining_seconds, Some(u64::MAX - 10));
-        // The renewal is bounded: it cannot push the environment past
-        // its ceiling.
-        core.ttl_remaining_seconds = Some(MAX_TTL_SECONDS - 10);
-        let beyond = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
+        core.ttl_remaining_seconds = Some(120);
+        let renew = apply(&mut core, SupervisorAction::Renew { added_seconds: 300 });
+        assert!(!renew.applied);
+        assert!(renew.detail.contains("runtime"), "{}", renew.detail);
+        assert_eq!(core.ttl_remaining_seconds, Some(120));
+    }
+
+    #[test]
+    fn a_confirmed_renewal_beyond_the_ceiling_is_refused() {
+        let mut core = default_core("gc");
+        let beyond = apply_renewal(
+            &mut core,
+            300,
+            RenewOutcome::Confirmed {
+                ttl_seconds: MAX_TTL_SECONDS + 1,
+            },
+        );
         assert!(!beyond.applied);
         assert!(beyond.detail.contains("ceiling"), "{}", beyond.detail);
-        assert_eq!(core.ttl_remaining_seconds, Some(MAX_TTL_SECONDS - 10));
+        assert_eq!(core.ttl_remaining_seconds, None);
+    }
+
+    #[test]
+    fn a_stop_without_a_verdict_is_cancelled_and_uncertain() {
+        let mut core = wired("gc");
+        started(&mut core);
+
+        let stop = apply(&mut core, SupervisorAction::Stop);
+        assert!(stop.applied, "{}", stop.detail);
+        assert!(
+            core.objective.is_none(),
+            "an interrupted objective produced no verdict"
+        );
+        let reason = core.stop_reason.as_deref().expect("a stop reason");
+        assert!(reason.contains("uncertain"), "{reason}");
+        let cancelled = core
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "objective/cancelled")
+            .expect("the cancellation event");
+        assert_eq!(cancelled.payload["uncertain"], serde_json::json!(true));
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn a_stop_after_a_confirmed_objective_keeps_the_verdict() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        record_outcome(
+            &mut core,
+            epoch,
+            ObjectiveOutcome::Confirmed {
+                work_ref: "TASK-1".into(),
+                detail: "published 1f0c3a5b".into(),
+            },
+        );
+
+        let stop = apply(&mut core, SupervisorAction::Stop);
+        assert!(stop.applied, "{}", stop.detail);
+        // A confirmed effect is a fact of the past: the stop ends the
+        // session, it does not relabel the verdict as unknown.
+        let objective = core
+            .objective
+            .as_ref()
+            .expect("the confirmed verdict stands");
+        assert_eq!(objective.work_ref.as_deref(), Some("TASK-1"));
+        assert!(matches!(
+            objective.outcome,
+            ObjectiveOutcome::Confirmed { .. }
+        ));
+        let reason = core.stop_reason.as_deref().expect("a stop reason");
+        assert!(!reason.contains("uncertain"), "{reason}");
+        assert!(reason.contains("verdict"), "{reason}");
+        assert!(!stop.detail.contains("uncertain"), "{}", stop.detail);
+        let cancelled = core
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "objective/cancelled")
+            .expect("the session stop event");
+        assert_eq!(cancelled.payload["uncertain"], serde_json::json!(false));
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn a_start_while_the_stopped_attempt_winds_down_is_refused() {
+        let mut core = wired("gc");
+        started(&mut core);
+        apply(&mut core, SupervisorAction::Stop);
+        assert!(core.winding_down, "the stop begins the wind-down");
+
+        let project = core.project.clone();
+        let concurrent = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: project.clone(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(!concurrent.applied);
+        assert!(
+            concurrent.detail.contains("winding down"),
+            "{}",
+            concurrent.detail
+        );
+        assert_eq!(
+            core.run.as_ref().map(|run| run.phase().clone()),
+            Some(Phase::Stopped)
+        );
+
+        // The attempt has ended: the next attempt may start.
+        core.winding_down = false;
+        let next = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(next.applied, "{}", next.detail);
     }
 
     #[test]

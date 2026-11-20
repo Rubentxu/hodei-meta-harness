@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use run::runtime::{
-    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RuntimeError,
+    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId, RuntimeError,
     RuntimeIdentity,
 };
 use supervisor::client::{self, ClientError};
@@ -29,7 +29,11 @@ impl ObjectiveRuntime for StubRuntime {
         RuntimeIdentity::rehearsal("stub")
     }
 
-    async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+    async fn start(
+        &self,
+        _run: RunId,
+        request: ObjectiveRequest,
+    ) -> Result<ObjectiveHandle, RuntimeError> {
         Ok(ObjectiveHandle::finished(ObjectiveOutcome::Confirmed {
             work_ref: request.work_ref.unwrap_or_else(|| "TASK-9".into()),
             detail: "the stub confirmed the objective".into(),

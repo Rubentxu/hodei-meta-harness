@@ -21,6 +21,12 @@ pub enum PromoteError {
     /// must revalidate against the new state before promoting.
     #[error("managed branch moved since verification (expected {expected}, current {current})")]
     BaseMoved { expected: String, current: String },
+    /// The host refused the update of the managed branch: the ref did not
+    /// move, so this is a policy refusal, not a concurrent move.
+    #[error(
+        "the host refused the branch update (git: {detail}): the candidate or its message violates the repository policy; nothing was moved"
+    )]
+    RefRejected { detail: String },
     /// The candidate adds nothing on top of the base.
     #[error("candidate is already integrated at {0}")]
     AlreadyIntegrated(String),
@@ -167,13 +173,25 @@ pub fn promote_ff_only_unchecked(
 
     // Native atomic CAS: fails when the branch is no longer at expected_base.
     let reference = format!("refs/heads/{managed_branch}");
-    let old = current.unwrap_or_else(|| ZERO_REF.to_string());
-    let (ok, _, _err) = run_git(repo, &["update-ref", &reference, &head, &old])?;
+    let old = current.clone().unwrap_or_else(|| ZERO_REF.to_string());
+    let (ok, _, err) = run_git(repo, &["update-ref", &reference, &head, &old])?;
     if !ok {
-        let now = current_ref(repo, managed_branch)?.unwrap_or_else(|| "?".into());
+        // A failed update is not proof of a concurrent move: a host hook
+        // may have refused exactly this update. The re-read separates the
+        // two facts instead of guessing one.
+        let now = current_ref(repo, managed_branch)?;
+        if now == current {
+            let trimmed = err.trim();
+            let detail = if trimmed.is_empty() {
+                "the refusal carried no message".to_string()
+            } else {
+                trimmed.to_string()
+            };
+            return Err(PromoteError::RefRejected { detail });
+        }
         return Err(PromoteError::BaseMoved {
             expected: expected_base.to_string(),
-            current: now,
+            current: now.unwrap_or_else(|| "?".into()),
         });
     }
     Ok(head)
@@ -390,6 +408,68 @@ mod tests {
         assert_eq!(
             current_ref(&repo, "hodei-mh/main").unwrap().as_deref(),
             Some(human.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Install a `reference-transaction` hook in the fixture's OWN hooks
+    /// path that refuses only the managed-branch update: the scratch refs
+    /// the promotion fetches keep passing.
+    #[cfg(unix)]
+    fn refuse_managed_updates(repo: &Path, message: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hook = repo.join(".git/hodei-no-hooks/reference-transaction");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\nwhile read -r old new ref; do\n  if [ \"$ref\" = refs/heads/hodei-mh/main ]; then\n    echo '{message}' >&2\n    exit 1\n  fi\ndone\nexit 0\n"
+        );
+        std::fs::write(&hook, script).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_update_is_reported_as_rejected_and_not_as_a_moved_base() {
+        let repo = temp_dir("refused");
+        init_repo(&repo);
+        let base = commit_file(&repo, "a.txt", "base");
+
+        must(&repo, "checkout", &["checkout", "-q", "-b", "candidate"]).unwrap();
+        let _ = commit_file(&repo, "b.txt", "candidate work");
+        let bundle = repo.join("candidate.bundle");
+        must(
+            &repo,
+            "bundle",
+            &["bundle", "create", &bundle.display().to_string(), "--all"],
+        )
+        .unwrap();
+
+        must(&repo, "checkout", &["checkout", "-q", "main"]).unwrap();
+        must(&repo, "branch", &["branch", "-q", "hodei-mh/main", &base]).unwrap();
+        let policy = "policy: the managed branch accepts no automated update";
+        refuse_managed_updates(&repo, policy);
+
+        let err = promote_ff_only_unchecked(&repo, "hodei-mh/main", &bundle, "candidate", &base)
+            .unwrap_err();
+        match &err {
+            PromoteError::RefRejected { detail } => {
+                assert!(
+                    detail.contains(policy),
+                    "the refusal carries the hook message: {detail}"
+                );
+                assert!(
+                    err.to_string().contains("nothing was moved"),
+                    "the refusal is honest about the untouched ref"
+                );
+            }
+            other => panic!("expected RefRejected, got {other:?}"),
+        }
+        // The ref never moved: nothing was promoted.
+        assert_eq!(
+            current_ref(&repo, "hodei-mh/main").unwrap().as_deref(),
+            Some(base.as_str())
         );
         let _ = std::fs::remove_dir_all(&repo);
     }
