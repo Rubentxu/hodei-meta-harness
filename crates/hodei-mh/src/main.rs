@@ -27,6 +27,7 @@ mod interact_probe;
 mod multiproject_probe;
 mod oneshot_debug;
 mod package;
+mod probe_sockets;
 mod probe_util;
 mod profile_probe;
 mod profile_run;
