@@ -262,6 +262,19 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 fn git_fixture(tag: &str) -> std::path::PathBuf {
     let dir = temp_dir(tag);
     hodei_mh_workspace::git::init_fixture_repo(&dir).expect("a fixture repository");
+    for (key, value) in [
+        ("user.name", "fixture"),
+        ("user.email", "fixture@example.invalid"),
+    ] {
+        let configured = std::process::Command::new("git")
+            .args(["-C", dir.to_string_lossy().as_ref(), "config", key, value])
+            .output()
+            .expect("git config");
+        assert!(
+            configured.status.success(),
+            "git config {key}: {configured:?}"
+        );
+    }
     std::fs::write(dir.join("README.md"), "fixture\n").expect("the fixture file");
     let added = std::process::Command::new("git")
         .args(["-C", dir.to_string_lossy().as_ref(), "add", "README.md"])
