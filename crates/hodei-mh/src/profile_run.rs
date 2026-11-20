@@ -11,6 +11,7 @@ use hodei_mh_workspace::export::{self, ExportPolicy};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use profiles::build_plan::{self, BuildPlan};
+use profiles::cache::{self, BuildCacheIdentity, CacheManifest, CacheSettings, RestoreVerdict};
 use profiles::credentials::{self, SubscriptionNote};
 use profiles::doctor::{self, DoctorCheck};
 use profiles::gate::{self, GateDecision};
@@ -33,6 +34,256 @@ const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// before it is cut: the tail of a build that printed a credential must
 /// not keep it.
 const OUTPUT_TAIL_LIMIT: usize = 400;
+
+/// Where a cache archive is staged inside the sandbox while it travels.
+const CACHE_ARCHIVE_IN_SANDBOX: &str = "/tmp/hodei-build-cache.tgz";
+
+/// Bounded wait for archiving/extracting a cache: a real build's cache is
+/// large, but a wedged command must not hold the run forever.
+const CACHE_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The host cache store: `$XDG_CACHE_HOME/hodei-mh/build-cache`, or
+/// `$HOME/.cache/hodei-mh/build-cache`, or a temporary directory.
+fn default_cache_store_root() -> String {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|home| format!("{home}/.cache"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+    format!("{base}/hodei-mh/build-cache")
+}
+
+/// The dependency lock files that can change the meaning of a cache. The
+/// JVM profile ships no download cache, so it has none here.
+fn dependency_locks(project_dir: &std::path::Path) -> Vec<(&'static str, Vec<u8>)> {
+    ["Cargo.lock"]
+        .into_iter()
+        .filter_map(|name| {
+            std::fs::read(project_dir.join(name))
+                .ok()
+                .map(|bytes| (name, bytes))
+        })
+        .collect()
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Join the plan's cache directory with a scope subdirectory; an empty
+/// relative name means the whole cache directory.
+fn scope_path(cache_dir: &str, relative: &str) -> String {
+    if relative.is_empty() {
+        cache_dir.to_string()
+    } else {
+        format!("{cache_dir}/{relative}")
+    }
+}
+
+fn read_cache_manifest(settings: &CacheSettings) -> CacheManifest {
+    let Ok(raw) = std::fs::read_to_string(cache::manifest_path(&settings.store_root)) else {
+        return CacheManifest::default();
+    };
+    match serde_json::from_str::<CacheManifest>(&raw) {
+        Ok(manifest) if manifest.is_current() => manifest,
+        _ => CacheManifest::default(),
+    }
+}
+
+fn write_cache_manifest(settings: &CacheSettings, manifest: &CacheManifest) -> Result<(), String> {
+    let path = cache::manifest_path(&settings.store_root);
+    let entries = std::path::Path::new(&settings.store_root).join(cache::ENTRIES_DIR);
+    std::fs::create_dir_all(&entries).map_err(|error| {
+        format!(
+            "the cache entries directory {} could not be created: {error}",
+            entries.display()
+        )
+    })?;
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| format!("the cache manifest could not be serialized: {error}"))?;
+    let temporary = format!("{path}.tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| {
+        format!("the cache manifest could not be written to {temporary}: {error}")
+    })?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("the cache manifest could not be moved to {path}: {error}"))
+}
+
+fn write_cache_archive(settings: &CacheSettings, key: &str, bytes: &[u8]) -> Result<(), String> {
+    let entries = std::path::Path::new(&settings.store_root).join(cache::ENTRIES_DIR);
+    std::fs::create_dir_all(&entries).map_err(|error| {
+        format!(
+            "the cache entries directory {} could not be created: {error}",
+            entries.display()
+        )
+    })?;
+    let path = cache::archive_path(&settings.store_root, key);
+    let temporary = format!("{path}.tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| {
+        format!("the cache archive could not be written to {temporary}: {error}")
+    })?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("the cache archive could not be moved to {path}: {error}"))
+}
+
+fn archive_names(store_root: &str) -> Vec<String> {
+    let entries = std::path::Path::new(store_root).join(cache::ENTRIES_DIR);
+    match std::fs::read_dir(entries) {
+        Ok(read) => read
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|kind| kind.is_file())
+                    .unwrap_or(false)
+            })
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Restore a digest-verified archive into the sandbox. A restore that
+/// cannot be completed leaves the scope directory EMPTY: a half-extracted
+/// archive is not a cache, and a build must not inherit it.
+async fn restore_cache_into_sandbox(
+    execd: &ExecdEndpoint,
+    bytes: Vec<u8>,
+    scope_dir: &str,
+) -> Value {
+    let uploaded = opensandbox::execd::api::upload_file(execd, bytes, CACHE_ARCHIVE_IN_SANDBOX)
+        .await
+        .is_ok();
+    if !uploaded {
+        return json!({"status": "cold", "reason": "uploading the cache archive failed"});
+    }
+    let extracted = opensandbox::execd::oneshot::run(
+        execd,
+        &format!(
+            "mkdir -p '{scope_dir}' && tar xzf {CACHE_ARCHIVE_IN_SANDBOX} -C '{scope_dir}' && rm -f {CACHE_ARCHIVE_IN_SANDBOX}"
+        ),
+        CACHE_IO_TIMEOUT,
+    )
+    .await;
+    if extracted.succeeded() {
+        return json!({"status": "warm", "scope_dir": scope_dir});
+    }
+    let cleaned = opensandbox::execd::oneshot::run(
+        execd,
+        &format!("rm -rf '{scope_dir}'"),
+        Duration::from_secs(30),
+    )
+    .await
+    .succeeded();
+    json!({
+        "status": "cold",
+        "reason": "the cache archive could not be extracted",
+        "scope_cleaned": cleaned,
+    })
+}
+
+/// Archive the scope directory, store it under its key, record it in the
+/// manifest, evict the oldest entries until the quota fits and remove
+/// archives no entry describes.
+async fn store_build_cache(
+    execd: &ExecdEndpoint,
+    settings: &CacheSettings,
+    key: &str,
+    scope_dir: &str,
+    manifest: &mut CacheManifest,
+) -> Value {
+    let archived = opensandbox::execd::oneshot::run(
+        execd,
+        &format!("tar czf {CACHE_ARCHIVE_IN_SANDBOX} -C '{scope_dir}' ."),
+        CACHE_IO_TIMEOUT,
+    )
+    .await;
+    if !archived.succeeded() {
+        return json!({
+            "status": "skipped",
+            "reason": "the cache directory could not be archived inside the sandbox",
+        });
+    }
+    let bytes = match opensandbox::execd::api::download_file(execd, CACHE_ARCHIVE_IN_SANDBOX).await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = opensandbox::execd::oneshot::run(
+                execd,
+                &format!("rm -f {CACHE_ARCHIVE_IN_SANDBOX}"),
+                Duration::from_secs(30),
+            )
+            .await;
+            return json!({
+                "status": "skipped",
+                "reason": format!("the cache archive could not be downloaded: {error}"),
+            });
+        }
+    };
+    let _ = opensandbox::execd::oneshot::run(
+        execd,
+        &format!("rm -f {CACHE_ARCHIVE_IN_SANDBOX}"),
+        Duration::from_secs(30),
+    )
+    .await;
+    let size_bytes = bytes.len() as u64;
+    if !cache::fits_quota(size_bytes, settings.quota_bytes) {
+        return json!({
+            "status": "refused",
+            "reason": "the archive is larger than the whole quota",
+            "size_bytes": size_bytes,
+            "quota_bytes": settings.quota_bytes,
+        });
+    }
+    let digest = cache::archive_digest(&bytes);
+    manifest.record(cache::CacheEntry {
+        key: key.to_string(),
+        digest: digest.clone(),
+        size_bytes,
+        last_used_epoch_secs: now_epoch_secs(),
+    });
+    let evicted = cache::plan_eviction(&manifest.entries, settings.quota_bytes, key);
+    for evicted_key in &evicted {
+        let _ = std::fs::remove_file(cache::archive_path(&settings.store_root, evicted_key));
+        manifest.remove(evicted_key);
+    }
+    if let Err(reason) = write_cache_archive(settings, key, &bytes) {
+        return json!({"status": "failed", "reason": reason});
+    }
+    let referenced: Vec<String> = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    let orphans = cache::unreferenced_archives(&referenced, &archive_names(&settings.store_root));
+    for orphan in &orphans {
+        let _ = std::fs::remove_file(
+            std::path::Path::new(&settings.store_root)
+                .join(cache::ENTRIES_DIR)
+                .join(orphan),
+        );
+    }
+    if let Err(reason) = write_cache_manifest(settings, manifest) {
+        return json!({"status": "failed", "reason": reason});
+    }
+    json!({
+        "status": "stored",
+        "digest": digest,
+        "size_bytes": size_bytes,
+        "evicted": evicted,
+        "pruned_orphans": orphans.len(),
+        "store_total_bytes": manifest.total_bytes(),
+        "quota_bytes": settings.quota_bytes,
+    })
+}
 
 /// The last `limit` characters of a text, cut on a character boundary.
 fn tail(text: &str, limit: usize) -> String {
@@ -309,6 +560,25 @@ pub async fn run_profile(args: &[String]) -> i32 {
         eprintln!("project dir {} does not exist", project_dir.display());
         return 2;
     }
+    // The build cache is OPT-IN and off by default. The verifier never
+    // enables it: its caller always resolves the policy as `Verification`.
+    let env_cache_enabled = std::env::var("HODEI_MH_BUILD_CACHE").ok();
+    let env_cache_root = std::env::var("HODEI_MH_BUILD_CACHE_DIR").ok();
+    let cache_settings = match cache::resolve_settings(
+        args,
+        cache::CacheEnv {
+            enabled: env_cache_enabled.as_deref(),
+            store_root: env_cache_root.as_deref(),
+        },
+        &default_cache_store_root(),
+        cache::CacheUse::Development,
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 2;
+        }
+    };
 
     // 1. Doctor + gate (host-side, read-only).
     let (checks, decision) = run_doctor(&spec, &server, &proxy_url, &subscription);
@@ -619,12 +889,88 @@ pub async fn run_profile(args: &[String]) -> i32 {
         .unwrap_or_else(|_| project_dir.clone());
     let plan: BuildPlan =
         build_plan::plan(&spec, &canonical_project.to_string_lossy(), &sandbox_root);
+
+    // 6a. The OPT-IN cache: identity, restore and (after the build) store.
+    let lock_bytes = dependency_locks(&project_dir);
+    let lock_refs: Vec<(&str, &[u8])> = lock_bytes
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let cache_key = BuildCacheIdentity::new(
+        &spec.name,
+        &spec.image.full_reference(),
+        &spec.toolchain.primary,
+        &cache::lockfile_digest(&lock_refs),
+        &build_plan::project_cache_token(&canonical_project.to_string_lossy()),
+        cache_settings.scope,
+    )
+    .key();
+    let cache_scope_dir = cache::scope_dir(&spec.name, cache_settings.scope)
+        .map(|relative| scope_path(&plan.cache_dir, relative));
+    let mut cache_manifest = CacheManifest::default();
+    let mut cached_bytes = 0u64;
+    let mut cache_restore = json!({"status": "disabled"});
+    if cache_settings.enabled {
+        match &cache_scope_dir {
+            None => {
+                cache_restore = json!({
+                    "status": "unsupported",
+                    "reason": "the profile has no dependency download cache",
+                });
+            }
+            Some(scope_dir) => {
+                cache_manifest = read_cache_manifest(&cache_settings);
+                let archive_path = cache::archive_path(&cache_settings.store_root, &cache_key);
+                match std::fs::read(&archive_path) {
+                    Err(_) => {
+                        cache_restore =
+                            json!({"status": "cold", "reason": "no archive for this key"});
+                    }
+                    Ok(bytes) => match cache::restore_verdict(
+                        cache_manifest.find(&cache_key),
+                        &cache_key,
+                        &cache::archive_digest(&bytes),
+                    ) {
+                        RestoreVerdict::Verified => {
+                            cached_bytes = bytes.len() as u64;
+                            cache_restore =
+                                restore_cache_into_sandbox(&execd, bytes, scope_dir).await;
+                        }
+                        RestoreVerdict::RejectedCorrupted { reason } => {
+                            // A cache that is not the one recorded is
+                            // DISCARDED: it is never an input to a build.
+                            let discarded = std::fs::remove_file(&archive_path).is_ok();
+                            cache_manifest.remove(&cache_key);
+                            let _ = write_cache_manifest(&cache_settings, &cache_manifest);
+                            cache_restore = json!({
+                                "status": "rejected",
+                                "reason": reason,
+                                "discarded": discarded,
+                            });
+                        }
+                        RestoreVerdict::ColdMiss => {
+                            // An archive with no manifest entry cannot be
+                            // verified, so it cannot be restored.
+                            let discarded = std::fs::remove_file(&archive_path).is_ok();
+                            cache_restore = json!({
+                                "status": "cold",
+                                "reason": "no manifest entry for this key",
+                                "discarded": discarded,
+                            });
+                        }
+                    },
+                }
+            }
+        }
+    }
+
     let mut command_outputs: Vec<Value> = Vec::new();
     // The RAW strings are kept for the leak check ONLY: they are never
     // persisted. A detector that reads the redacted record would be
     // blinded by the very redaction it has to notice.
     let mut executed: Vec<String> = Vec::new();
     let mut all_ok = observed.succeeded();
+    let build_started = std::time::Instant::now();
     for command in &plan.commands {
         let proxied = format!("HTTPS_PROXY={proxy_url} HTTP_PROXY={proxy_url} {command}");
         let outcome =
@@ -638,6 +984,30 @@ pub async fn run_profile(args: &[String]) -> i32 {
             &outcome.output,
         ));
     }
+    let build_elapsed_seconds = build_started.elapsed().as_secs_f64();
+
+    // A cache is only stored when the build that produced it succeeded: a
+    // failed build leaves state no later run should inherit.
+    let cache_persist = match (cache_settings.enabled, &cache_scope_dir) {
+        (false, _) => json!({"status": "disabled"}),
+        (true, None) => json!({
+            "status": "unsupported",
+            "reason": "the profile has no dependency download cache",
+        }),
+        (true, Some(_)) if !all_ok => {
+            json!({"status": "skipped", "reason": "the build did not succeed"})
+        }
+        (true, Some(scope_dir)) => {
+            store_build_cache(
+                &execd,
+                &cache_settings,
+                &cache_key,
+                scope_dir,
+                &mut cache_manifest,
+            )
+            .await
+        }
+    };
 
     // 7. The record: SHA, commands, limits — no secrets by construction.
     let env_sample: Vec<(String, String)> = vec![
@@ -720,6 +1090,24 @@ pub async fn run_profile(args: &[String]) -> i32 {
             "raw": egress.output.trim(),
         },
         "cache_dir": plan.cache_dir,
+        "cache": {
+            "enabled": cache_settings.enabled,
+            "scope": cache_settings.scope.as_str(),
+            "key": cache_key,
+            "scope_dir": cache_scope_dir,
+            "store": cache_settings.store_root,
+            "quota_bytes": cache_settings.quota_bytes,
+            "restore": cache_restore,
+            "restored_bytes": cached_bytes,
+            "persist": cache_persist,
+            // Promotion is validated by a fresh checkout in a fresh
+            // sandbox that never reads this cache, so a poisoned cache
+            // cannot produce PASS.
+            "verification_eligible": false,
+        },
+        "build": {
+            "elapsed_seconds": build_elapsed_seconds,
+        },
         "project_export": staged.report(),
         "commands": command_outputs,
         "all_succeeded": all_ok,
