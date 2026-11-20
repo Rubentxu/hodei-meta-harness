@@ -79,6 +79,12 @@ product:
                                        (credentials only from the environment)
   sup-status | sup-action | sup-events | attach-terminal | tui
                                        observe and drive the supervisor
+  sup-events [--socket PATH] [--since N]
+             [--jsonl | --pretty]      replay the event log: one JSON object
+                                       per line when stdout is a pipe or a
+                                       file, the readable tail when it is a
+                                       terminal; the flags force one channel
+                                       or the other (they are exclusive)
   package                              build the installable bundle
 
 probes (evidence about this host):
