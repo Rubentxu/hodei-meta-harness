@@ -9,12 +9,186 @@
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tokio::process::Command;
 
 struct Check {
     name: &'static str,
     passed: bool,
     detail: String,
+}
+
+/// The epoch the FIRST Start of the probe opens: a fresh core counts epochs
+/// from zero and every applied Start takes the next one.
+const FIRST_EPOCH: u64 = 1;
+/// The epoch the SECOND Start of the probe opens.
+const SECOND_EPOCH: u64 = 2;
+/// The verdicts that END a run. A confirmed objective keeps the session
+/// alive, so it is not one of them: only after an ending verdict is a second
+/// Start allowed to be applied.
+const RUN_ENDING_OUTCOMES: &[&str] = &["idle", "rejected", "failed"];
+/// The words the refusal of a second controller carries. They are what the
+/// journal would show if this project ever served two controllers.
+const SECOND_CONTROLLER_REFUSAL: &str = "second controller";
+/// How long the journal is followed before the probe admits the transition
+/// never happened.
+const JOURNAL_DEADLINE: Duration = Duration::from_secs(20);
+/// The wait between two reads of the journal.
+const JOURNAL_POLL: Duration = Duration::from_millis(300);
+
+/// The transitions one controller's journal must show for its two Starts.
+///
+/// Every field is the SEQUENCE of the event that proved it, or `None` when
+/// the journal never showed it: a missing milestone says where the trace
+/// stopped, which a plain boolean could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JournalSummary {
+    /// The human Start that opened epoch 1 and was applied.
+    first_start_applied: Option<u64>,
+    /// The verdict that ENDED epoch 1.
+    first_run_ended: Option<u64>,
+    /// The human Start that opened epoch 2 and was applied.
+    second_start_applied: Option<u64>,
+    /// The automatic confirmation the runtime gave to epoch 2.
+    second_run_confirmed: Option<u64>,
+    /// The action that was refused as a second controller.
+    refused_by_second_controller: Option<u64>,
+}
+
+impl JournalSummary {
+    /// The whole two-run sequence, each milestone AFTER the one before it.
+    ///
+    /// Order is the assertion, not membership: a journal that shows an
+    /// epoch-2 Start at a lower sequence than the verdict that ended epoch 1
+    /// did not witness the run ending first.
+    fn sequence_is_complete(&self) -> bool {
+        match (
+            self.first_start_applied,
+            self.first_run_ended,
+            self.second_start_applied,
+            self.second_run_confirmed,
+        ) {
+            (Some(start_one), Some(ended_one), Some(start_two), Some(confirmed_two)) => {
+                start_one < ended_one && ended_one < start_two && start_two < confirmed_two
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What one read of the journal found.
+struct JournalRead {
+    summary: JournalSummary,
+    /// The lines that are not one readable event, with the reason each one
+    /// is unusable. A hole in the journal is never read as a pass.
+    unreadable: Vec<String>,
+    /// Whether the read command itself answered.
+    reachable: bool,
+}
+
+/// The transitions the journal shows, as the machine channel carries them.
+fn journal_assertions(events: &[Value]) -> JournalSummary {
+    let mut summary = JournalSummary::default();
+    for event in events {
+        let (Some(seq), Some(epoch), Some(kind)) = (
+            number(event, "seq"),
+            number(event, "epoch"),
+            text(event, "kind"),
+        ) else {
+            continue;
+        };
+        match kind {
+            "supervisor/action" => read_action_event(&mut summary, seq, epoch, event),
+            "objective/outcome" => read_outcome_event(&mut summary, seq, epoch, event),
+            "objective/confirmed" => read_confirmation_event(&mut summary, seq, epoch, event),
+            _ => {}
+        }
+    }
+    summary
+}
+
+/// One answered action: applied Starts open the epochs, and a refusal that
+/// names a second controller is the invariant breaking.
+fn read_action_event(summary: &mut JournalSummary, seq: u64, epoch: u64, event: &Value) {
+    let applied = event
+        .pointer("/payload/applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !applied {
+        let detail = pointer_text(event, "/payload/detail").unwrap_or_default();
+        if detail.contains(SECOND_CONTROLLER_REFUSAL) {
+            summary.refused_by_second_controller.get_or_insert(seq);
+        }
+        return;
+    }
+    if pointer_text(event, "/payload/action/action") != Some("start")
+        || pointer_text(event, "/provenance/prov") != Some("human")
+    {
+        return;
+    }
+    if epoch == FIRST_EPOCH {
+        summary.first_start_applied.get_or_insert(seq);
+    } else if epoch == SECOND_EPOCH {
+        summary.second_start_applied.get_or_insert(seq);
+    }
+}
+
+/// One verdict of the first run, but only when it ENDED the run.
+fn read_outcome_event(summary: &mut JournalSummary, seq: u64, epoch: u64, event: &Value) {
+    let outcome = pointer_text(event, "/payload/outcome").unwrap_or_default();
+    if epoch == FIRST_EPOCH && RUN_ENDING_OUTCOMES.contains(&outcome) {
+        summary.first_run_ended.get_or_insert(seq);
+    }
+}
+
+/// The runtime's own confirmation of the second run: it comes from the
+/// runtime, never from a person.
+fn read_confirmation_event(summary: &mut JournalSummary, seq: u64, epoch: u64, event: &Value) {
+    if epoch == SECOND_EPOCH && pointer_text(event, "/provenance/prov") == Some("automatic") {
+        summary.second_run_confirmed.get_or_insert(seq);
+    }
+}
+
+fn number(event: &Value, key: &str) -> Option<u64> {
+    event.get(key).and_then(Value::as_u64)
+}
+
+fn text<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
+    event.get(key).and_then(Value::as_str)
+}
+
+fn pointer_text<'a>(event: &'a Value, pointer: &str) -> Option<&'a str> {
+    event.pointer(pointer).and_then(Value::as_str)
+}
+
+/// The journal lines as events, and the reason for every line that is not
+/// one.
+///
+/// A line that parses but names nothing is a hole, not a silent skip: the
+/// assertion over it would be invented from what happened to be readable.
+fn parse_journal_lines(raw: &str) -> (Vec<Value>, Vec<String>) {
+    let parsed: Vec<Result<Value, String>> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .map_err(|error| format!("not one JSON event ({error}): {line}"))
+                .and_then(|event| match event.get("kind").and_then(Value::as_str) {
+                    Some(_) => Ok(event),
+                    None => Err(format!("an event without a kind: {line}")),
+                })
+        })
+        .collect();
+    let events: Vec<Value> = parsed
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok().cloned())
+        .collect();
+    let unreadable: Vec<String> = parsed
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err().cloned())
+        .collect();
+    (events, unreadable)
 }
 
 async fn run_capture(bin: &std::path::Path, args: &[&str]) -> (i32, String, String) {
@@ -160,12 +334,58 @@ pub async fn run() -> i32 {
         ),
     });
 
+    // ---- ONE controller per project, audited in the JOURNAL -------------
+    // A rehearsal never holds a run steady in `running`: the trial runtime
+    // confirms at once and every chained attempt ends epoch 1 before a
+    // stable phase can be observed. So this probe does NOT claim that a
+    // second Start is refused over the wire — that refusal is asserted on
+    // the productive path by the offline tests of the runner, the engine and
+    // the socket. What the journal DOES carry, live, is the whole transition
+    // the single-controller rule depends on: epoch 1 opened by an applied
+    // Start and ended by its verdict, and only then epoch 2 opened by the
+    // next applied Start and confirmed by the runtime. A second controller
+    // that ever took this project over would leave its refusal in the very
+    // same journal.
+    let before_second =
+        wait_journal(&bin, &socket, |summary| summary.first_run_ended.is_some()).await;
     let (second_code, second_out, _) =
         run_capture(&bin, &["sup-action", "start", "--socket", &socket]).await;
+    let after_second = wait_journal(&bin, &socket, JournalSummary::sequence_is_complete).await;
+    let milestones = format!(
+        "start epoch {FIRST_EPOCH} applied {}, epoch {FIRST_EPOCH} ended {}, start epoch \
+         {SECOND_EPOCH} applied {}, epoch {SECOND_EPOCH} confirmed by the runtime {}",
+        milestone(after_second.summary.first_start_applied),
+        milestone(after_second.summary.first_run_ended),
+        milestone(after_second.summary.second_start_applied),
+        milestone(after_second.summary.second_run_confirmed),
+    );
+    let refusal = match after_second.summary.refused_by_second_controller {
+        Some(seq) => format!("PRESENT at #{seq}"),
+        None => "absent".to_string(),
+    };
+    let holes = if after_second.unreadable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " — UNREADABLE JOURNAL LINES: {}",
+            after_second.unreadable.join(" | ")
+        )
+    };
+    let second_answer = second_out.trim();
     checks.push(Check {
-        name: "second-controller-is-refused-over-the-wire",
-        passed: second_code == 1 && second_out.contains("second controller"),
-        detail: format!("a second Start is refused with exit {second_code}: {second_out}",),
+        name: "journal-driven-second-controller-safety",
+        passed: after_second.reachable
+            && after_second.unreadable.is_empty()
+            && before_second.summary.first_run_ended.is_some()
+            && after_second.summary.sequence_is_complete()
+            && after_second.summary.refused_by_second_controller.is_none(),
+        detail: format!(
+            "the transition the journal (sup-events --jsonl) shows over the live socket: \
+             {milestones}; the refusal of a second controller is {refusal}; the second Start \
+             answered with exit {second_code}: {second_answer}; before it, epoch 1 had ended: \
+             {}{holes}",
+            milestone(before_second.summary.first_run_ended),
+        ),
     });
 
     // ---- a SECOND SUPERVISOR PROCESS on a LIVE socket is refused -------
@@ -366,5 +586,242 @@ async fn wait_ready_contains(
             return None;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// The journal as the machine channel carries it: one JSON object per line,
+/// read from the very first event.
+///
+/// The read is a client of the same socket the CLI and the TUI use, so the
+/// journal is observed as a consumer observes it — never by reaching into
+/// the supervisor's memory.
+async fn read_journal(bin: &std::path::Path, socket: &str) -> JournalRead {
+    let args = ["sup-events", "--socket", socket, "--since", "0", "--jsonl"];
+    let (code, stdout, stderr) = run_capture(bin, &args).await;
+    if code != 0 {
+        return JournalRead {
+            summary: JournalSummary::default(),
+            unreadable: vec![format!(
+                "sup-events exited {code}: {}",
+                stderr.trim().chars().take(200).collect::<String>()
+            )],
+            reachable: false,
+        };
+    }
+    let (events, unreadable) = parse_journal_lines(&stdout);
+    JournalRead {
+        summary: journal_assertions(&events),
+        unreadable,
+        reachable: true,
+    }
+}
+
+/// Follow the journal until it shows the transition `wants`, or the
+/// deadline expires.
+///
+/// A deadline that expires returns what the journal DID show: the missing
+/// milestone is then reported as missing, not waited on forever.
+async fn wait_journal(
+    bin: &std::path::Path,
+    socket: &str,
+    wants: fn(&JournalSummary) -> bool,
+) -> JournalRead {
+    let deadline = Instant::now() + JOURNAL_DEADLINE;
+    loop {
+        let read = read_journal(bin, socket).await;
+        let settled = !read.reachable || wants(&read.summary);
+        if settled || Instant::now() >= deadline {
+            return read;
+        }
+        tokio::time::sleep(JOURNAL_POLL).await;
+    }
+}
+
+/// One milestone of the journal, printed as the sequence it was found at.
+fn milestone(seq: Option<u64>) -> String {
+    seq.map(|seq| format!("#{seq}"))
+        .unwrap_or_else(|| "MISSING".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One event as the machine channel writes it.
+    fn event(seq: u64, epoch: u64, kind: &str, payload: Value, prov: Value) -> Value {
+        serde_json::json!({
+            "seq": seq,
+            "epoch": epoch,
+            "kind": kind,
+            "payload": payload,
+            "provenance": prov,
+        })
+    }
+
+    /// The journal answers a Start with the action it was, applied or not.
+    fn start_action(seq: u64, epoch: u64, applied: bool, detail: &str) -> Value {
+        event(
+            seq,
+            epoch,
+            "supervisor/action",
+            serde_json::json!({
+                "action": {"action": "start", "project": "probe-project", "ticket": null,
+                           "revision": null},
+                "applied": applied,
+                "detail": detail,
+            }),
+            serde_json::json!({"prov": "human"}),
+        )
+    }
+
+    fn confirmed(seq: u64, epoch: u64) -> Value {
+        event(
+            seq,
+            epoch,
+            "objective/confirmed",
+            serde_json::json!({
+                "epoch": epoch,
+                "runtime": "rehearsal (trial-default)",
+                "detail": "the runtime confirmed the objective",
+            }),
+            serde_json::json!({"prov": "automatic", "rule": "runtime-confirmation"}),
+        )
+    }
+
+    fn outcome(seq: u64, epoch: u64, outcome: &str) -> Value {
+        event(
+            seq,
+            epoch,
+            "objective/outcome",
+            serde_json::json!({"outcome": outcome, "work_ref": null, "reason": "the verdict"}),
+            serde_json::json!({"prov": "automatic", "rule": "runtime-outcome"}),
+        )
+    }
+
+    /// The journal of a rehearsal that confirms at once: epoch 1 chains
+    /// through two confirmed attempts and then ends idle, and only after
+    /// that does the second Start open epoch 2 — or is refused, which is
+    /// what two controllers over one project would look like.
+    fn a_two_epoch_journal(second_start_applied: bool) -> Vec<Value> {
+        let mut events = vec![
+            event(
+                0,
+                0,
+                "supervisor/boot",
+                Value::String("listening".into()),
+                serde_json::json!({"prov": "automatic", "rule": "boot"}),
+            ),
+            start_action(1, FIRST_EPOCH, true, "starting for probe-project (epoch 1)"),
+            confirmed(2, FIRST_EPOCH),
+            outcome(3, FIRST_EPOCH, "confirmed"),
+            outcome(4, FIRST_EPOCH, "confirmed"),
+            outcome(5, FIRST_EPOCH, "idle"),
+        ];
+        events.push(if second_start_applied {
+            start_action(
+                6,
+                SECOND_EPOCH,
+                true,
+                "starting for probe-project (epoch 2)",
+            )
+        } else {
+            start_action(
+                6,
+                SECOND_EPOCH,
+                false,
+                "a run is already in flight: not a second controller",
+            )
+        });
+        if second_start_applied {
+            events.push(confirmed(7, SECOND_EPOCH));
+        }
+        events
+    }
+
+    #[test]
+    fn a_journal_with_epoch_one_terminal_and_epoch_two_start_is_second_controller_safe() {
+        let summary = journal_assertions(&a_two_epoch_journal(true));
+
+        assert_eq!(
+            summary.first_start_applied,
+            Some(1),
+            "the first Start is the applied human one of epoch 1"
+        );
+        assert_eq!(
+            summary.first_run_ended,
+            Some(5),
+            "the run ended by its own verdict, not by a confirmed attempt"
+        );
+        assert_eq!(summary.second_start_applied, Some(6));
+        assert_eq!(summary.second_run_confirmed, Some(7));
+        assert_eq!(summary.refused_by_second_controller, None);
+        assert!(summary.sequence_is_complete());
+    }
+
+    #[test]
+    fn a_journal_that_refuses_the_second_start_is_flagged() {
+        let summary = journal_assertions(&a_two_epoch_journal(false));
+
+        assert_eq!(
+            summary.refused_by_second_controller,
+            Some(6),
+            "the refusal names a second controller and is found by the journal"
+        );
+        assert_eq!(summary.second_start_applied, None);
+        assert!(
+            !summary.sequence_is_complete(),
+            "an epoch that was never opened cannot complete the sequence"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_objective_does_not_end_the_first_run() {
+        // A journal whose last epoch-1 verdict is CONFIRMED shows a run
+        // still in flight: the second Start would be refused for real.
+        let events = vec![
+            start_action(1, FIRST_EPOCH, true, "starting"),
+            confirmed(2, FIRST_EPOCH),
+            outcome(3, FIRST_EPOCH, "confirmed"),
+        ];
+
+        assert_eq!(journal_assertions(&events).first_run_ended, None);
+    }
+
+    #[test]
+    fn a_second_start_applied_before_the_first_run_ended_is_not_a_sequence() {
+        // The same milestones, in the WRONG order: the second Start was
+        // applied while epoch 1 was still in flight, which is exactly two
+        // controllers serving one project. No refusal string is needed for
+        // the trace to betray it.
+        let events = vec![
+            start_action(1, FIRST_EPOCH, true, "starting"),
+            start_action(2, SECOND_EPOCH, true, "starting again"),
+            confirmed(3, SECOND_EPOCH),
+            outcome(4, FIRST_EPOCH, "idle"),
+        ];
+        let summary = journal_assertions(&events);
+
+        assert_eq!(summary.refused_by_second_controller, None);
+        assert!(
+            !summary.sequence_is_complete(),
+            "{summary:?}: the epoch 2 run came before the epoch 1 verdict ended it"
+        );
+    }
+
+    #[test]
+    fn a_journal_line_that_is_not_one_event_is_reported_and_never_dropped() {
+        let raw = format!(
+            "{}\nnot JSON at all\n{{\"seq\":9,\"epoch\":1,\"payload\":{{}}}}\n",
+            serde_json::to_string(&start_action(1, FIRST_EPOCH, true, "starting")).unwrap()
+        );
+
+        let (events, unreadable) = parse_journal_lines(&raw);
+
+        assert_eq!(events.len(), 1, "the one real event survives");
+        assert_eq!(
+            unreadable.len(),
+            2,
+            "a broken line and an event without a kind are both reported: {unreadable:?}"
+        );
     }
 }
