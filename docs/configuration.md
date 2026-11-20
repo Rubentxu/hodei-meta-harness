@@ -3,7 +3,7 @@
 This is the environment-variable reference for **hodei-meta-harness**
 (**hodei-mh**). Every variable below was confirmed against the code that
 actually reads it, and each row cites the repository path and the line that
-consumes it (verified at commit `1014a4b`). Nothing here is invented: if a
+consumes it (verified at commit `f59e43e`). Nothing here is invented: if a
 name could not be confirmed in the source it is not listed.
 
 "Default" is the value the code falls back to when the variable is unset.
@@ -34,9 +34,11 @@ not linked here until it exists.
 
 ### Secrets are never shown in clear text
 
-Two variables carry credentials: `HODEI_MH_CONTROL_TOKEN` (control-plane
-authorization) and `ANTHROPIC_AUTH_TOKEN` (ACP gateway token). This document
-only ever names them and shows how to **export** them with a placeholder —
+Three variables carry credentials: `HODEI_MH_CONTROL_TOKEN` (control-plane
+authorization), `ANTHROPIC_AUTH_TOKEN` (ACP gateway token, the default
+`--agent claude-code` runtime) and `QODER_PERSONAL_ACCESS_TOKEN` (the Qoder
+runtime's personal access token). This document only ever names them and
+shows how to **export** them with a placeholder —
 never a real value. In the code these tokens travel **only in the
 environment** of the process that needs them: they are never written to disk,
 never logged, and never echoed in a response. See the redaction in
@@ -46,7 +48,8 @@ keep the values out of the repository:
 
 ```sh
 export HODEI_MH_CONTROL_TOKEN="<a strong secret you keep out of the repo>"
-export ANTHROPIC_AUTH_TOKEN="<your gateway token>"
+export ANTHROPIC_AUTH_TOKEN="<your gateway token>"          # --agent claude-code (default)
+export QODER_PERSONAL_ACCESS_TOKEN="<your Qoder access token>"  # --agent qoder
 ```
 
 ---
@@ -112,8 +115,9 @@ follow the XDG spec with a `hodei-mh` subdirectory.
 | `HODEI_MH_BUILD_CACHE` | unset (**cache off**) | Opt-in switch for the host build cache. Unset means disabled; the verifier never enables it. | `crates/hodei-mh/src/profile_run.rs:581,583-597` |
 | `HODEI_MH_BUILD_CACHE_DIR` | unset (falls back to the `XDG_CACHE_HOME` root above) | Overrides the build-cache store root directly. | `crates/hodei-mh/src/profile_run.rs:582,583-590` |
 | `PROBE_MODE` | unset (`""`) | A **label only**: it is echoed into the `"mode"` field of the `acp_probe` JSON report. It does not change behavior — the probe's real mode comes from the `--mode` flag (default `mock`). | `crates/hodei-mh/src/main.rs:298` (report), `--mode` `284` |
-| `ANTHROPIC_AUTH_TOKEN` | **required for the live loop** | Gateway token for the real ACP agent. It is passed **only** as the agent process's environment (into the sandbox), never persisted. In the product live loop an empty value is a hard error (`MissingCredentials`). See the "Secrets" note above. | `crates/hodei-mh/src/live/agent.rs:208-217`; probe reads `main.rs:529`, `interact_probe.rs:32`, `autonomous_probe.rs:152`, `supervisor_probe.rs:505` |
-| `ANTHROPIC_BASE_URL` | unset (SDK default) | Optional gateway base URL propagated to the agent the same way (never persisted). When empty, no override prefix is added. | `crates/hodei-mh/src/live/agent.rs:213-215`; `main.rs:531`, `interact_probe.rs:33`, `autonomous_probe.rs:153` |
+| `ANTHROPIC_AUTH_TOKEN` | **required for the live loop with `--agent claude-code`** (the default) | Gateway token for the real ACP agent. It is passed **only** as the agent process's environment (into the sandbox), never persisted. In the product live loop an empty value is a hard error (`MissingCredentials`). See the "Secrets" note above. | `crates/hodei-mh/src/live/agent.rs:220` (read), refusal `221-225`; the name is declared per runtime at `crates/hodei-mh/src/live/runtime.rs:116`; probe reads `main.rs:531`, `interact_probe.rs:32`, `autonomous_probe.rs:152`, `supervisor_probe.rs:650` |
+| `QODER_PERSONAL_ACCESS_TOKEN` | **required for the live loop with `--agent qoder`** | Headless personal access token for the Qoder ACP runtime. Same channel as every credential here — the agent process's environment only (`CredentialChannel::ProcessEnvOnly`), never persisted, and an empty value is the same `MissingCredentials` refusal, whose message names this variable. | declared at `crates/hodei-mh/src/live/runtime.rs:139`, read through the runtime at `crates/hodei-mh/src/live/agent.rs:220`, refusal `221-225`; not read by the probe code (the probes drive the default runtime) |
+| `ANTHROPIC_BASE_URL` | unset (SDK default) | Optional gateway base URL propagated to the agent the same way (never persisted). When empty, no override prefix is added. Only `claude-code` declares a base-URL variable; the Qoder runtime's endpoint is fixed by the vendor (`base_url_env: None`). | `crates/hodei-mh/src/live/agent.rs:226-229`; declared `runtime.rs:117`, Qoder `142`; `main.rs:533`, `interact_probe.rs:33`, `autonomous_probe.rs:153` |
 
 ### Supervisor behavior flags (not environment)
 
@@ -202,6 +206,7 @@ restricted egress proxy, and does not fall back).
 | `HODEI_MH_PROXY_URL`, `HODEI_MH_PROXY_CHECK_URL` | — | ✅ | ✅ (exports URL, requires CHECK URL) |
 | `PROBE_MODE` | — | ✅ (label only) | — (not set here) |
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | — | ✅ | ✅ (probe code reads them) |
+| `QODER_PERSONAL_ACCESS_TOKEN` | — | ✅ (`--agent qoder`) | — (probes drive the default runtime) |
 | `--permission allow-once\|deny` | — | ✅ (CLI flag) | — |
 | `yolo_fallback` | — | reported (always `false`) | — |
 | `PROBE_IMAGES`, `OUT`, `PROXY_PORT`, `BACKLOG_CLI_VERSION` | — | — | ✅ |

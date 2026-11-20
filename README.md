@@ -315,8 +315,10 @@ whitespace value in the host's environment is a hard error
 **Fix.** `export ANTHROPIC_AUTH_TOKEN` in the environment of the host
 process that starts the supervisor or the live loop before launching it
 (the variables are listed in
-[docs/configuration.md](docs/configuration.md)). Never put a token in a
-command line, a file or the repo — records redact any that leaks anyway
+[docs/configuration.md](docs/configuration.md)). With `--agent qoder` the
+same refusal names `QODER_PERSONAL_ACCESS_TOKEN`, the credential variable
+that runtime declares. Never put a token in a command line, a file or the
+repo — records redact any that leaks anyway
 (`[redacted]`).
 
 ### `hodei-mh package` refuses your binaries
