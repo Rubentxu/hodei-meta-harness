@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use run::run::Phase;
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId};
-use runner::live::{ClaimError, ClaimPort, Claimed, LiveRuntime};
+use runner::live::{ClaimError, ClaimPort, ClaimReleaseError, Claimed, LiveRuntime};
 use runner::ports::{
     AgentError, AgentPort, Checkpointed, Closed, Closes, Objective, ObjectiveCheck, Publication,
     PublisherError, PublisherPort, RequirementsError, RequirementsPort, Verification,
@@ -124,10 +124,11 @@ impl ClaimPort for GrantingClaims {
         Ok(self.grant)
     }
 
-    fn release(&self, work_ref: &str, epoch: u64) {
+    fn release(&self, work_ref: &str, epoch: u64) -> Result<(), ClaimReleaseError> {
         if let Ok(mut releases) = self.releases.lock() {
             releases.push((work_ref.to_string(), epoch));
         }
+        Ok(())
     }
 
     fn claims(&self) -> Result<BTreeMap<String, String>, ClaimError> {
