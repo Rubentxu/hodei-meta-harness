@@ -4,7 +4,7 @@ title: '[MH-A06] Conectar el supervisor de producto al bucle real de objetivos A
 status: In Progress
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T13:21:00Z'
+updated_date: '2026-11-20T14:44:00Z'
 labels:
   - audit-v0.2
   - product
@@ -38,7 +38,7 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 <!-- AC:BEGIN -->
 - [x] #1 Un repo externo con Backlog.md y dos tickets dependientes se ejecuta mediante CLI de producto y ACP real; el segundo recibe el commit promovido del primero.
 - [x] #2 Start/Pause/Resume/Stop corresponden a efectos confirmados u objetivos explícitamente pendientes/inciertos; Renew solo confirma si backend lo confirma, si no Unsupported.
-- [ ] #3 Candidato fallido o permiso negado no promociona ni cierra; objetivo sin trabajo no consume sandbox ni tokens.
+- [x] #3 Candidato fallido o permiso negado no promociona ni cierra; objetivo sin trabajo no consume sandbox ni tokens.
 - [ ] #4 La UAT usa el propio binario, conserva evidencia de SHA, cierre, cancelación y liberación; los probes equivalentes se sustituyen solo tras comprobar paridad.
 <!-- AC:END -->
 
@@ -69,4 +69,11 @@ UAT en vivo run 4 (2026-11-20 13:01-13:26 local, evidencia en /tmp/uat-task34/ev
 - D (repo-d, --permission deny): failed con timeout de 180 s, sin ningún evento de denegación en D_events.jsonl; el objective/confirmed automático se emitió antes de que el agente pudiera reaccionar. Confirma TASK-41(5): la denegación sigue siendo invisible y AC3(ii) no puede marcarse hasta visibilizarla.
 - E (repo-e, tablero vacío): phase=idle "no eligible work", containers.txt vacío — AC3(iii) refrendado por segunda vez.
 Además, en D_status.txt el text_tail del timeout aparece espejado (línea "L .noitaerc elif gnikcolb..."), confirmando TASK-41(4) en producción con un agente real (no solo con el fake).
+
+UAT run 5 (2026-11-20 14:17-14:41 UTC, main 6972e45, sha hodei-mh c5bf65d3…, lifecycle 961241f7…, fast-check --all PASS, proveedor cuenta-1 operativo). Evidencia en /tmp/uat-task34/evidence5.
+AC1 encadenado (permite marcarlo [x] con una salvedad): un solo Start ejecutó TASK-1 (promovido b80dad6, cerrado Done, evento seq 4 objective/outcome confirmed "promoted … TASK-1") y ENCADENÓ automáticamente TASK-2 en la misma epoch sin Stop humano (seq 5 menciona TASK-2). El encadenamiento de TASK-34 fix 7d86143 FUNCIONA. TASK-2 murió por un defecto orthogonal: allow-once refused un tool kind "Unknown" (un `cat && echo && find` compuesto); registrado en TASK-42. El requisito observable de AC1 — el segundo recibe el commit promovido del primero — quedó probado en run 3 con Stop+Start manual y su wiring automático en run 5; queda un reintento tras TASK-42 para cerrar la AC con un TASK-2 real.
+AC2 PASS (refrendado): stop/pause/renew/Renew Unsupported ya probados en evidence2/3; byte-scan-final.txt 0/4200 en run 5; TASK-40 wrapper sin secretos en argv confirmado con sandbox real.
+AC3 MARCADA [x]: (i) candidato insatisfacible — no promociona ni cierra, probado con camino real en run 4 C_events (el mismo camino sigue intacto en main; en run 5 el escenario D no llegó al check por TASK-42); (ii) permiso denegado — PASS NUEVO en run 5 E_events seq 4: evento agent.permission_refused con tool/policy estructurados, turno 91 s (< 180 s), sha_before==sha_after, ticket To Do, claims []; la corrección de TASK-41 r1/r2 está en el binario; (iii) tablero vacío no consume sandbox ni tokens — PASS C_events 2 s idle, C_containers.txt vacío.
+AC4 NO se marca aún: propio binario ✓ (shas.txt), SHA ✓, cierre ✓ (A_chaining), liberación ✓ (release.txt: 0 supervisores/0 lifecycle/0 sandboxes/0 redes owner, hodei-proxy intacto), cancelación ya probada en run 3 B_* con el mismo camino (sin regresión). Falta la cláusula final "los probes equivalentes se sustituyen solo tras comprobar paridad" — no se ejecutó scripts/probes.sh en la run 5. Se reejecutará cuando TASK-42 cierre para certificar paridad en el binario final.
+Tres descubrimientos abiertos que bloquean el cierre limpio de TASK-34: TASK-42 (allow-once refuses tool kind Unknown), TASK-43 (refusal sin efecto deja Pending y bloquea reintentos — el fix 3 de TASK-35 es conservador de más), TASK-44 (sup-events formato legible vs JSONL). TASK-34 permanece In Progress hasta TASK-42+43 cerrados y AC4 con probes parity.
 <!-- SECTION:NOTES:END -->

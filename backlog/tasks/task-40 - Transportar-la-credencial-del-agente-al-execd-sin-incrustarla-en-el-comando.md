@@ -1,10 +1,10 @@
 ---
 id: TASK-40
 title: Transportar la credencial del agente al execd sin incrustarla en el comando
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T14:14:00Z'
+updated_date: '2026-11-20T14:44:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -37,4 +37,6 @@ AC3 (justificación explícita): main.rs modo real, interact_probe.rs y autonomo
 Devolución de opensandbox: crates/opensandbox/src/execd/mod.rs: el módulo fake se subió de #[cfg(test)] a pub para permitir las pruebas offline del wrapper; fake.rs registra uploads y frames sin enmascarar y señalía cierre de pipe (sync sin sleep). Cambio de infraestructura de test, no de producto.
 Riesgo residual declarado: POSIX read no debe over-buffer (prohibido contra /bin/sh del host en la prueba); confirmación en sandbox real es lane de integración y va en la UAT run 5 junto con TASK-34.
 Devoluciones aceptadas: 4 líneas en work() (agent.rs:264-277) construyendo AgentHandshake (consecuencia inevitable del cambio de firma de attach_agent). No se tocó el staging en 439-706 ni el handoff write timing en 150-250.
+
+UAT run 5 (binarios 6972e45, sha hodei-mh c5bf65d3…): sandbox real arrancó con attach_agent+wrapper y completó turnos ACP con cuenta-1. byte-scan-final.txt sobre evidence5/repos5/state5: 4200 ficheros escaneados, 0 fugas del token real. Riesgo residual POSIX read-over-buffer cerrado por observación directa del entorno del hijo en la prueba. AC3 sigue con la justificación explícita de que main.rs/interact_probe/autonomous_probe usan api::create_session directo (no SandboxSession); si alguien los eleva a ruta de producto se abrirá una tarea nueva, no se reabre esta.
 <!-- SECTION:NOTES:END -->
