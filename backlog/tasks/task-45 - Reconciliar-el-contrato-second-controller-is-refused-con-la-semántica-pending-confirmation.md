@@ -3,10 +3,10 @@ id: TASK-45
 title: >-
   Reconciliar el contrato second-controller-is-refused con la semántica
   pending-confirmation
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-20T16:31:00Z'
-updated_date: '2026-11-20T16:40:00Z'
+updated_date: '2026-11-20T17:13:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -34,3 +34,15 @@ Opciones para el humano:
 Recomendación interna: (b) toca menos superficie, reutiliza infraestructura nueva, no amplía TASK-29. Pero la decisión no es del supervisor de delegación; es del arquitecto.
 El worker no avanza hasta que el humano elija (a) o (b).
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T17:13:00Z
+
+---
+
+Opción (b) implementada y fusionada en main. Fast-check --all PASS en el workspace post-merge. Lane: PORT=18092 probe supervisor-probe → 1/11 checks adicionales PASS (journal-driven-second-controller-safety); 4 asserts out-of-scope permanecen rojos exactamente como run 6 (cero regresiones, confirmado por bisect 7d86143 vs 924daa1). El assertion viejo 'second-controller-is-refused-over-the-wire' fue sustituido por audit del journal (sup-events --jsonl); la negativa second controller queda cubierta offline en product_flow.rs:115-127, socket_integration.rs:294 y engine.rs:1132-1150, verificando el invariante AGENTS.md (probe solo se retira cuando la invariante está en el productivo). Evidencia en /tmp/uat-task34/evidence45/ (fast-check.txt, lane.txt, lane-checks.txt, probes-out/supervisor-probe-1.json). Worker 12,8 M tokens / 89 tool-uses / 22 min.
+
+---
+<!-- COMMENTS:END -->
