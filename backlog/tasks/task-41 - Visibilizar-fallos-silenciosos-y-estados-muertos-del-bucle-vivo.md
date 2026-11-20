@@ -4,7 +4,7 @@ title: Visibilizar fallos silenciosos y estados muertos del bucle vivo
 status: To Do
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T10:53:00Z'
+updated_date: '2026-11-20T13:44:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -31,4 +31,13 @@ Descubrimiento de la revisión independiente de TASK-34 (linea base f3dcec5), fu
 Cuarto hallazgo (UAT en vivo 11:21, época 2 de uat3): el resumen de timeout del agente imprime el texto espejado. agent.rs:563-565 hace agent_text.chars().rev().take(200) para quedarse con la cola y lo formatea sin invertirlo de nuevo, así que el error muestra '...ti etaerc em teL' en lugar de 'Let me create it...'. No hay corrupción del stream: es un mensaje de fallo engañoso (bajo impacto, alta confusión). Corregir con prueba que afirme la cola legible.
 
 Quinto hallazgo (UAT run 3, escenario D con --permission deny, 11:43-11:50): la denegación de permiso es invisible para el consumidor. crates/hodei-mh/src/live/agent.rs responde al session/request_permission con {"outcome":{"outcome":"cancelled"}} y no emite ningún evento; los dos epochs terminaron como 'the agent did not finish its turn: timeout' a los 180 s y la única traza de la denegación quedó en el text_tail. Un observador no puede distinguir 'permiso denegado por política' de 'modelo lento', así que la AC3(ii) de TASK-34 no puede darse por demostrada. Arreglo exigible: emitir un evento explícito de denegación (herramienta, motivo, política aplicada) y que el resultado del run lo refleje como rechazo con causa en lugar de timeout genérico; prueba determinista con el fake de ACP, sin sandbox y sin dormir.
+
+Ronda 1 entregada en rama task/task-41-visibility (commits a7153e3, 052be7c, cdf4b42 sobre 1b7cd59). Verificada por el supervisor contra el código:
+- (4) text_tail espejado: corregido con readable_tail (agent.rs:626-631), TEXT_TAIL_LIMIT nombrado (agent.rs:173); resumen ahora "timeout after {}s, text_tail={:?}" con la cola legible; dos pruebas offline deterministas sin dormir. Introdujo la tubería AcpPipe (agent.rs:602,611) que drive_agent acepta como dyn; callers de work() y autonomous_probe.rs coerced sin cambios visibles. Encaja con AC2/AC3 sin ampliar alcance.
+- (5) denegación invisible: en el refusal branch (agent.rs:687-699) se emite un evento estructurado agent.permission_refused (stderr JSON) con tool/policy/effect (permission_refusal_event, agent.rs:790-802), y el turno termina de inmediato con summary "the permission policy refused..." y refusal Some(event); work() (agent.rs:290-301) propaga la causa en el mensaje del run. Prueba nueva a_denied_permission_ends_the_turn_as_a_refusal_without_waiting (agent.rs:1003) verifica que devuelve ANTES de consumir los eventos encolados (2 restantes intactos). Mapping completo a AttemptEnd::Rejected sigue pendiente de runner/live.rs (ronda 2). AC3(ii) de TASK-34 se vuelve demostrable en la próxima UAT.
+- Bonus AGENT_TIMEOUT: doc con el porqué en agent.rs:163-168, mensaje "within AGENT_TIMEOUT (180s); retry or shorten the task" (agent.rs:295-299). Sin flag de CLI (fuera de alcance).
+- Gate: scripts/fast-check.sh --all PASS; 15 tests de live::agent verdes.
+- (1) StoreClaims::release NO se tocó conscientemente: la firma ClaimPort (runner/live.rs:46), el call site en ClaimGuard::release_now/Drop (live.rs:178,184) y AttemptEnd/outcome_of (live.rs:63-148) están en runner/live.rs, ocupado por el worker de TASK-35. Pasa a ronda 2 junto con (2) NoNewCommit y (3) install stops.
+- Hallazgo nuevo dentro del mismo tema: main.rs:704-712 tiene el mismo patrón mirror-tail (chars().rev().take(400) sin devolver) en el detalle del probe acp-prompt-response. No es crítico pero es un mensaje engañoso igual que (4); va en ronda 2.
+- Hallazgo nuevo: drive_agent (agent.rs:660-669) hace busy-spin si pipe.next_event() devuelve None inmediatamente (socket cerrado limpio) — el timeout interno de 10 s envuelve la espera, no el reintento; hay que dormir o cortar el loop en Ok(None). Va en ronda 2, con prueba del corte.
 <!-- SECTION:NOTES:END -->
