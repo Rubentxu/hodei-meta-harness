@@ -255,6 +255,7 @@ mod tests {
             Ok(crate::ports::Publication {
                 revision: "1f0c3a5b".into(),
                 closure: crate::ports::Closed::Confirmed,
+                checkpoint: crate::ports::Checkpointed::Settled,
                 detail: "published".into(),
             })
         }

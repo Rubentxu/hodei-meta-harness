@@ -249,19 +249,25 @@ async fn an_objective_whose_verification_does_not_hold_is_rejected_and_ends_the_
 
 /// The rehearsal has no path to promote or to close a ticket.
 ///
-/// This crate declares no dependency on any crate that writes outside
-/// this process — the promoter, the releaser or the workspace exporter —
-/// and the rehearsal's publisher holds no writer at all: it can only
-/// record. The route to an effect does not exist because the ports that
-/// could carry one are declared HERE, and the tracker port is read-only.
+/// The PRODUCT dependencies of this crate declare no writer outside the
+/// process — the promoter, the releaser or the workspace exporter — and
+/// the rehearsal's publisher holds no writer at all: it can only record.
+/// The route to an effect does not exist because the ports that could
+/// carry one are declared HERE, and the tracker port is read-only.
+/// Dev-dependencies do not count: cargo strips them from the manifest of
+/// a published crate, so nothing a consumer builds can link them.
 #[test]
 fn the_rehearsal_cannot_reach_the_promoter() {
     let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("the crate manifest");
+    let product = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("the manifest has a product section");
     for writer in ["hodei-mh-promote", "hodei-mh-release", "hodei-mh-workspace"] {
         assert!(
-            !manifest.contains(writer),
-            "the rehearsal must not depend on '{writer}', a crate that writes outside the process: {manifest}"
+            !product.contains(writer),
+            "the rehearsal must not depend on '{writer}', a crate that writes outside the process: {product}"
         );
     }
 }

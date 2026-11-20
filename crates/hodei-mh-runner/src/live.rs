@@ -1,23 +1,27 @@
-//! The live runtime: select, claim, work, verify, publish — for real.
+//! The live runtime: select, record, claim, work, verify, publish — for
+//! real.
 //!
-//! The runtime owns the ORDER of an attempt. Selection and the claim
-//! happen before any effect, so idle, ineligible and already-claimed work
-//! never reaches the agent. The attempt ends in ONE terminal value, and
-//! the claim is released exactly once whichever way it ends.
+//! The runtime owns the ORDER of an attempt. Selection, the durable
+//! record and the claim happen before any effect, so idle, ineligible
+//! and already-claimed work never reaches the agent and a crash between
+//! the record and the claim has an owner to recover. The attempt ends in
+//! ONE terminal value, and the claim is released exactly once whichever
+//! way it ends.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use run::runtime::{
-    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId, RuntimeError,
-    RuntimeIdentity,
+    CustomObjective, ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId,
+    RuntimeError, RuntimeIdentity,
 };
 use tracker::core::TrackerRead;
 
 use crate::core::{GoalRunner, RunnerError};
 use crate::ports::{
-    AgentPort, Closed, Closes, Objective, PublisherPort, RequirementsPort, VerifierPort,
+    AgentPort, Checkpointed, Closed, Closes, Objective, ObjectiveCheck, PublisherPort,
+    RequirementsPort, VerifierPort,
 };
 
 /// The claim this runtime holds on the work it selected.
@@ -57,6 +61,51 @@ pub trait ClaimPort: Send + Sync {
     }
 }
 
+/// The goal the durable attempt record describes: what the attempt is
+/// about, so a recovery can say it out loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptGoal {
+    pub work_ref: String,
+    pub instruction: String,
+    pub run: u64,
+}
+
+/// Why the durable record of the attempt could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the attempt record of {work_ref} could not be opened: {reason}")]
+pub struct AttemptRecordError {
+    pub work_ref: String,
+    pub reason: String,
+}
+
+/// The durable record of the attempt, written BEFORE the claim: a crash
+/// between the record and the claim then has an owner, and the recovery
+/// of the record can give the claim back.
+pub trait AttemptRecordPort: Send + Sync {
+    /// Ask what the previous attempt left behind, and resolve it: a
+    /// pending record releases the dead run's claim, a confirmed one is
+    /// never redone. An unrecovered record refuses the next attempt.
+    fn recover(&self) -> Result<(), AttemptRecordError>;
+
+    /// Open the Pending record of this attempt, with its handoff.
+    fn begin_attempt(&self, goal: &AttemptGoal) -> Result<(), AttemptRecordError>;
+}
+
+/// The record nobody keeps: for runtimes that own no durable state (the
+/// offline tests). The live runtime never uses it — the product wires
+/// the durable one.
+pub struct NoAttemptRecord;
+
+impl AttemptRecordPort for NoAttemptRecord {
+    fn recover(&self) -> Result<(), AttemptRecordError> {
+        Ok(())
+    }
+
+    fn begin_attempt(&self, _goal: &AttemptGoal) -> Result<(), AttemptRecordError> {
+        Ok(())
+    }
+}
+
 /// How a live attempt ended, before it is read as an objective outcome.
 ///
 /// The vocabulary is TOTAL: every way an attempt can stop has a value,
@@ -90,6 +139,10 @@ pub enum AttemptEnd {
     InfraFailed { reason: String },
     /// The candidate could not be promoted.
     PromotionFailed { work_ref: String, reason: String },
+    /// The candidate WAS promoted and the durable record could not be
+    /// settled: the effect is a fact, only the record is uncertain, and
+    /// the effect is never applied a second time.
+    PromotedUnconfirmed { work_ref: String, detail: String },
     /// There was no eligible work at all.
     NoEligibleWork { reason: String },
 }
@@ -143,6 +196,11 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
         AttemptEnd::InfraFailed { reason } => ObjectiveOutcome::Failed { reason },
         AttemptEnd::PromotionFailed { work_ref, reason } => ObjectiveOutcome::Failed {
             reason: format!("the candidate of {work_ref} could not be promoted: {reason}"),
+        },
+        AttemptEnd::PromotedUnconfirmed { work_ref, detail } => ObjectiveOutcome::Failed {
+            reason: format!(
+                "the candidate of {work_ref} was promoted but the durable record is unconfirmed: {detail}; the effect is durable and must never be re-applied to settle the record"
+            ),
         },
         AttemptEnd::NoEligibleWork { reason } => ObjectiveOutcome::Idle { reason },
     }
@@ -274,11 +332,16 @@ pub struct LiveRuntime {
     verifier: Arc<dyn VerifierPort>,
     publisher: Arc<dyn PublisherPort>,
     claims: Arc<dyn ClaimPort>,
+    records: Arc<dyn AttemptRecordPort>,
     cancellations: Arc<Cancellations>,
 }
 
 impl LiveRuntime {
     /// A runtime that serves `project` through the given ports.
+    ///
+    /// The attempt record of such a runtime is the one nobody keeps:
+    /// `with_records` wires the durable one, and the LIVE product must
+    /// not run without it.
     pub fn new(
         project: impl Into<String>,
         tracker: Arc<dyn TrackerRead>,
@@ -298,8 +361,15 @@ impl LiveRuntime {
             verifier,
             publisher,
             claims,
+            records: Arc::new(NoAttemptRecord),
             cancellations: Arc::new(Cancellations::default()),
         }
+    }
+
+    /// The runtime that keeps its attempts in the durable record `records`.
+    pub fn with_records(mut self, records: Arc<dyn AttemptRecordPort>) -> Self {
+        self.records = records;
+        self
     }
 
     /// Ask the attempt of `run` to stop after the agent returns. The
@@ -321,6 +391,18 @@ impl LiveRuntime {
             self.verifier.clone(),
             self.publisher.clone(),
         )
+    }
+
+    /// Ask the durable record before the attempt runs: the recovery
+    /// resolves what the last attempt left (and gives back the claim of
+    /// a dead one), and the Pending record of this attempt is opened.
+    fn open_record(&self, objective: &Objective, run: RunId) -> Result<(), AttemptRecordError> {
+        self.records.recover()?;
+        self.records.begin_attempt(&AttemptGoal {
+            work_ref: objective.work_ref.clone(),
+            instruction: objective.instruction.clone(),
+            run: run.number(),
+        })
     }
 }
 
@@ -347,6 +429,8 @@ impl ObjectiveRuntime for LiveRuntime {
         let cancelled = self.cancellations.install(run);
         // A custom objective owns no ticket: it selects nothing, claims
         // nothing and writes no tracker, so no selection runs for it.
+        // The durable record still comes first: an effect without an
+        // owner record is exactly what a crash must not leave behind.
         if let Some(custom) = &request.objective {
             if request.work_ref.is_some() {
                 return Err(RuntimeError(
@@ -355,6 +439,13 @@ impl ObjectiveRuntime for LiveRuntime {
                 ));
             }
             let objective = custom_objective(custom, run);
+            if let Err(error) = self.open_record(&objective, run) {
+                return Ok(ObjectiveHandle::finished(outcome_of(
+                    AttemptEnd::InfraFailed {
+                        reason: error.to_string(),
+                    },
+                )));
+            }
             return Ok(self.handle(objective, None, cancelled));
         }
         // Work somebody else holds is not selected at all: it is not
@@ -389,6 +480,29 @@ impl ObjectiveRuntime for LiveRuntime {
                 ))));
             }
         };
+        // The requirements are read BEFORE the claim: they are a pure
+        // read, and work whose contract cannot be read was never worth
+        // claiming. The durable record is written BEFORE the claim too:
+        // a crash between the two then has an owner to recover.
+        let mut objective = match self.requirements.requirements(&item) {
+            Ok(objective) => objective,
+            Err(error) => {
+                return Ok(ObjectiveHandle::finished(outcome_of(
+                    AttemptEnd::Unverifiable {
+                        work_ref: item.id,
+                        reason: error.to_string(),
+                    },
+                )));
+            }
+        };
+        objective.run = Some(run.number());
+        if let Err(error) = self.open_record(&objective, run) {
+            return Ok(ObjectiveHandle::finished(outcome_of(
+                AttemptEnd::InfraFailed {
+                    reason: error.to_string(),
+                },
+            )));
+        }
         let epoch = match self.claims.claim(&item.id) {
             Ok(claimed) => claimed.epoch,
             Err(ClaimError::Denied { holder }) => {
@@ -408,19 +522,6 @@ impl ObjectiveRuntime for LiveRuntime {
         // The guard is created with the claim and travels with the attempt:
         // a dropped attempt (aborted) still gives the work back.
         let guard = ClaimGuard::new(self.claims.clone(), &item.id, epoch);
-        let mut objective = match self.requirements.requirements(&item) {
-            Ok(objective) => objective,
-            Err(error) => {
-                drop(guard);
-                return Ok(ObjectiveHandle::finished(outcome_of(
-                    AttemptEnd::Unverifiable {
-                        work_ref: item.id,
-                        reason: error.to_string(),
-                    },
-                )));
-            }
-        };
-        objective.run = Some(run.number());
         Ok(self.handle(objective, Some(guard), cancelled))
     }
 
@@ -459,14 +560,38 @@ impl LiveRuntime {
 }
 
 /// The objective a custom request carries: free-form work that owns no
-/// ticket, so it declares no tracker check and closes nothing.
-fn custom_objective(text: &str, run: RunId) -> Objective {
+/// ticket, so it selects nothing, claims nothing and closes nothing. It
+/// IS judged — by the one check the operator's termination criterion
+/// becomes. An objective without a criterion could never produce the
+/// evidence the promotion demands, so the CLI refuses one outright. Its
+/// identity carries the run: two custom objectives never share a goal
+/// record.
+pub(crate) fn custom_objective(custom: &CustomObjective, run: RunId) -> Objective {
     Objective {
-        work_ref: "custom-objective".to_string(),
-        instruction: text.trim().to_string(),
-        checks: Vec::new(),
+        work_ref: format!("custom-objective-{}", run.number()),
+        instruction: custom.instruction.trim().to_string(),
+        checks: vec![ObjectiveCheck::free(accept_check(&custom.accept))],
         run: Some(run.number()),
         closes: Closes::Nothing,
+    }
+}
+
+/// The operator's criterion as the executable check the verification
+/// demands: the check holds exactly when the command ends with the exit
+/// code that means fulfilled. An exit code other than zero must survive
+/// the shell, so the expectation is compiled into the command itself.
+fn accept_check(criterion: &goal::source::TerminationCriterion) -> verify::runner::Check {
+    let command = if criterion.expect_exit == 0 {
+        criterion.command.clone()
+    } else {
+        format!(
+            "( {} ); rc=$?; if [ \"$rc\" = {} ]; then exit 0; else echo \"the criterion exited $rc, expected {}\" >&2; exit 1; fi",
+            criterion.command, criterion.expect_exit, criterion.expect_exit
+        )
+    };
+    verify::runner::Check {
+        id: "accept".to_string(),
+        command,
     }
 }
 
@@ -549,10 +674,21 @@ async fn attempt(
         .publish(objective, &candidate, &verification)
         .await
     {
-        Ok(publication) => AttemptEnd::Published {
-            work_ref,
-            closure: publication.closure,
-            detail: publication.detail,
+        // A publication whose record settled ends as Published: the
+        // closure dimension says how the tracker reads. A publication
+        // whose record could NOT settle ends as PromotedUnconfirmed: the
+        // effect moved, so it is never mistaken for a promotion failure
+        // and never re-attempted.
+        Ok(publication) => match publication.checkpoint {
+            Checkpointed::Settled => AttemptEnd::Published {
+                work_ref,
+                closure: publication.closure,
+                detail: publication.detail,
+            },
+            Checkpointed::Uncertain => AttemptEnd::PromotedUnconfirmed {
+                work_ref,
+                detail: publication.detail,
+            },
         },
         Err(error) => AttemptEnd::PromotionFailed {
             work_ref,
@@ -569,8 +705,7 @@ mod tests {
     use super::*;
     use crate::ports::{
         AgentError, Closed, Closes, ObjectiveCheck, Publication, PublisherError, RequirementsError,
-        Verification,
-        VerifierError,
+        Verification, VerifierError,
     };
     use tracker::core::{WorkItem, WorkStatus};
     use tracker::fake::FakeTracker;
@@ -702,6 +837,7 @@ mod tests {
             Ok(Publication {
                 revision: "1f0c3a5b".into(),
                 closure: self.closure,
+                checkpoint: Checkpointed::Settled,
                 detail: "the publisher moved the effects".into(),
             })
         }
@@ -908,6 +1044,23 @@ mod tests {
                 "{end:?} must fail"
             );
         }
+        // A promoted effect with an unsettled record fails WITHOUT
+        // inviting a re-promotion: the reason says the effect moved.
+        let promoted_unconfirmed = outcome_of(AttemptEnd::PromotedUnconfirmed {
+            work_ref: "T-1".into(),
+            detail: "promoted 1f0c3a5b; the checkpoint was not confirmed".into(),
+        });
+        match promoted_unconfirmed {
+            ObjectiveOutcome::Failed { ref reason } => {
+                assert!(reason.contains("was promoted"), "{reason}");
+                assert!(
+                    !reason.contains("could not be promoted"),
+                    "an unsettled record is never a promotion failure: {reason}"
+                );
+                assert!(reason.contains("never be re-applied"), "{reason}");
+            }
+            other => panic!("a moved effect with an uncertain record must fail, got {other:?}"),
+        }
         assert_eq!(
             outcome_of(AttemptEnd::NoEligibleWork {
                 reason: "none".into(),
@@ -988,31 +1141,123 @@ mod tests {
         }
     }
 
-    /// A publisher that records what it was asked to close.
-    struct RegistryPublisher {
+    /// A publisher that runs the REAL evidence gate: the same
+    /// `require_evidence` the product's promotion applies before a
+    /// candidate moves. A verdict without evidence that speaks for the
+    /// candidate is refused here exactly as it is refused in production.
+    struct GatedPublisher {
         closures: Mutex<Vec<Closes>>,
     }
 
     #[async_trait::async_trait]
-    impl PublisherPort for RegistryPublisher {
+    impl PublisherPort for GatedPublisher {
         async fn publish(
             &self,
             objective: &Objective,
-            _candidate: &Candidate,
-            _verification: &Verification,
+            candidate: &Candidate,
+            verification: &Verification,
         ) -> Result<Publication, PublisherError> {
             if let Ok(mut closures) = self.closures.lock() {
                 closures.push(objective.closes);
             }
+            let evidence = verification
+                .evidence
+                .as_ref()
+                .ok_or_else(|| PublisherError {
+                    work_ref: objective.work_ref.clone(),
+                    reason: "the verdict carries no evidence".into(),
+                })?;
+            promote::evidence::require_evidence(
+                evidence,
+                &promote::evidence::PromotionCandidate {
+                    work_ref: objective.work_ref.clone(),
+                    revision: candidate.revision.clone(),
+                    transport_digest: candidate.transport_digest.clone(),
+                },
+            )
+            .map_err(|error| PublisherError {
+                work_ref: objective.work_ref.clone(),
+                reason: error.to_string(),
+            })?;
             let closure = match objective.closes {
                 Closes::Ticket => Closed::Confirmed,
                 Closes::Nothing => Closed::NotRequired,
             };
             Ok(Publication {
-                revision: "1f0c3a5b".into(),
+                revision: candidate.revision.as_str().to_string(),
                 closure,
-                detail: "the publisher moved the effects".into(),
+                checkpoint: Checkpointed::Settled,
+                detail: "the evidence gate held and the effects moved".into(),
             })
+        }
+    }
+
+    /// A verifier that mirrors the shape of the real verifier's output:
+    /// one result per declared check, bound to the candidate as observed.
+    /// The measurement itself belongs to the sandbox; THE GATE UNDER TEST
+    /// is the real `require_evidence`, which this feeds.
+    struct MeasuringVerifier;
+
+    #[async_trait::async_trait]
+    impl VerifierPort for MeasuringVerifier {
+        async fn verify(
+            &self,
+            objective: &Objective,
+            candidate: &Candidate,
+        ) -> Result<Verification, VerifierError> {
+            let binding = verify::evidence::EvidenceBinding {
+                revision: candidate.revision.clone(),
+                tree: candidate.tree.clone(),
+                transport_digest: candidate.transport_digest.clone(),
+                required_checks: objective
+                    .checks
+                    .iter()
+                    .map(|declared| verify::evidence::CheckBinding {
+                        id: declared.check.id.clone(),
+                        command: declared.check.command.clone(),
+                    })
+                    .collect(),
+                image_id: "sha256:image".to_string(),
+                environment: "env-1".to_string(),
+            };
+            let entries = objective
+                .checks
+                .iter()
+                .map(|declared| verify::evidence::EvidenceEntry {
+                    result: verify::evidence::BoundResult {
+                        check_id: declared.check.id.clone(),
+                        environment: "env-1".to_string(),
+                        image_id: "sha256:image".to_string(),
+                        tree: candidate.tree.clone(),
+                        transport_digest: candidate.transport_digest.clone(),
+                        command: declared.check.command.clone(),
+                        record: verify::result::ExecutionRecord::terminal(
+                            &declared.check.command,
+                            0,
+                            "the criterion held",
+                        ),
+                    },
+                    status: verify::evidence::EvidenceStatus::Valid,
+                })
+                .collect();
+            Ok(Verification {
+                satisfied: objective.required(),
+                evidence: Some(verify::evidence::EvidenceSet {
+                    work_ref: objective.work_ref.clone(),
+                    binding,
+                    entries,
+                }),
+            })
+        }
+    }
+
+    fn custom(text: &str) -> CustomObjective {
+        CustomObjective {
+            instruction: text.into(),
+            accept: goal::source::TerminationCriterion {
+                command: "test -f SUMMARY.md".into(),
+                expect_exit: 0,
+            },
         }
     }
 
@@ -1048,7 +1293,7 @@ mod tests {
 
         let agent = Arc::new(CountingAgent::default());
         let claims = Arc::new(FakeClaims::granting(7));
-        let publisher = Arc::new(RegistryPublisher {
+        let publisher = Arc::new(GatedPublisher {
             closures: Mutex::new(Vec::new()),
         });
         let tracker = Arc::new(CountingTracker {
@@ -1059,7 +1304,7 @@ mod tests {
             tracker.clone(),
             Arc::new(FixedRequirements),
             agent.clone(),
-            Arc::new(HoldingVerifier),
+            Arc::new(MeasuringVerifier),
             publisher.clone(),
             claims.clone(),
         );
@@ -1069,7 +1314,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "project".into(),
                     work_ref: None,
-                    objective: Some("summarise the docs".into()),
+                    objective: Some(custom("summarise the docs")),
                 },
             )
             .await
@@ -1078,10 +1323,10 @@ mod tests {
             .await;
 
         assert!(
-            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "custom-objective"),
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "custom-objective-3"),
             "{outcome:?}"
         );
-        assert_eq!(agent.seen(), vec!["custom-objective".to_string()]);
+        assert_eq!(agent.seen(), vec!["custom-objective-3".to_string()]);
         assert_eq!(claims.claim_calls(), 0, "a custom objective takes no claim");
         assert!(claims.releases().is_empty());
         assert_eq!(
@@ -1122,7 +1367,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "project".into(),
                     work_ref: Some("T-1".into()),
-                    objective: Some("summarise the docs".into()),
+                    objective: Some(custom("summarise the docs")),
                 },
             )
             .await;
@@ -1214,7 +1459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unverifiable_objective_never_reaches_the_agent_and_releases_the_claim() {
+    async fn an_unverifiable_objective_never_reaches_the_agent_nor_the_claim() {
         let agent = Arc::new(CountingAgent::default());
         let publisher = Arc::new(CountingPublisher::confirm_closing());
         let claims = Arc::new(FakeClaims::granting(3));
@@ -1233,7 +1478,14 @@ mod tests {
         );
         assert_eq!(agent.calls(), 0);
         assert_eq!(publisher.calls(), 0);
-        assert_eq!(claims.releases(), vec![("T-1".to_string(), 3)]);
+        // The contract is a pure read and runs before the claim: work
+        // whose contract cannot be read was never claimed, so there is
+        // nothing to give back.
+        assert_eq!(claims.claim_calls(), 0);
+        assert!(
+            claims.releases().is_empty(),
+            "work that was never claimed releases nothing"
+        );
     }
 
     #[tokio::test]
@@ -1308,6 +1560,65 @@ mod tests {
         assert_eq!(claims.releases(), vec![("T-1".to_string(), 13)]);
     }
 
+    /// A publisher that moves the effect and then reports the durable
+    /// record UNCERTAIN: the effect stands, the record does not.
+    struct UncertainRecordPublisher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PublisherPort for UncertainRecordPublisher {
+        async fn publish(
+            &self,
+            _objective: &Objective,
+            _candidate: &Candidate,
+            _verification: &Verification,
+        ) -> Result<Publication, PublisherError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Publication {
+                revision: "1f0c3a5b".into(),
+                closure: Closed::Confirmed,
+                checkpoint: Checkpointed::Uncertain,
+                detail: "promoted 1f0c3a5b; the checkpoint was not confirmed".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_promoted_effect_with_an_uncertain_record_never_invites_a_re_promotion() {
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(UncertainRecordPublisher {
+            calls: AtomicUsize::new(0),
+        });
+        let claims = Arc::new(FakeClaims::granting(47));
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            agent,
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match outcome {
+            ObjectiveOutcome::Failed { ref reason } => {
+                assert!(reason.contains("was promoted"), "{reason}");
+                assert!(
+                    !reason.contains("could not be promoted"),
+                    "the effect moved: this is not a promotion failure: {reason}"
+                );
+            }
+            other => panic!("an unsettled record is a failure, got {other:?}"),
+        }
+        assert_eq!(
+            publisher.calls.load(Ordering::SeqCst),
+            1,
+            "the attempt ends in ONE verdict: the effect is not retried"
+        );
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 47)]);
+    }
+
     /// A tracker whose snapshot MOVES: the closing publisher marks the
     /// work it published as done, the way the official tracker does when
     /// the closure lands. The chained selection then advances instead of
@@ -1353,6 +1664,7 @@ mod tests {
             Ok(Publication {
                 revision: "1f0c3a5b".into(),
                 closure: Closed::Confirmed,
+                checkpoint: Checkpointed::Settled,
                 detail: "the closure moved the ticket".into(),
             })
         }
@@ -1668,6 +1980,7 @@ mod tests {
                 Ok(Publication {
                     revision: "1f0c3a5b".into(),
                     closure: Closed::Confirmed,
+                    checkpoint: Checkpointed::Settled,
                     detail: "the publisher moved the effects".into(),
                 })
             }

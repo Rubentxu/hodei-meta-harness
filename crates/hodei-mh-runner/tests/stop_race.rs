@@ -12,9 +12,9 @@ use run::run::Phase;
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId};
 use runner::live::{ClaimError, ClaimPort, Claimed, LiveRuntime};
 use runner::ports::{
-    AgentError, AgentPort, Closed, Closes, Objective, ObjectiveCheck, Publication, PublisherError,
-    PublisherPort,
-    RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
+    AgentError, AgentPort, Checkpointed, Closed, Closes, Objective, ObjectiveCheck, Publication,
+    PublisherError, PublisherPort, RequirementsError, RequirementsPort, Verification,
+    VerifierError, VerifierPort,
 };
 use supervisor::engine::{self, Transition};
 use supervisor::protocol::SupervisorAction;
@@ -92,6 +92,7 @@ impl PublisherPort for GatedPublisher {
         Ok(Publication {
             revision: "1f0c3a5b".into(),
             closure: Closed::Confirmed,
+            checkpoint: Checkpointed::Settled,
             detail: "the publisher moved the effects".into(),
         })
     }

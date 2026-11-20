@@ -131,6 +131,21 @@ impl Verification {
     }
 }
 
+/// The state of the durable attempt record once the effects moved.
+///
+/// The record is a SEPARATE fact from the closure: an effect that moved
+/// but whose record could not be settled is never re-applied to fix the
+/// record, and it is never reported as a promotion failure inviting a
+/// second promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpointed {
+    /// The record says the effect moved: it must not happen again.
+    Settled,
+    /// The effect moved and the record could not say so: the effect is
+    /// durable, only the record is uncertain.
+    Uncertain,
+}
+
 /// How the closure of a publication ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closed {
@@ -149,6 +164,8 @@ pub struct Publication {
     pub revision: String,
     /// How the closure ended.
     pub closure: Closed,
+    /// Whether the durable record settled with the effect.
+    pub checkpoint: Checkpointed,
     /// What happened, in words.
     pub detail: String,
 }
