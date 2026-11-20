@@ -6,8 +6,8 @@
 //! the claim is released exactly once whichever way it ends.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use run::runtime::{
     ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RuntimeError,
@@ -44,6 +44,15 @@ pub trait ClaimPort: Send + Sync {
     /// Give the work back. Called once per successful claim, whatever the
     /// attempt ended with.
     fn release(&self, work_ref: &str, epoch: u64);
+
+    /// The claims held right now, as work ref → holder.
+    ///
+    /// Selection reads it so work somebody else holds is skipped instead
+    /// of selected and denied afterwards. The default is empty: a store
+    /// that models no other holder has nothing to report.
+    fn claims(&self) -> Result<BTreeMap<String, String>, ClaimError> {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// How a live attempt ended, before it is read as an objective outcome.
@@ -186,7 +195,11 @@ pub struct LiveRuntime {
     verifier: Arc<dyn VerifierPort>,
     publisher: Arc<dyn PublisherPort>,
     claims: Arc<dyn ClaimPort>,
-    cancelled: Arc<AtomicBool>,
+    /// The cancellation flag of the CURRENT attempt. Every start REPLACES
+    /// it, so a stop raised for one attempt cannot be read by the next
+    /// one, and a stop cannot be missed because a previous attempt reset
+    /// the flag it belonged to.
+    cancelled: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl LiveRuntime {
@@ -210,14 +223,23 @@ impl LiveRuntime {
             verifier,
             publisher,
             claims,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: Mutex::new(None),
         }
     }
 
     /// Ask the current attempt to stop after the agent returns. The
     /// attempt then releases its claim without verifying or publishing.
+    ///
+    /// A stop that arrives when no attempt is in flight changes nothing:
+    /// it never reaches an attempt that has not started yet.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        let slot = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(flag) = slot.as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
     }
 
     fn runner(&self) -> GoalRunner {
@@ -244,12 +266,32 @@ impl ObjectiveRuntime for LiveRuntime {
                 self.project, request.project
             )));
         }
-        // A cancellation belongs to the attempt it was raised for, never
-        // to the next one.
-        self.cancelled.store(false, Ordering::SeqCst);
+        // A cancellation belongs to the attempt it was raised for: the
+        // attempt gets a FRESH flag, and a stop raised for an earlier
+        // attempt can neither silence this one nor be lost on it.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut slot = self
+                .cancelled
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *slot = Some(cancelled.clone());
+        }
+        // Work somebody else holds is not selected at all: it is not
+        // eligible, and the chain skips it.
+        let held = match self.claims.claims() {
+            Ok(held) => held,
+            Err(error) => {
+                return Ok(ObjectiveHandle::finished(outcome_of(
+                    AttemptEnd::InfraFailed {
+                        reason: format!("the held claims could not be read: {error}"),
+                    },
+                )));
+            }
+        };
         let selected = self
             .runner()
-            .select_in(request.work_ref.as_deref(), &BTreeMap::new())
+            .select_in(request.work_ref.as_deref(), &held)
             .await;
         let item = match selected {
             Ok(Some(item)) => item,
@@ -301,12 +343,26 @@ impl ObjectiveRuntime for LiveRuntime {
         let agent = self.agent.clone();
         let verifier = self.verifier.clone();
         let publisher = self.publisher.clone();
-        let cancelled = self.cancelled.clone();
         Ok(ObjectiveHandle::new(async move {
-            let end = attempt(&objective, agent, verifier, publisher, cancelled).await;
+            // A stop that arrived while the attempt was being set up ends
+            // it before any effect: no sandbox is created for work nobody
+            // wants anymore, and the claim goes back with the attempt.
+            let end = if cancelled.load(Ordering::SeqCst) {
+                AttemptEnd::Cancelled {
+                    work_ref: objective.work_ref.clone(),
+                }
+            } else {
+                attempt(&objective, agent, verifier, publisher, cancelled).await
+            };
             drop(guard);
             outcome_of(end)
         }))
+    }
+
+    /// Signal the current attempt: it ends after the agent returns, without
+    /// verifying or publishing, and releases everything it owns.
+    fn cancel(&self) {
+        LiveRuntime::cancel(self)
     }
 }
 
@@ -382,7 +438,7 @@ async fn attempt(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::ports::{
@@ -423,18 +479,29 @@ mod tests {
     #[derive(Default)]
     struct CountingAgent {
         calls: AtomicUsize,
+        seen: Mutex<Vec<String>>,
     }
 
     impl CountingAgent {
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        }
     }
 
     #[async_trait::async_trait]
     impl AgentPort for CountingAgent {
-        async fn execute(&self, _objective: &Objective) -> Result<Candidate, AgentError> {
+        async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(objective.work_ref.clone());
+            }
             Ok(candidate())
         }
     }
@@ -514,6 +581,7 @@ mod tests {
         grant: Option<Claimed>,
         claim_calls: AtomicUsize,
         releases: Mutex<Vec<(String, u64)>>,
+        held: BTreeMap<String, String>,
     }
 
     impl FakeClaims {
@@ -522,6 +590,7 @@ mod tests {
                 grant: Some(Claimed { epoch }),
                 claim_calls: AtomicUsize::new(0),
                 releases: Mutex::new(Vec::new()),
+                held: BTreeMap::new(),
             }
         }
 
@@ -530,6 +599,20 @@ mod tests {
                 grant: None,
                 claim_calls: AtomicUsize::new(0),
                 releases: Mutex::new(Vec::new()),
+                held: BTreeMap::new(),
+            }
+        }
+
+        /// A claim store that already reports `held` and grants `epoch`.
+        fn holding(epoch: u64, held: &[(&str, &str)]) -> Self {
+            Self {
+                grant: Some(Claimed { epoch }),
+                claim_calls: AtomicUsize::new(0),
+                releases: Mutex::new(Vec::new()),
+                held: held
+                    .iter()
+                    .map(|(work_ref, holder)| (work_ref.to_string(), holder.to_string()))
+                    .collect(),
             }
         }
 
@@ -560,6 +643,10 @@ mod tests {
             if let Ok(mut releases) = self.releases.lock() {
                 releases.push((work_ref.to_string(), epoch));
             }
+        }
+
+        fn claims(&self) -> Result<BTreeMap<String, String>, ClaimError> {
+            Ok(self.held.clone())
         }
     }
 
@@ -744,6 +831,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_claims_are_skipped_by_selection_and_not_eligible_by_name() {
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::holding(7, &[("T-1", "another-agent")]));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open), item("T-2", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        // Unnamed: the claimed work is skipped, not selected and denied
+        // afterwards.
+        let outcome = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "T-2"),
+            "{outcome:?}"
+        );
+        assert_eq!(agent.seen(), vec!["T-2".to_string()]);
+        assert_eq!(claims.releases(), vec![("T-2".to_string(), 7)]);
+
+        // Named: the claimed work is not eligible, and nothing runs.
+        let named = outcome_of_start(&runtime, Some("T-1")).await;
+        assert!(
+            matches!(named, ObjectiveOutcome::Rejected { ref reason, .. } if reason.contains("ClaimedBy")),
+            "{named:?}"
+        );
+        assert_eq!(agent.calls(), 1, "named claimed work costs no agent call");
+    }
+
+    #[tokio::test]
     async fn a_denied_claim_never_reaches_the_agent() {
         let agent = Arc::new(CountingAgent::default());
         let publisher = Arc::new(CountingPublisher::confirm_closing());
@@ -886,9 +1005,79 @@ mod tests {
             matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
             "{outcome:?}"
         );
-        assert_eq!(agent.calls(), 1);
+        assert_eq!(
+            agent.calls(),
+            0,
+            "a stop that precedes the attempt costs no effect"
+        );
         assert_eq!(publisher.calls(), 0);
         assert_eq!(claims.releases(), vec![("T-1".to_string(), 17)]);
+    }
+
+    #[tokio::test]
+    async fn a_cooperative_stop_lets_the_attempt_end_and_releases_its_claim() {
+        // An agent that winds down when the stop reaches it — the way the
+        // real one closes its session and releases its sandbox — instead
+        // of being dropped mid-flight.
+        struct WindingDownAgent {
+            started: Arc<tokio::sync::Notify>,
+            gate: Arc<tokio::sync::Notify>,
+            closed: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentPort for WindingDownAgent {
+            async fn execute(&self, _objective: &Objective) -> Result<Candidate, AgentError> {
+                self.started.notify_one();
+                self.gate.notified().await;
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(candidate())
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let claims = Arc::new(FakeClaims::granting(23));
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            Arc::new(WindingDownAgent {
+                started: started.clone(),
+                gate: gate.clone(),
+                closed: closed.clone(),
+            }),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+        );
+        let handle = start(&runtime, None)
+            .await
+            .expect("the runtime accepts the objective");
+        let completion = tokio::spawn(async move { handle.completion().await });
+        // The attempt is inside the agent when the stop arrives.
+        started.notified().await;
+        // The stop is a SIGNAL: the attempt returns and closes what it owns
+        // instead of being dropped.
+        runtime.cancel();
+        gate.notify_one();
+        let outcome = completion.await.expect("the attempt ends");
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
+            "{outcome:?}"
+        );
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the attempt reached its own end and closed its session"
+        );
+        assert_eq!(
+            publisher.calls(),
+            0,
+            "a cancelled attempt publishes nothing"
+        );
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 23)]);
     }
 
     #[tokio::test]

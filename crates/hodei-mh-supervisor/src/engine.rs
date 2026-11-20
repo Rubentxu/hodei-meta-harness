@@ -68,6 +68,11 @@ pub struct SupervisorCore {
     /// work held: the outcome of an interrupted objective is uncertain
     /// and the snapshot says why it is not known.
     pub stop_reason: Option<String>,
+    /// Whether an attempt the controller started is still winding down
+    /// after a Stop. A Start is refused while one is, so two attempts are
+    /// never in flight together; whoever owns the attempt clears it once
+    /// the attempt has ended.
+    pub winding_down: bool,
     pub resources: ResourceObservation,
     pub context_available: bool,
     pub ttl_remaining_seconds: Option<u64>,
@@ -97,6 +102,7 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         runtime: None,
         objective: None,
         stop_reason: None,
+        winding_down: false,
         resources: ResourceObservation::Unknown {
             reason: "no telemetry yet".into(),
         },
@@ -336,6 +342,14 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                     false,
                     "a run is already in flight: not a second controller",
                 )
+            } else if core.winding_down {
+                // The stopped attempt may still be releasing its sandbox
+                // and its session: a new one would run beside it.
+                outcome(
+                    &action,
+                    false,
+                    "the previous attempt is still winding down: one attempt at a time",
+                )
             } else {
                 core.epoch += 1;
                 let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
@@ -405,14 +419,25 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
             match stopped {
                 Some((was_starting, cancelled, irreversible)) => {
                     core.paused = false;
-                    // The objective was interrupted: its effects are not a
-                    // verdict, so none is claimed. The cancellation is
-                    // recorded WITH its uncertainty.
-                    core.objective = None;
-                    let reason = if was_starting {
-                        "stopped before the runtime confirmed: the objective is cancelled and its outcome is uncertain"
-                    } else {
-                        "stopped by the user: the objective is cancelled and its outcome is uncertain"
+                    // A Stop ends the session: it does not un-say what
+                    // already happened. A recorded verdict — a confirmed
+                    // effect above all — stands beside the stop; only a run
+                    // that produced NO verdict is reported as uncertain.
+                    let uncertain = core.objective.is_none();
+                    core.winding_down = true;
+                    let reason = match (was_starting, uncertain) {
+                        (true, true) => {
+                            "stopped before the runtime confirmed: the objective is cancelled and its outcome is uncertain"
+                        }
+                        (false, true) => {
+                            "stopped by the user: the objective is cancelled and its outcome is uncertain"
+                        }
+                        (true, false) => {
+                            "stopped before the runtime confirmed: the session ended and the recorded verdict of the objective stands"
+                        }
+                        (false, false) => {
+                            "stopped by the user: the session ended and the recorded verdict of the objective stands"
+                        }
                     };
                     core.stop_reason = Some(reason.to_string());
                     emit_event(
@@ -420,7 +445,7 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                         "objective/cancelled",
                         serde_json::json!({
                             "reason": reason,
-                            "uncertain": true,
+                            "uncertain": uncertain,
                         }),
                         Provenance::Human,
                     );
@@ -428,12 +453,7 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
                         &action,
                         true,
                         format!(
-                            "stopped{}; cancelled_processes={cancelled:?}; irreversible={irreversible:?}; the objective is cancelled and its outcome is uncertain",
-                            if was_starting {
-                                " before the runtime confirmed"
-                            } else {
-                                ""
-                            }
+                            "{reason}; cancelled_processes={cancelled:?}; irreversible={irreversible:?}"
                         ),
                     )
                 }
@@ -529,6 +549,10 @@ pub fn record_outcome(
             core.epoch
         ));
     }
+    // The outcome is the attempt telling us it has ended: whether the
+    // verdict is recorded or not, no attempt of this run is winding down
+    // any more, and the next Start may proceed.
+    core.winding_down = false;
     // The outcome belongs to a LIVE run: a run that was stopped or
     // dropped does not get a verdict afterwards.
     let live = core.run.as_ref().is_some_and(|run| run.is_live());
@@ -965,6 +989,8 @@ mod tests {
         assert_eq!(core.epoch, epoch_after_start);
         // A new run after a stop advances it again.
         apply(&mut core, SupervisorAction::Stop);
+        // The stopped attempt has ended: its wind-down is over.
+        core.winding_down = false;
         let second = started(&mut core);
         assert_eq!(core.epoch, 2);
         assert_eq!(second, 2);
@@ -1140,24 +1166,15 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_marks_the_objective_cancelled_and_uncertain() {
+    fn a_stop_without_a_verdict_is_cancelled_and_uncertain() {
         let mut core = wired("gc");
-        let epoch = started(&mut core);
-        record_outcome(
-            &mut core,
-            epoch,
-            ObjectiveOutcome::Confirmed {
-                work_ref: "TASK-1".into(),
-                detail: "published".into(),
-            },
-        );
-        assert!(core.objective.is_some());
+        started(&mut core);
 
         let stop = apply(&mut core, SupervisorAction::Stop);
         assert!(stop.applied, "{}", stop.detail);
         assert!(
             core.objective.is_none(),
-            "an interrupted objective has no verdict"
+            "an interrupted objective produced no verdict"
         );
         let reason = core.stop_reason.as_deref().expect("a stop reason");
         assert!(reason.contains("uncertain"), "{reason}");
@@ -1169,6 +1186,86 @@ mod tests {
             .expect("the cancellation event");
         assert_eq!(cancelled.payload["uncertain"], serde_json::json!(true));
         assert_eq!(snapshot(&core).phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn a_stop_after_a_confirmed_objective_keeps_the_verdict() {
+        let mut core = wired("gc");
+        let epoch = started(&mut core);
+        record_outcome(
+            &mut core,
+            epoch,
+            ObjectiveOutcome::Confirmed {
+                work_ref: "TASK-1".into(),
+                detail: "published 1f0c3a5b".into(),
+            },
+        );
+
+        let stop = apply(&mut core, SupervisorAction::Stop);
+        assert!(stop.applied, "{}", stop.detail);
+        // A confirmed effect is a fact of the past: the stop ends the
+        // session, it does not relabel the verdict as unknown.
+        let objective = core
+            .objective
+            .as_ref()
+            .expect("the confirmed verdict stands");
+        assert_eq!(objective.work_ref.as_deref(), Some("TASK-1"));
+        assert!(matches!(
+            objective.outcome,
+            ObjectiveOutcome::Confirmed { .. }
+        ));
+        let reason = core.stop_reason.as_deref().expect("a stop reason");
+        assert!(!reason.contains("uncertain"), "{reason}");
+        assert!(reason.contains("verdict"), "{reason}");
+        assert!(!stop.detail.contains("uncertain"), "{}", stop.detail);
+        let cancelled = core
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "objective/cancelled")
+            .expect("the session stop event");
+        assert_eq!(cancelled.payload["uncertain"], serde_json::json!(false));
+        assert_eq!(snapshot(&core).phase, Phase::Stopped);
+    }
+
+    #[test]
+    fn a_start_while_the_stopped_attempt_winds_down_is_refused() {
+        let mut core = wired("gc");
+        started(&mut core);
+        apply(&mut core, SupervisorAction::Stop);
+        assert!(core.winding_down, "the stop begins the wind-down");
+
+        let project = core.project.clone();
+        let concurrent = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project: project.clone(),
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(!concurrent.applied);
+        assert!(
+            concurrent.detail.contains("winding down"),
+            "{}",
+            concurrent.detail
+        );
+        assert_eq!(
+            core.run.as_ref().map(|run| run.phase().clone()),
+            Some(Phase::Stopped)
+        );
+
+        // The attempt has ended: the next attempt may start.
+        core.winding_down = false;
+        let next = apply(
+            &mut core,
+            SupervisorAction::Start {
+                project,
+                ticket: None,
+                revision: None,
+            },
+        );
+        assert!(next.applied, "{}", next.detail);
     }
 
     #[test]

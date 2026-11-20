@@ -170,6 +170,18 @@ pub trait ObjectiveRuntime: Send + Sync {
     /// Take the objective and confirm it.
     async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError>;
 
+    /// Ask the current attempt to stop.
+    ///
+    /// This is a SIGNAL, not a drop: the attempt is expected to wind down
+    /// on its own and return its outcome, so it can release what it owns
+    /// (a sandbox, a session, a claim). The controller keeps a bounded
+    /// grace and aborts the attempt only when the signal is ignored.
+    ///
+    /// The default does nothing: a runtime whose attempts cannot be
+    /// interrupted cooperatively has no signal to offer, and the
+    /// controller's grace is what ends them.
+    fn cancel(&self) {}
+
     /// Extend the ttl of the managed environment by `added_seconds`.
     ///
     /// The default is honest about what most runtimes can do: without a

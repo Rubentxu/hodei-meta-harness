@@ -5,6 +5,7 @@
 //! with; the runtime's guard owns the release, so an aborted attempt
 //! releases it too.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -68,6 +69,22 @@ impl ClaimPort for StoreClaims {
             Ok(())
         });
     }
+
+    /// The claims the coordinator holds right now.
+    ///
+    /// A store that cannot be read is an ERROR, never an empty snapshot:
+    /// selection over unseen claims would pick work somebody else owns.
+    fn claims(&self) -> Result<BTreeMap<String, String>, ClaimError> {
+        let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = store.load().map_err(|error| ClaimError::Unavailable {
+            reason: error.to_string(),
+        })?;
+        Ok(state
+            .claims
+            .iter()
+            .map(|(ticket, claim)| (ticket.clone(), claim.holder.clone()))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +119,16 @@ mod tests {
             .expect("the released work is free again");
         assert_eq!(second.epoch, 2, "every grant advances the fencing epoch");
         claims.release("T-1", second.epoch);
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn the_held_claims_are_reported_for_selection() {
+        let (claims, path) = claims("snapshot");
+        claims.claim("T-1").expect("the work is free");
+        let held = claims.claims().expect("the snapshot is readable");
+        assert_eq!(held.get("T-1").map(String::as_str), Some(LIVE_HOLDER));
+        assert!(!held.contains_key("T-2"), "{held:?}");
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
     }
 

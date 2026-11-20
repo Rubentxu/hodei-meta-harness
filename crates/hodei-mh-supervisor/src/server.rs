@@ -35,6 +35,14 @@ use crate::protocol::{PROTOCOL_VERSION, Request, Response, SupervisorAction};
 /// deadline turns that into an explicit, visible failure.
 pub const CONFIRMATION_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a stopped attempt has to wind down before it is aborted.
+///
+/// The stop is a cooperative signal first: the attempt returns, closes its
+/// session and releases its sandbox. Only an attempt that ignores the
+/// signal is aborted, and the durable journal is still the safety net for
+/// whatever it left behind.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(30);
+
 /// How many bytes one request line may weigh. A client that never ends
 /// its line is cut off here instead of filling the memory of the host.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -527,7 +535,11 @@ async fn handle_connection(
                     epoch,
                 );
             }
-            FollowUp::Cancel => cancel_execution(&pending),
+            FollowUp::Cancel => {
+                cancel_execution(runtime.as_ref(), &pending, CANCEL_GRACE).await;
+                // The attempt has ended, whichever way: a new one may run.
+                lock_core(&core).winding_down = false;
+            }
         }
     }
     Ok(())
@@ -663,13 +675,33 @@ fn spawn_execution(
     }
 }
 
-/// Cancel the in-flight execution: the user stopped the run.
-fn cancel_execution(pending: &Pending) {
-    let mut slot = pending
+/// Stop the in-flight execution: the user stopped the run.
+///
+/// The stop is a SIGNAL first, through the runtime, and only then a
+/// deadline. Aborting straight away drops the attempt mid-flight, so the
+/// agent never reaches its `session.close()` and the sandbox outlives the
+/// stop; a cooperative wind-down lets the attempt release what it owns.
+/// An attempt that ignores the signal is aborted after `grace`, and the
+/// journal still names the sandbox to reconcile.
+async fn cancel_execution(
+    runtime: Option<&Arc<dyn ObjectiveRuntime>>,
+    pending: &Pending,
+    grace: Duration,
+) {
+    if let Some(runtime) = runtime {
+        runtime.cancel();
+    }
+    let handle = pending
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(handle) = slot.take() {
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(mut handle) = handle else {
+        return;
+    };
+    if tokio::time::timeout(grace, &mut handle).await.is_err() {
+        // The last resort: the attempt did not wind down in time.
         handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -834,6 +866,7 @@ mod tests {
     use super::*;
     use crate::protocol::SupervisorAction;
     use run::runtime::{ObjectiveHandle, RenewOutcome, RuntimeError, RuntimeIdentity};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A runtime whose renewal answer is scripted: the server must pass it
     /// through, not invent one.
@@ -1037,5 +1070,119 @@ mod tests {
             ),
             other => panic!("expected a snapshot, got {other:?}"),
         }
+    }
+
+    /// A runtime that delivers its stop to the attempt it owns, the way the
+    /// live runtime does: the attempt winds down by itself.
+    struct SignallingRuntime {
+        cancelled: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectiveRuntime for SignallingRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::live("signalling")
+        }
+
+        async fn start(&self, _request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+            Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
+                reason: "nothing to do".into(),
+            }))
+        }
+
+        fn cancel(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+            self.gate.notify_one();
+        }
+    }
+
+    fn signalling(
+        cancelled: &Arc<AtomicBool>,
+        gate: &Arc<tokio::sync::Notify>,
+    ) -> Arc<dyn ObjectiveRuntime> {
+        Arc::new(SignallingRuntime {
+            cancelled: cancelled.clone(),
+            gate: gate.clone(),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_signals_the_runtime_and_lets_the_attempt_wind_down() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runtime = signalling(&cancelled, &gate);
+        // The attempt: it ends when the stop reaches it, the way an ACP
+        // session closes its own conversation and sandbox.
+        let wound_down = Arc::new(AtomicBool::new(false));
+        let flag = wound_down.clone();
+        let waiter = gate.clone();
+        let attempt = tokio::spawn(async move {
+            waiter.notified().await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        let pending: Pending = Arc::new(Mutex::new(Some(attempt)));
+
+        let started = tokio::time::Instant::now();
+        cancel_execution(Some(&runtime), &pending, CANCEL_GRACE).await;
+
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the runtime was told to stop"
+        );
+        assert!(
+            wound_down.load(Ordering::SeqCst),
+            "the attempt wound down on its own"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::ZERO,
+            "a cooperative attempt is never aborted"
+        );
+        assert!(
+            pending.lock().expect("lock").is_none(),
+            "the handle was consumed"
+        );
+    }
+
+    /// Marks that the attempt's future was DROPPED: an abort is the only
+    /// thing that drops an attempt that never ends on its own.
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_ignores_the_stop_is_aborted_only_after_the_grace() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let runtime = signalling(&cancelled, &Arc::new(tokio::sync::Notify::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let attempt = tokio::spawn(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+        let pending: Pending = Arc::new(Mutex::new(Some(attempt)));
+
+        let started = tokio::time::Instant::now();
+        cancel_execution(Some(&runtime), &pending, CANCEL_GRACE).await;
+
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the signal was sent before the abort"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "an attempt that ignores the stop is aborted"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            CANCEL_GRACE,
+            "the abort waited for the whole grace"
+        );
+        assert!(pending.lock().expect("lock").is_none());
     }
 }

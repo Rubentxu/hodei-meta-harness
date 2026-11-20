@@ -6,6 +6,7 @@
 //! and the tree are read before the sandbox goes away — so the
 //! verification judges the very commit the agent produced.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use opensandbox::acp::AcpAssembler;
@@ -48,6 +49,12 @@ const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// How long the cleanup of the agent session may take.
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The stop reason of a turn the agent ended on its own.
+///
+/// Any other reason — a refusal, a cancellation — means the agent did not
+/// finish the work it was asked for, whatever it produced along the way.
+const END_TURN: &str = "end_turn";
 
 /// The credentials of the agent. They come from the environment of this
 /// process only, and they are never printed: the debug representation
@@ -197,11 +204,12 @@ impl AcpAgent {
                 Self::failure(work_ref, format!("the bundle directory: {error}"))
             })?;
         }
-        let reference = format!("refs/heads/{}", self.config.managed_branch);
-        hodei_mh_workspace::git::create_bundle(&self.config.project_dir, &path, &reference)
-            .map_err(|error| Self::failure(work_ref, error))?;
-        promote::git::candidate_head(&path, crate::live::publisher::CANDIDATE_BRANCH)
-            .map_err(|error| Self::failure(work_ref, error))
+        managed_bundle(
+            &self.config.project_dir,
+            &path,
+            &self.config.managed_branch,
+            work_ref,
+        )
     }
 
     /// Pack the pinned ACP adapter on the host and stage it in the
@@ -310,6 +318,30 @@ impl AgentPort for AcpAgent {
     }
 }
 
+/// Build the bundle of the managed branch and return the base commit it
+/// carries.
+///
+/// The base is read from the MANAGED branch's ref inside the bundle: that
+/// is the state the attempt starts from. The `main` branch a sandbox
+/// export happens to name is a different fact, and it is not in this
+/// bundle at all.
+fn managed_bundle(
+    project_dir: &Path,
+    bundle_path: &Path,
+    managed_branch: &str,
+    work_ref: &str,
+) -> Result<String, AgentError> {
+    let failure = |reason: String| AgentError {
+        work_ref: work_ref.to_string(),
+        reason,
+    };
+    let reference = format!("refs/heads/{managed_branch}");
+    hodei_mh_workspace::git::create_bundle(project_dir, bundle_path, &reference)
+        .map_err(|error| failure(error.to_string()))?;
+    promote::git::candidate_head(bundle_path, managed_branch)
+        .map_err(|error| failure(error.to_string()))
+}
+
 /// The command that recreates the managed state inside the sandbox.
 fn prepare_command(managed_branch: &str) -> String {
     format!(
@@ -335,6 +367,26 @@ fn instruction_for(instruction: &str) -> String {
 pub struct AcpTurn {
     pub completed: bool,
     pub summary: String,
+}
+
+impl AcpTurn {
+    /// Read the answer of the prompt turn.
+    ///
+    /// The turn is COMPLETED only when the agent says it ended it. A
+    /// refusal or a cancellation answers the prompt too, but the work was
+    /// not done: promoting it would publish what the agent declined to
+    /// produce. The stop reason is always kept in the summary, so the
+    /// record says which of the two happened.
+    fn of_prompt_result(result: &Value, text_len: usize) -> Self {
+        let stop_reason = result
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or("no stop reason");
+        Self {
+            completed: stop_reason == END_TURN,
+            summary: format!("{stop_reason}, text_len={text_len}"),
+        }
+    }
 }
 
 /// Drive one ACP conversation: initialize, open a session, send the
@@ -436,9 +488,7 @@ pub async fn drive_agent(
                         && phase == 2
                         && message["result"].get("stopReason").is_some()
                     {
-                        turn.completed = true;
-                        turn.summary = format!("end_turn, text_len={}", agent_text.len());
-                        return turn;
+                        return AcpTurn::of_prompt_result(&message["result"], agent_text.len());
                     }
                 }
             }
@@ -476,6 +526,7 @@ fn permission_answer(message: &Value, permission: PermissionMode) -> Value {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn config() -> LiveConfig {
         LiveConfig {
@@ -530,5 +581,72 @@ mod tests {
             permission_answer(&message, PermissionMode::AllowOnce)["outcome"]["optionId"],
             json!("a")
         );
+    }
+
+    #[test]
+    fn only_an_end_turn_completes_the_turn() {
+        let ended = AcpTurn::of_prompt_result(&json!({"stopReason": "end_turn"}), 42);
+        assert!(ended.completed);
+        assert_eq!(ended.summary, "end_turn, text_len=42");
+
+        // A refusal (what `--permission deny` produces) or a cancellation
+        // answers the prompt, but the work was not done.
+        for reason in ["refusal", "cancelled"] {
+            let turn = AcpTurn::of_prompt_result(&json!({"stopReason": reason}), 42);
+            assert!(!turn.completed, "{reason} is not a completed turn");
+            assert!(
+                turn.summary.contains(reason),
+                "the actual stop reason is kept: {}",
+                turn.summary
+            );
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git is available");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn fixture_repo(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hodei-live-agent-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        hodei_mh_workspace::git::init_fixture_repo(&dir).expect("the fixture repository");
+        dir
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str, message: &str) -> String {
+        std::fs::write(dir.join(name), content).expect("the fixture file");
+        git(dir, &["add", "-A"]);
+        hodei_mh_workspace::git::commit_index(dir, message).expect("the fixture commits")
+    }
+
+    #[test]
+    fn the_base_is_read_from_the_managed_branch_inside_the_bundle() {
+        let repo = fixture_repo("bundle-base");
+        let managed = commit_file(&repo, "managed.txt", "managed\n", "managed state");
+        let main = commit_file(&repo, "main.txt", "main\n", "main moved on");
+        assert_ne!(managed, main);
+        // The managed branch stays on the earlier commit: the two heads
+        // name different states, and the bundle only carries the managed
+        // one.
+        git(&repo, &["update-ref", "refs/heads/hodei-mh/main", &managed]);
+
+        let bundle = repo.join("candidate.bundle");
+        let base = managed_bundle(&repo, &bundle, "hodei-mh/main", "TASK-1")
+            .expect("the base of the managed branch");
+        assert_eq!(base, managed, "the base is the managed state");
+        assert_ne!(base, main, "the base is not the main branch");
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
