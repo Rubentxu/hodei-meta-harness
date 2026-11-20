@@ -614,6 +614,30 @@ struct AgentProbeResult {
     checks: Vec<ProbeCheck>,
 }
 
+/// How many characters of the agent's text the prompt probe records.
+const AGENT_TEXT_TAIL_LIMIT: usize = 400;
+
+/// The last `limit` characters of `text`, in reading order.
+///
+/// The tail of a reversed iterator must be reversed back before it is
+/// printed: an error record that reads "L .noitaerc" tells the reader
+/// nothing about what the agent was doing.
+fn readable_tail(text: &str, limit: usize) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let start = characters.len().saturating_sub(limit);
+    characters[start..].iter().collect()
+}
+
+/// The record the prompt turn leaves in the probe: the stop reason and
+/// the agent's last words, in reading order.
+fn prompt_response_detail(answer: &Value, agent_text: &str) -> String {
+    format!(
+        "stopReason={:?} agent_text_tail={:?}",
+        answer.get("stopReason"),
+        readable_tail(agent_text, AGENT_TEXT_TAIL_LIMIT)
+    )
+}
+
 /// Drive the ACP v1 conversation over the pipe: initialize, session/new,
 /// session/prompt, collect structured events, verify stderr separation,
 /// then cancel and observe process release.
@@ -700,16 +724,7 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
             checks.push(ProbeCheck {
                 name: "acp-prompt-response",
                 passed: answer.get("stopReason").is_some(),
-                detail: format!(
-                    "stopReason={:?} agent_text_tail={:?}",
-                    answer.get("stopReason"),
-                    dialogue
-                        .agent_text()
-                        .chars()
-                        .rev()
-                        .take(400)
-                        .collect::<String>()
-                ),
+                detail: prompt_response_detail(&answer, dialogue.agent_text()),
             });
             checks.push(ProbeCheck {
                 name: "structured-events",
@@ -773,4 +788,44 @@ async fn drive_acp_session(pipe_session: &mut PipeSession, mode: &str) -> AgentP
         ),
     });
     AgentProbeResult { checks }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AGENT_TEXT_TAIL_LIMIT, prompt_response_detail};
+    use serde_json::json;
+
+    #[test]
+    fn the_prompt_response_detail_keeps_the_agent_text_tail_readable() {
+        // 500 digits: the last AGENT_TEXT_TAIL_LIMIT are unique enough
+        // that a mirrored or middle-truncated tail cannot match them by
+        // accident.
+        let text: String = (0..500)
+            .map(|i| char::from_digit(i % 10, 10).unwrap())
+            .collect();
+        let tail: String = text
+            .chars()
+            .skip(text.chars().count() - AGENT_TEXT_TAIL_LIMIT)
+            .collect();
+        assert_ne!(
+            tail,
+            tail.chars().rev().collect::<String>(),
+            "the fixture tail is not a palindrome: a mirror cannot pass"
+        );
+        let detail = prompt_response_detail(&json!({"stopReason": "end_turn"}), &text);
+        assert!(
+            detail.contains(&tail),
+            "the tail appears in reading order: {}",
+            &detail[..detail.len().min(120)]
+        );
+        let mirrored: String = tail.chars().rev().collect();
+        assert!(
+            !detail.contains(&mirrored),
+            "the tail is not printed reversed"
+        );
+        assert!(
+            detail.contains("end_turn"),
+            "the stop reason is still recorded: {detail}"
+        );
+    }
 }

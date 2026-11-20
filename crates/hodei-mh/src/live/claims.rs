@@ -11,7 +11,7 @@ use std::sync::{Mutex, PoisonError};
 
 use hodei_mh_coordinator::core::ClaimResult;
 use hodei_mh_coordinator::store::{CoordinatorStore, StoreError};
-use runner::live::{ClaimError, ClaimPort, Claimed};
+use runner::live::{ClaimError, ClaimPort, ClaimReleaseError, Claimed};
 
 /// The holder the live runtime claims work as.
 pub const LIVE_HOLDER: &str = "supervisor-run";
@@ -58,16 +58,27 @@ impl ClaimPort for StoreClaims {
         }
     }
 
-    fn release(&self, work_ref: &str, epoch: u64) {
+    /// Give the work back. A store that cannot transact the release is
+    /// reported, never ignored: the work would stay held under this
+    /// holder with no record saying so.
+    fn release(&self, work_ref: &str, epoch: u64) -> Result<(), ClaimReleaseError> {
         let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         // Only the attempt that owns the claim releases it: a stale
-        // attempt must not give back work somebody else now holds.
-        let _ = store.transact(|state| {
-            if state.claim_of(work_ref).map(|claim| claim.epoch) == Some(epoch) {
-                state.release(work_ref, &self.holder);
-            }
-            Ok(())
-        });
+        // attempt must not give back work somebody else now holds. Such
+        // a mismatch is a no-op, not a failure: the claim of THIS epoch
+        // was never ours to give back.
+        store
+            .transact(|state| {
+                if state.claim_of(work_ref).map(|claim| claim.epoch) == Some(epoch) {
+                    state.release(work_ref, &self.holder);
+                }
+                Ok(())
+            })
+            .map_err(|error| ClaimReleaseError {
+                work_ref: work_ref.to_string(),
+                epoch,
+                reason: error.to_string(),
+            })
     }
 
     /// The claims the coordinator holds right now.
@@ -113,12 +124,16 @@ mod tests {
             claims.claim("T-1"),
             Err(ClaimError::Denied { ref holder }) if holder == LIVE_HOLDER
         ));
-        claims.release("T-1", first.epoch);
+        claims
+            .release("T-1", first.epoch)
+            .expect("the release completes");
         let second = claims
             .claim("T-1")
             .expect("the released work is free again");
         assert_eq!(second.epoch, 2, "every grant advances the fencing epoch");
-        claims.release("T-1", second.epoch);
+        claims
+            .release("T-1", second.epoch)
+            .expect("the release completes");
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
     }
 
@@ -156,7 +171,9 @@ mod tests {
                 .map(String::as_str),
             Some(LIVE_HOLDER)
         );
-        booted.release("T-3", held.epoch);
+        booted
+            .release("T-3", held.epoch)
+            .expect("the release completes");
         assert_eq!(booted.claim("T-3").expect("the released work").epoch, 2);
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
     }
@@ -165,14 +182,20 @@ mod tests {
     fn a_stale_epoch_does_not_release_the_current_claim() {
         let (claims, path) = claims("stale");
         let first = claims.claim("T-2").expect("the work is free");
-        claims.release("T-2", first.epoch);
+        claims
+            .release("T-2", first.epoch)
+            .expect("the release completes");
         let second = claims.claim("T-2").expect("the work is free again");
-        claims.release("T-2", first.epoch);
+        claims
+            .release("T-2", first.epoch)
+            .expect("a stale epoch is a no-op, not a failure");
         assert!(
             matches!(claims.claim("T-2"), Err(ClaimError::Denied { .. })),
             "a stale attempt must not release the current one"
         );
-        claims.release("T-2", second.epoch);
+        claims
+            .release("T-2", second.epoch)
+            .expect("the release completes");
         let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
     }
 }

@@ -41,6 +41,19 @@ pub enum ClaimError {
     Unavailable { reason: String },
 }
 
+/// The store could not give the work back.
+///
+/// A claim that stays held is not a silent fact: whoever reads the run
+/// must see that the work may still belong to this runtime, so the
+/// refusal names the work, the epoch and the store's own reason.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the claim of {work_ref} (epoch {epoch}) could not be released: {reason}")]
+pub struct ClaimReleaseError {
+    pub work_ref: String,
+    pub epoch: u64,
+    pub reason: String,
+}
+
 /// The claim store the live runtime talks to.
 pub trait ClaimPort: Send + Sync {
     /// Take the work for this runtime. One holder per work: a second
@@ -48,8 +61,10 @@ pub trait ClaimPort: Send + Sync {
     fn claim(&self, work_ref: &str) -> Result<Claimed, ClaimError>;
 
     /// Give the work back. Called once per successful claim, whatever the
-    /// attempt ended with.
-    fn release(&self, work_ref: &str, epoch: u64);
+    /// attempt ended with. A store that could not take the work back is
+    /// reported, never ignored: the attempt must say the claim may still
+    /// be held.
+    fn release(&self, work_ref: &str, epoch: u64) -> Result<(), ClaimReleaseError>;
 
     /// The claims held right now, as work ref → holder.
     ///
@@ -123,8 +138,6 @@ pub enum AttemptEnd {
         work_ref: String,
         missing: Vec<String>,
     },
-    /// The agent produced no new revision to verify.
-    NoNewCommit { work_ref: String },
     /// The named work was not eligible in the observed snapshot.
     NamedNotEligible { work_ref: String, reason: String },
     /// The candidate could not be verified.
@@ -133,7 +146,11 @@ pub enum AttemptEnd {
     ClaimDenied { work_ref: String, holder: String },
     /// The attempt was stopped before its effects could be published.
     Cancelled { work_ref: String },
-    /// The agent could not run the objective.
+    /// The agent could not run the objective. An agent that ends its turn
+    /// with no candidate changes arrives HERE, carrying the stage's own
+    /// cause: the port refuses before the runner ever sees a diff, so the
+    /// vocabulary keeps no separate no-change state — it could only
+    /// duplicate a cause that already travels with the reason.
     AgentFailed { work_ref: String, reason: String },
     /// The infrastructure failed around the attempt.
     InfraFailed { reason: String },
@@ -145,6 +162,13 @@ pub enum AttemptEnd {
     PromotedUnconfirmed { work_ref: String, detail: String },
     /// There was no eligible work at all.
     NoEligibleWork { reason: String },
+    /// The attempt ended as `end`, but the claim release did not
+    /// complete: the verdict travels with the release failure so neither
+    /// half is lost, and the work may still be held.
+    UncertainRelease {
+        release: ClaimReleaseError,
+        end: Box<AttemptEnd>,
+    },
 }
 
 /// The outcome the attempt ended with.
@@ -170,10 +194,6 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
         AttemptEnd::ChecksNotHeld { work_ref, missing } => ObjectiveOutcome::Rejected {
             work_ref,
             reason: format!("the evidence does not satisfy {}", missing.join(", ")),
-        },
-        AttemptEnd::NoNewCommit { work_ref } => ObjectiveOutcome::Rejected {
-            work_ref,
-            reason: "the agent produced no new commit".into(),
         },
         AttemptEnd::NamedNotEligible { work_ref, reason } => ObjectiveOutcome::Rejected {
             reason: format!("{work_ref} is not eligible: {reason}"),
@@ -203,6 +223,15 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
             ),
         },
         AttemptEnd::NoEligibleWork { reason } => ObjectiveOutcome::Idle { reason },
+        // The release failure is the headline: an operator must see that
+        // the work may still be held. The attempt's own verdict travels
+        // with it, so the end is never lost behind the store's refusal.
+        AttemptEnd::UncertainRelease { release, end } => ObjectiveOutcome::Failed {
+            reason: format!(
+                "the claim release did not complete: {release}; the attempt itself ended as: {}",
+                outcome_of(*end).describe()
+            ),
+        },
     }
 }
 
@@ -211,11 +240,16 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
 /// The guard is owned by the attempt itself, so an attempt whose task is
 /// ABORTED (a Stop) still releases its claim when the future is dropped:
 /// the release does not depend on the attempt reaching its end.
+///
+/// `Drop` cannot return the store's refusal, so a failed release is
+/// stowed in the slot instead of dropped: the attempt drains the slot at
+/// its terminal step and wraps its verdict as an uncertain release.
 struct ClaimGuard {
     claims: Arc<dyn ClaimPort>,
     work_ref: String,
     epoch: u64,
     released: bool,
+    release_failed: Arc<Mutex<Option<ClaimReleaseError>>>,
 }
 
 impl ClaimGuard {
@@ -225,16 +259,33 @@ impl ClaimGuard {
             work_ref: work_ref.to_string(),
             epoch,
             released: false,
+            release_failed: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Give the work back now. Calling it twice releases once.
+    /// Give the work back now. Calling it twice releases once. A release
+    /// the store refused is stowed in the slot, never discarded.
     fn release_now(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
-        self.claims.release(&self.work_ref, self.epoch);
+        if let Err(error) = self.claims.release(&self.work_ref, self.epoch) {
+            let mut slot = self
+                .release_failed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *slot = Some(error);
+        }
+    }
+
+    /// The release failure the store left in the slot, if any. Taking it
+    /// is the terminal step: a drained slot means the work went back.
+    fn take_release_error(&self) -> Option<ClaimReleaseError> {
+        self.release_failed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -277,6 +328,13 @@ impl Cancellations {
     /// stop arrived before the attempt did: a stop raised while the run
     /// was starting is never lost. An attempt that installs late never
     /// steals the slot from a newer one.
+    ///
+    /// The pending stops of OLDER runs are superseded here, and that is
+    /// provably inert: a stop never starts an attempt — it can only mark
+    /// the flag of the run it names — so a superseded stop neither
+    /// reaches the newer attempt nor revives the older one. The test
+    /// `a_pending_stop_superseded_by_a_newer_install_starts_and_cancels_nothing`
+    /// keeps that invariant observable.
     fn install(&self, run: RunId) -> Arc<AtomicBool> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         // One attempt per run installs its flag once; a second install
@@ -536,10 +594,14 @@ impl LiveRuntime {
     /// The handle of an objective about to run: a stop that arrived while
     /// the attempt was being set up ends it before any effect, and the
     /// claim, when there is one, goes back with the attempt.
+    ///
+    /// The release is the last thing the attempt does before its verdict
+    /// is read: a store that refused the release wraps the verdict as an
+    /// uncertain release, so a held claim is never a silent fact.
     fn handle(
         &self,
         objective: Objective,
-        guard: Option<ClaimGuard>,
+        mut guard: Option<ClaimGuard>,
         cancelled: Arc<AtomicBool>,
     ) -> ObjectiveHandle {
         let agent = self.agent.clone();
@@ -553,7 +615,21 @@ impl LiveRuntime {
             } else {
                 attempt(&objective, agent, verifier, publisher, cancelled).await
             };
+            let release = match &mut guard {
+                Some(guard) => {
+                    guard.release_now();
+                    guard.take_release_error()
+                }
+                None => None,
+            };
             drop(guard);
+            let end = match release {
+                Some(release) => AttemptEnd::UncertainRelease {
+                    release,
+                    end: Box::new(end),
+                },
+                None => end,
+            };
             outcome_of(end)
         })
     }
@@ -848,6 +924,7 @@ mod tests {
         claim_calls: AtomicUsize,
         releases: Mutex<Vec<(String, u64)>>,
         held: BTreeMap<String, String>,
+        release_fails: bool,
     }
 
     impl FakeClaims {
@@ -857,6 +934,7 @@ mod tests {
                 claim_calls: AtomicUsize::new(0),
                 releases: Mutex::new(Vec::new()),
                 held: BTreeMap::new(),
+                release_fails: false,
             }
         }
 
@@ -866,6 +944,7 @@ mod tests {
                 claim_calls: AtomicUsize::new(0),
                 releases: Mutex::new(Vec::new()),
                 held: BTreeMap::new(),
+                release_fails: false,
             }
         }
 
@@ -879,6 +958,16 @@ mod tests {
                     .iter()
                     .map(|(work_ref, holder)| (work_ref.to_string(), holder.to_string()))
                     .collect(),
+                release_fails: false,
+            }
+        }
+
+        /// A store that grants the claim but REFUSES the release: the
+        /// work stays held whatever the attempt ended with.
+        fn granting_but_refusing_release(epoch: u64) -> Self {
+            Self {
+                release_fails: true,
+                ..Self::granting(epoch)
             }
         }
 
@@ -905,10 +994,18 @@ mod tests {
             }
         }
 
-        fn release(&self, work_ref: &str, epoch: u64) {
+        fn release(&self, work_ref: &str, epoch: u64) -> Result<(), ClaimReleaseError> {
             if let Ok(mut releases) = self.releases.lock() {
                 releases.push((work_ref.to_string(), epoch));
             }
+            if self.release_fails {
+                return Err(ClaimReleaseError {
+                    work_ref: work_ref.to_string(),
+                    epoch,
+                    reason: "the release transaction was refused".into(),
+                });
+            }
+            Ok(())
         }
 
         fn claims(&self) -> Result<BTreeMap<String, String>, ClaimError> {
@@ -1005,9 +1102,6 @@ mod tests {
                 work_ref: "T-1".into(),
                 missing: vec!["AC-1".into()],
             },
-            AttemptEnd::NoNewCommit {
-                work_ref: "T-1".into(),
-            },
             AttemptEnd::NamedNotEligible {
                 work_ref: "T-1".into(),
                 reason: "done".into(),
@@ -1043,6 +1137,42 @@ mod tests {
                 matches!(outcome_of(end.clone()), ObjectiveOutcome::Failed { .. }),
                 "{end:?} must fail"
             );
+        }
+        // A release the store refused is visible in the outcome text,
+        // whatever the attempt itself ended with: the release failure is
+        // the headline, and the inner verdict travels with it.
+        for end in [
+            AttemptEnd::Published {
+                work_ref: "T-1".into(),
+                closure: Closed::Confirmed,
+                detail: "published".into(),
+            },
+            AttemptEnd::Cancelled {
+                work_ref: "T-1".into(),
+            },
+        ] {
+            let uncertain = outcome_of(AttemptEnd::UncertainRelease {
+                release: ClaimReleaseError {
+                    work_ref: "T-1".into(),
+                    epoch: 3,
+                    reason: "the state directory is read-only".into(),
+                },
+                end: Box::new(end),
+            });
+            match uncertain {
+                ObjectiveOutcome::Failed { ref reason } => {
+                    assert!(
+                        reason.contains("the claim release did not complete"),
+                        "{reason}"
+                    );
+                    assert!(
+                        reason.contains("read-only"),
+                        "the store's reason travels: {reason}"
+                    );
+                    assert!(reason.contains("epoch 3"), "the epoch travels: {reason}");
+                }
+                other => panic!("a refused release must fail the run, got {other:?}"),
+            }
         }
         // A promoted effect with an unsettled record fails WITHOUT
         // inviting a re-promotion: the reason says the effect moved.
@@ -2286,5 +2416,154 @@ mod tests {
         assert_eq!(agent.calls(), 0);
         assert_eq!(publisher.calls(), 0);
         assert!(claims.releases().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_claim_release_ends_the_run_as_an_uncertain_release() {
+        // The whole attempt succeeds and only the store's release is
+        // refused: the verdict must say the release did not complete,
+        // never silently leave the work held.
+        let claims = Arc::new(FakeClaims::granting_but_refusing_release(43));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            Arc::new(CountingPublisher::confirm_closing()),
+            claims.clone(),
+            Arc::new(CountingAgent::default()),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match &outcome {
+            ObjectiveOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("the claim release did not complete"),
+                    "the release failure is the headline: {reason}"
+                );
+                assert!(reason.contains("T-1"), "the held work is named: {reason}");
+                assert!(
+                    reason.contains("the release transaction was refused"),
+                    "the store's reason travels: {reason}"
+                );
+                assert!(
+                    reason.contains("confirmed T-1"),
+                    "the attempt's own verdict is not lost: {reason}"
+                );
+            }
+            other => panic!("a refused release must fail the run, got {other:?}"),
+        }
+        assert_eq!(
+            claims.releases().len(),
+            1,
+            "the release is attempted exactly once even when the store refuses"
+        );
+    }
+
+    /// The agent port of a turn that changed nothing: the refusal the
+    /// productive stage raises when the staged worktree is still the
+    /// base tree.
+    struct NoChangesAgent;
+
+    #[async_trait::async_trait]
+    impl AgentPort for NoChangesAgent {
+        async fn execute(&self, objective: &Objective) -> Result<Candidate, AgentError> {
+            Err(AgentError {
+                work_ref: objective.work_ref.clone(),
+                reason: "the agent produced no changes to the managed state: the staged worktree is still the base tree".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_no_candidate_changes_carries_its_cause_and_never_promotes() {
+        // The shape of a no-change turn after the dead no-commit state
+        // was removed: NOT a timeout, NEVER promoted, and the cause
+        // ("no changes") travels in the outcome text.
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(5));
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            Arc::new(NoChangesAgent),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+        );
+        let outcome = outcome_of_start(&runtime, None).await;
+        match &outcome {
+            ObjectiveOutcome::Failed { reason } => {
+                assert!(reason.contains("no changes"), "the cause travels: {reason}");
+                assert!(
+                    !reason.contains("timeout"),
+                    "a no-change turn is never mistaken for a timeout: {reason}"
+                );
+            }
+            other => panic!("a refused turn without effects must fail the run, got {other:?}"),
+        }
+        assert_eq!(
+            publisher.calls(),
+            0,
+            "a candidate that did not move is never promoted"
+        );
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 5)],
+            "the claim goes back whatever the refusal was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_stop_superseded_by_a_newer_install_starts_and_cancels_nothing() {
+        // The superseded stop of a run whose attempt never installed a
+        // flag is dropped by the newer install. That is inert by proof,
+        // not by promise: the newer attempt runs untouched, and a stop
+        // addressed to the older run afterwards reaches neither one.
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(41));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open), item("T-2", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        // A stop for run 1 arrives before any attempt of run 1 installs.
+        runtime.cancel(RunId(1));
+        // Run 2 installs: its own flag starts false, so the superseded
+        // stop neither cancels run 2 nor revives anything of run 1.
+        let second = start(&runtime, RunId(2), None)
+            .await
+            .expect("the runtime accepts the objective")
+            .completion()
+            .await;
+        // The unnamed selection takes the first eligible ticket.
+        assert!(
+            matches!(&second, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "T-1"),
+            "the superseded stop does not cancel the newer run: {second:?}"
+        );
+        assert_eq!(agent.calls(), 1, "the superseded stop starts no attempt");
+        assert_eq!(publisher.calls(), 1);
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 41)]);
+
+        // Now a run is IN FLIGHT and the older stop is raised again: it
+        // is history, and the attempt in flight reads only its own flag.
+        let third = start(&runtime, RunId(3), Some("T-2"))
+            .await
+            .expect("the runtime accepts the next objective");
+        let completion = tokio::spawn(async move { third.completion().await });
+        runtime.cancel(RunId(1));
+        let outcome = completion.await.expect("the attempt ends");
+        assert!(
+            matches!(&outcome, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "T-2"),
+            "a stop for an older run never reaches the attempt in flight: {outcome:?}"
+        );
+        assert_eq!(agent.calls(), 2, "nothing else ran");
+        assert_eq!(publisher.calls(), 2);
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 41), ("T-2".to_string(), 41)]
+        );
     }
 }
