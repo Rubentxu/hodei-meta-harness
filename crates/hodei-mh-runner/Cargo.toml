@@ -21,3 +21,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 supervisor = { path = "../hodei-mh-supervisor", package = "hodei-mh-supervisor" }
+promote = { path = "../hodei-mh-promote", package = "hodei-mh-promote" }

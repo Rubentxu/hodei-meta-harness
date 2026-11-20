@@ -21,8 +21,9 @@ use verify::transport::TransportDigest;
 
 use crate::core::GoalRunner;
 use crate::ports::{
-    AgentError, AgentPort, Objective, ObjectiveCheck, Publication, PublisherError, PublisherPort,
-    RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
+    AgentError, AgentPort, Checkpointed, Closed, Closes, Objective, ObjectiveCheck, Publication,
+    PublisherError, PublisherPort, RequirementsError, RequirementsPort, Verification,
+    VerifierError, VerifierPort,
 };
 
 /// The revision the rehearsal's candidate claims to be.
@@ -88,6 +89,8 @@ impl RequirementsPort for ScriptedRequirements {
                 id: "AC-1".into(),
                 command: format!("rehearse {}", item.id),
             })],
+            run: None,
+            closes: Closes::Ticket,
         })
     }
 }
@@ -181,12 +184,28 @@ impl PublisherPort for RecordingPublisher {
         candidate: &Candidate,
         _verification: &Verification,
     ) -> Result<Publication, PublisherError> {
+        let (closure, outcome) = match objective.closes {
+            // The rehearsal closes nothing: it records what WOULD have
+            // been published and moves no ref.
+            Closes::Ticket => (
+                Closed::Unconfirmed,
+                "nothing was closed and no ref moved".to_string(),
+            ),
+            // A custom objective owns no ticket: there was never a
+            // closure to confirm, exactly as the live publisher says.
+            Closes::Nothing => (
+                Closed::NotRequired,
+                "the objective owns no ticket, so no work was closed".to_string(),
+            ),
+        };
         let publication = Publication {
             revision: candidate.revision.as_str().to_string(),
-            // The rehearsal closes nothing.
-            closed: false,
+            closure,
+            // The rehearsal keeps no durable record: the recording IS
+            // its record, and nothing is left uncertain.
+            checkpoint: Checkpointed::Settled,
             detail: format!(
-                "the rehearsal recorded the publication of {}; nothing was closed and no ref moved",
+                "the rehearsal recorded the publication of {}; {outcome}",
                 objective.work_ref
             ),
         };
@@ -337,12 +356,33 @@ impl ObjectiveRuntime for TrialRuntime {
 
     async fn start(
         &self,
-        _run: RunId,
+        run: RunId,
         request: ObjectiveRequest,
     ) -> Result<ObjectiveHandle, RuntimeError> {
         // The gate: the runtime does not confirm until it is opened.
         if let Some(accept) = &self.accept {
             accept.notified().await;
+        }
+        // A custom objective owns no ticket: the rehearsal mirrors the
+        // live custom path instead of running tracker work. The
+        // criterion check, the absence of selection and the closure
+        // that is NOT required are what the rehearsal rehearses.
+        if let Some(custom) = &request.objective {
+            if request.work_ref.is_some() {
+                return Err(RuntimeError(
+                    "a custom objective owns no ticket: name a ticket or an objective, not both"
+                        .into(),
+                ));
+            }
+            let objective = crate::live::custom_objective(custom, run);
+            let runner = self.runner_for(None);
+            let finish = self.finish.clone();
+            return Ok(ObjectiveHandle::new(async move {
+                if let Some(finish) = finish {
+                    finish.notified().await;
+                }
+                runner.execute(&objective).await
+            }));
         }
         let runner = self.runner_for(request.work_ref.as_deref());
         // The work this rehearsal already ran is held by the trial itself:
@@ -396,6 +436,7 @@ impl ObjectiveRuntime for TrialRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use run::runtime::CustomObjective;
 
     #[tokio::test]
     async fn the_rehearsal_selects_the_first_eligible_work_and_publishes_nothing() {
@@ -406,6 +447,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -418,7 +460,7 @@ mod tests {
         let recorded = runtime.publications();
         assert_eq!(recorded.len(), 1);
         // The rehearsal closed nothing and moved no ref.
-        assert!(!recorded[0].closed);
+        assert_eq!(recorded[0].closure, Closed::Unconfirmed);
         assert!(recorded[0].detail.contains("nothing was closed"));
     }
 
@@ -431,6 +473,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -459,6 +502,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: Some("TASK-9".into()),
+                    objective: None,
                 },
             ),
         )
@@ -474,7 +518,76 @@ mod tests {
         // The rehearsal still closed nothing: the recording says so.
         let recorded = runtime.publications();
         assert_eq!(recorded.len(), 1);
-        assert!(!recorded[0].closed);
+        assert_eq!(recorded[0].closure, Closed::Unconfirmed);
+    }
+
+    #[tokio::test]
+    async fn the_rehearsal_rehearses_a_custom_objective_without_ticket_work() {
+        // A custom objective in the rehearsal must be REHEARSED as what
+        // it is: no selection, no tracker work, nothing to close. The
+        // silent rewrite of an objective into ticket work is the defect
+        // this test pins shut.
+        let runtime = TrialRuntime::new();
+        let outcome = runtime
+            .start(
+                RunId(4),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: None,
+                    objective: Some(CustomObjective {
+                        instruction: "summarise the docs".into(),
+                        accept: goal::source::TerminationCriterion {
+                            command: "test -f SUMMARY.md".into(),
+                            expect_exit: 0,
+                        },
+                    }),
+                },
+            )
+            .await
+            .expect("the rehearsal rehearses a custom objective")
+            .completion()
+            .await;
+        assert!(
+            matches!(&outcome, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "custom-objective-4"),
+            "the objective is rehearsed under its own identity: {outcome:?}"
+        );
+        let recorded = runtime.publications();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].closure,
+            Closed::NotRequired,
+            "a custom objective owns no ticket: the closure is not required"
+        );
+        assert!(
+            recorded[0].detail.contains("owns no ticket"),
+            "{}",
+            recorded[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rehearsal_refuses_an_objective_that_also_names_a_ticket() {
+        let runtime = TrialRuntime::new();
+        let refused = runtime
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: Some("T-1".into()),
+                    objective: Some(CustomObjective {
+                        instruction: "summarise the docs".into(),
+                        accept: goal::source::TerminationCriterion {
+                            command: "true".into(),
+                            expect_exit: 0,
+                        },
+                    }),
+                },
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "an objective never carries a ticket, and ticket work is never a substitute"
+        );
     }
 
     #[tokio::test]
@@ -491,6 +604,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: Some("TASK-9".into()),
+                    objective: None,
                 },
             )
             .await
@@ -510,6 +624,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -529,6 +644,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await

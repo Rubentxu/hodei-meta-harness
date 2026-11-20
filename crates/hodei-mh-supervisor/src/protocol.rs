@@ -27,6 +27,13 @@ pub enum SupervisorAction {
         ticket: Option<String>,
         revision: Option<String>,
     },
+    /// Start one pass over a custom objective: it owns no ticket, so it
+    /// never selects, claims or closes tracker work. The objective ends
+    /// by its operator criterion, never by the agent's feeling of done.
+    StartObjective {
+        project: String,
+        objective: run::runtime::CustomObjective,
+    },
     Pause,
     Resume,
     Stop,
@@ -165,6 +172,10 @@ pub struct Snapshot {
     /// Pause/Resume gate the prompt loop without touching the session).
     pub paused: bool,
     pub ticket: Option<String>,
+    /// The custom objective the current run serves, when it owns no
+    /// ticket. Absent means the run works the tracker queue.
+    #[serde(default)]
+    pub goal: Option<String>,
     pub revision: Option<String>,
     /// The runtime that executes objectives. Its KIND is never hidden: a
     /// rehearsal says so. Absent means no runtime is wired.
@@ -219,6 +230,27 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_objective_start_carries_no_ticket() {
+        let raw = r#"{"req":"action","action":{"action":"start_objective","project":"gc","objective":{"instruction":"summarise","accept":{"command":"test -f SUMMARY.md","expect_exit":0}}}}"#;
+        let request: Request = serde_json::from_str(raw).expect("parse");
+        assert_eq!(
+            request,
+            Request::Action {
+                action: SupervisorAction::StartObjective {
+                    project: "gc".into(),
+                    objective: run::runtime::CustomObjective {
+                        instruction: "summarise".into(),
+                        accept: goal::source::TerminationCriterion {
+                            command: "test -f SUMMARY.md".into(),
+                            expect_exit: 0,
+                        },
+                    },
+                }
+            }
+        );
+    }
+
+    #[test]
     fn an_events_request_without_a_limit_is_accepted() {
         // A client of the previous version does not send a limit: the
         // answer is still an answer.
@@ -269,6 +301,7 @@ mod tests {
             phase: Phase::Running,
             paused: false,
             ticket: None,
+            goal: None,
             revision: None,
             runtime: None,
             objective: None,

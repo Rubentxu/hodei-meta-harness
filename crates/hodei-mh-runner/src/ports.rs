@@ -39,6 +39,16 @@ impl ObjectiveCheck {
     }
 }
 
+/// What the objective's publication closes.
+///
+/// A custom objective owns no ticket: it is promoted like any candidate,
+/// but there is nothing to close, and the tracker is never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closes {
+    Ticket,
+    Nothing,
+}
+
 /// The work to execute and the requirements that decide whether it held.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Objective {
@@ -49,6 +59,11 @@ pub struct Objective {
     /// The checks that decide whether the objective held, each with the
     /// criterion that declares it.
     pub checks: Vec<ObjectiveCheck>,
+    /// The controller's run that carries this objective, when one named
+    /// it. It is the identity the durable checkpoint records.
+    pub run: Option<u64>,
+    /// What the objective closes when it is published.
+    pub closes: Closes,
 }
 
 impl Objective {
@@ -116,13 +131,41 @@ impl Verification {
     }
 }
 
+/// The state of the durable attempt record once the effects moved.
+///
+/// The record is a SEPARATE fact from the closure: an effect that moved
+/// but whose record could not be settled is never re-applied to fix the
+/// record, and it is never reported as a promotion failure inviting a
+/// second promotion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpointed {
+    /// The record says the effect moved: it must not happen again.
+    Settled,
+    /// The effect moved and the record could not say so: the effect is
+    /// durable, only the record is uncertain.
+    Uncertain,
+}
+
+/// How the closure of a publication ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closed {
+    /// A ticket was closed and the re-read confirmed it.
+    Confirmed,
+    /// The objective owns no ticket: nothing had to be closed.
+    NotRequired,
+    /// Effects moved but the closure was not confirmed.
+    Unconfirmed,
+}
+
 /// What the publisher did with the candidate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Publication {
     /// The revision that was published, as git names it.
     pub revision: String,
-    /// Whether the work item was closed.
-    pub closed: bool,
+    /// How the closure ended.
+    pub closure: Closed,
+    /// Whether the durable record settled with the effect.
+    pub checkpoint: Checkpointed,
     /// What happened, in words.
     pub detail: String,
 }

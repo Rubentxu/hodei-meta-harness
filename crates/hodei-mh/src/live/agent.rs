@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use opensandbox::acp::AcpAssembler;
+use interact::policy::InteractionPolicy;
+use interact::request::{InteractionRequest, PermissionOption, ToolKind};
+use interact::resolver::{GrantSource, Resolution, resolve};
+use opensandbox::acp::{AcpAssembler, METHOD_NOT_FOUND, encode_error};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::PipeSession;
@@ -25,6 +28,7 @@ use verify::transport::TransportDigest;
 
 use runner::ports::{AgentError, AgentPort, Objective};
 
+use crate::live::checkpoint::{CandidateRef, LiveCheckpoints};
 use crate::live::session::SandboxSession;
 use crate::live::{GitIdentity, LiveConfig, LiveError, PermissionMode};
 
@@ -216,13 +220,16 @@ impl Credentials {
 pub struct AcpAgent {
     config: LiveConfig,
     credentials: Credentials,
+    checkpoints: LiveCheckpoints,
 }
 
 impl AcpAgent {
     pub fn new(config: LiveConfig, credentials: Credentials) -> Self {
+        let checkpoints = config.checkpoints();
         Self {
             config,
             credentials,
+            checkpoints,
         }
     }
 
@@ -265,6 +272,9 @@ impl AcpAgent {
             .attach_agent(&command, WORKTREE)
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
+        // The record and its handoff were written BEFORE the claim, by
+        // the durable attempt port: a crash from here on leaves a
+        // pending checkpoint the boot classifies as uncertain.
         let instruction = instruction_for(&objective.instruction);
         let turn = drive_agent(
             &mut conversation,
@@ -279,9 +289,18 @@ impl AcpAgent {
             .delete_session(&agent_session.session_id, SESSION_CLEANUP_TIMEOUT)
             .await;
         if !turn.completed {
+            let interactions = turn.interactions.join("; ");
             return Err(Self::failure(
                 work_ref,
-                format!("the agent did not finish its turn: {}", turn.summary),
+                format!(
+                    "the agent did not finish its turn: {}{}",
+                    turn.summary,
+                    if interactions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; interactions: {interactions}")
+                    }
+                ),
             ));
         }
         // The harness authors the candidate commit: whatever the agent
@@ -319,6 +338,15 @@ impl AcpAgent {
         let revision =
             GitRevision::parse(head.trim()).map_err(|error| Self::failure(work_ref, error))?;
         let tree = GitTree::parse(tree.trim()).map_err(|error| Self::failure(work_ref, error))?;
+        // The candidate is recorded while the phase stays Pending: only the
+        // publication settles it.
+        self.checkpoints
+            .observe(CandidateRef {
+                base: base.clone(),
+                head: head.trim().to_string(),
+                bundle_digest: TransportDigest::of(&candidate_bundle).as_str().to_string(),
+            })
+            .map_err(|error| Self::failure(work_ref, error))?;
         Ok(Candidate {
             revision,
             tree,
@@ -548,6 +576,9 @@ fn instruction_for(instruction: &str) -> String {
 pub struct AcpTurn {
     pub completed: bool,
     pub summary: String,
+    /// How the client answered the interactions the agent raised. Every
+    /// decision is recorded with its reason, so a refusal is never silent.
+    pub interactions: Vec<String>,
 }
 
 impl AcpTurn {
@@ -566,6 +597,7 @@ impl AcpTurn {
         Self {
             completed: stop_reason == END_TURN,
             summary: format!("{stop_reason}, text_len={text_len}"),
+            interactions: Vec::new(),
         }
     }
 }
@@ -597,9 +629,11 @@ pub async fn drive_agent(
     let deadline = Instant::now() + timeout;
     let mut phase = 0u8;
     let mut session_id = json!(null);
+    let mut interactions: Vec<String> = Vec::new();
     let mut turn = AcpTurn {
         completed: false,
         summary: String::new(),
+        interactions: Vec::new(),
     };
     while Instant::now() < deadline {
         let Some(event) = tokio::time::timeout(Duration::from_secs(10), pipe.next_event())
@@ -612,19 +646,9 @@ pub async fn drive_agent(
         match event {
             ServerEvent::Stdout(bytes) => {
                 for message in assembler.push(&bytes).unwrap_or_default() {
-                    if message.get("method").and_then(|m| m.as_str())
-                        == Some("session/request_permission")
-                    {
-                        let answer = permission_answer(&message, permission);
-                        let _ = pipe
-                            .send_stdin(
-                                opensandbox::acp::encode_response(
-                                    message.get("id").cloned().unwrap_or(json!(0)),
-                                    answer,
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
+                    if let Some((response, detail)) = interaction_answer(&message, permission) {
+                        interactions.push(detail);
+                        let _ = pipe.send_stdin(response.as_bytes()).await;
                     }
                     if let Some(chunk) = message["params"]["update"]["content"]["text"].as_str()
                         && agent_text.len() < 3000
@@ -669,7 +693,9 @@ pub async fn drive_agent(
                         && phase == 2
                         && message["result"].get("stopReason").is_some()
                     {
-                        return AcpTurn::of_prompt_result(&message["result"], agent_text.len());
+                        turn = AcpTurn::of_prompt_result(&message["result"], agent_text.len());
+                        turn.interactions = interactions;
+                        return turn;
                     }
                 }
             }
@@ -681,25 +707,123 @@ pub async fn drive_agent(
         "timeout, text_tail={:?}",
         agent_text.chars().rev().take(200).collect::<String>()
     );
+    turn.interactions = interactions;
     turn
 }
 
-/// The answer to a permission request, by the configured mode.
-fn permission_answer(message: &Value, permission: PermissionMode) -> Value {
+/// The interaction policy the configured permission mode applies.
+pub fn policy_for(permission: PermissionMode) -> InteractionPolicy {
     match permission {
-        PermissionMode::AllowOnce => {
-            let option = message["params"]["options"]
-                .as_array()
-                .and_then(|options| {
-                    options
-                        .iter()
-                        .find(|option| option["kind"].as_str() == Some("allow_once"))
+        PermissionMode::AllowOnce => InteractionPolicy::sandbox_first(),
+        PermissionMode::Deny => InteractionPolicy::deny_all(),
+    }
+}
+
+/// The tool kind an ACP permission request refers to, typed before any
+/// decision: the protocol kind first, the tool name only as a fallback.
+fn acp_tool_kind(message: &Value) -> ToolKind {
+    let tool_call = &message["params"]["toolCall"];
+    match tool_call["kind"].as_str().unwrap_or_default() {
+        "read" | "search" => ToolKind::Read,
+        "edit" | "delete" | "move" => ToolKind::Write,
+        "execute" => ToolKind::Execute,
+        "fetch" => ToolKind::Network,
+        "" => ToolKind::from_tool_name(tool_call["title"].as_str().unwrap_or_default()),
+        _ => ToolKind::Unknown,
+    }
+}
+
+/// The typed request an ACP permission message describes.
+fn permission_request(message: &Value) -> InteractionRequest {
+    let options = message["params"]["options"]
+        .as_array()
+        .map(|options| {
+            options
+                .iter()
+                .map(|option| PermissionOption {
+                    option_id: option["optionId"].as_str().unwrap_or_default().to_string(),
+                    name: option["name"].as_str().unwrap_or_default().to_string(),
+                    kind: option["kind"].as_str().unwrap_or_default().to_string(),
                 })
-                .and_then(|option| option["optionId"].as_str())
-                .unwrap_or_default();
-            json!({"outcome": {"outcome": "selected", "optionId": option}})
-        }
-        PermissionMode::Deny => json!({"outcome": {"outcome": "cancelled"}}),
+                .collect()
+        })
+        .unwrap_or_default();
+    InteractionRequest::Permission {
+        tool_name: message["params"]["toolCall"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        kind: acp_tool_kind(message),
+        options,
+    }
+}
+
+/// How a grant reads in the interaction record.
+fn grant_label(source: Option<&GrantSource>) -> &'static str {
+    match source {
+        Some(GrantSource::PolicyRule) => "granted by the interaction policy",
+        Some(GrantSource::SandboxRoute) => "routed to the sandbox",
+        None => "granted",
+    }
+}
+
+/// The encoded answer an interaction message needs, with its record.
+///
+/// Only REQUESTS are answered: a response or a notification is not an
+/// interaction. A request this client does not implement is answered with
+/// an explicit error, so the agent never waits for a reply that would
+/// never come.
+pub fn interaction_answer(message: &Value, permission: PermissionMode) -> Option<(String, String)> {
+    let method = message.get("method").and_then(Value::as_str)?;
+    let id = message.get("id").cloned()?;
+    if method == "session/request_permission" {
+        let (answer, detail) = permission_answer(message, permission);
+        return Some((opensandbox::acp::encode_response(id, answer), detail));
+    }
+    let reason = format!(
+        "{method} is not a supported interaction: this client answers permission requests only"
+    );
+    Some((encode_error(id, METHOD_NOT_FOUND, &reason), reason))
+}
+
+/// The option the agent offers for an `allow_once` answer.
+fn allow_once_option(message: &Value) -> Option<&str> {
+    message["params"]["options"]
+        .as_array()?
+        .iter()
+        .find(|option| option["kind"].as_str() == Some("allow_once"))
+        .and_then(|option| option["optionId"].as_str())
+}
+
+/// The ACP answer to a permission request and how it was decided.
+///
+/// The decision comes from the typed interaction policy, never from the
+/// handoff of another session; a request the policy does not cover is
+/// refused with its reason instead of being answered on trust.
+pub fn permission_answer(message: &Value, permission: PermissionMode) -> (Value, String) {
+    let request = permission_request(message);
+    let resolution = resolve(&policy_for(permission), &request);
+    let granted = match &resolution {
+        Resolution::AutoGranted { source } => Ok(grant_label(Some(source))),
+        Resolution::RoutedToSandbox => Ok(grant_label(Some(&GrantSource::SandboxRoute))),
+        Resolution::HumanRequired { reason } => Err(reason.clone()),
+        Resolution::Unsupported { reason } => Err(reason.clone()),
+    };
+    match granted {
+        Ok(detail) => match allow_once_option(message) {
+            Some(option) => (
+                json!({"outcome": {"outcome": "selected", "optionId": option}}),
+                format!("permission {detail}"),
+            ),
+            None => (
+                json!({"outcome": {"outcome": "cancelled"}}),
+                format!("permission refused: the request offers no allow_once option ({detail})"),
+            ),
+        },
+        Err(reason) => (
+            json!({"outcome": {"outcome": "cancelled"}}),
+            format!("permission refused: {reason}"),
+        ),
     }
 }
 
@@ -768,17 +892,124 @@ mod tests {
         assert!(!instruction.contains("hodei-mh@local"));
     }
 
+    fn permission(kind: &str, title: &str, options: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "session/request_permission",
+            "params": {"toolCall": {"kind": kind, "title": title}, "options": options},
+        })
+    }
+
+    fn allow_once() -> Value {
+        json!([
+            {"optionId": "a", "name": "Allow once", "kind": "allow_once"},
+            {"optionId": "r", "name": "Reject", "kind": "reject_once"},
+        ])
+    }
+
     #[test]
-    fn a_denied_permission_is_answered_with_a_cancellation() {
-        let message = json!({"params": {"options": [{"kind": "allow_once", "optionId": "a"}]}});
-        assert_eq!(
-            permission_answer(&message, PermissionMode::Deny),
-            json!({"outcome": {"outcome": "cancelled"}})
+    fn an_ordinary_read_is_granted_by_the_policy_under_allow_once() {
+        let (answer, detail) = permission_answer(
+            &permission("read", "Read", allow_once()),
+            PermissionMode::AllowOnce,
         );
-        assert_eq!(
-            permission_answer(&message, PermissionMode::AllowOnce)["outcome"]["optionId"],
-            json!("a")
+        assert_eq!(answer["outcome"]["optionId"], json!("a"));
+        assert!(detail.contains("policy"), "{detail}");
+    }
+
+    #[test]
+    fn a_write_is_routed_to_the_sandbox_and_still_answers_allow_once() {
+        let (answer, detail) = permission_answer(
+            &permission("edit", "Edit", allow_once()),
+            PermissionMode::AllowOnce,
         );
+        assert_eq!(answer["outcome"]["optionId"], json!("a"));
+        assert!(detail.contains("sandbox"), "{detail}");
+    }
+
+    #[test]
+    fn a_reviewed_or_unknown_tool_is_refused_with_its_reason() {
+        for (kind, title) in [("fetch", "WebFetch"), ("other", "mystery")] {
+            let (answer, detail) = permission_answer(
+                &permission(kind, title, allow_once()),
+                PermissionMode::AllowOnce,
+            );
+            assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
+            assert!(detail.starts_with("permission refused:"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn the_deny_mode_refuses_every_kind_including_reads() {
+        for kind in ["read", "edit", "execute", "fetch"] {
+            let (answer, detail) = permission_answer(
+                &permission(kind, "tool", allow_once()),
+                PermissionMode::Deny,
+            );
+            assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
+            assert!(detail.contains("refused"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_grant_without_an_allow_once_option_is_an_explicit_refusal() {
+        let options = json!([{"optionId": "x", "name": "Other", "kind": "allow_always"}]);
+        let (answer, detail) = permission_answer(
+            &permission("read", "Read", options),
+            PermissionMode::AllowOnce,
+        );
+        assert_eq!(answer["outcome"]["outcome"], json!("cancelled"));
+        assert!(detail.contains("no allow_once option"), "{detail}");
+    }
+
+    #[test]
+    fn an_unsupported_interaction_is_answered_instead_of_stalling() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "session/request_form",
+            "params": {},
+        });
+        let (response, detail) =
+            interaction_answer(&request, PermissionMode::AllowOnce).expect("an answer");
+        let value: Value = serde_json::from_str(&response).expect("encoded");
+        assert_eq!(value["id"], json!(8));
+        assert_eq!(value["error"]["code"], json!(METHOD_NOT_FOUND));
+        assert!(detail.contains("not a supported interaction"), "{detail}");
+        // Notifications and responses are not interactions.
+        assert!(
+            interaction_answer(
+                &json!({"method": "session/update", "params": {}}),
+                PermissionMode::AllowOnce
+            )
+            .is_none()
+        );
+        assert!(
+            interaction_answer(
+                &json!({"id": 3, "result": {"ok": true}}),
+                PermissionMode::AllowOnce
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_permission_decision_is_the_policy_and_never_a_handoff() {
+        // The decision takes the request and the CLI mode only, so a grant
+        // taken in one session cannot be inherited by the next one.
+        let message = permission("read", "Read", allow_once());
+        let (allowed, granted) = permission_answer(&message, PermissionMode::AllowOnce);
+        assert_eq!(allowed["outcome"]["optionId"], json!("a"));
+        let (refused, denial) = permission_answer(&message, PermissionMode::Deny);
+        assert_eq!(refused["outcome"]["outcome"], json!("cancelled"));
+        assert_ne!(
+            granted, denial,
+            "the deny mode re-decides, it does not inherit"
+        );
+        // And the same request decides the same way with no history.
+        let (_, again) = permission_answer(&message, PermissionMode::AllowOnce);
+        assert_eq!(granted, again);
     }
 
     #[test]

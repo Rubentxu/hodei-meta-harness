@@ -686,6 +686,7 @@ fn spawn_execution(
             attempt = ObjectiveRequest {
                 project: project.clone(),
                 work_ref: None,
+                objective: None,
             };
         }
         // The bound was reached with the run still live: it is ended with
@@ -896,7 +897,10 @@ fn respond(core: &SharedCore, request: Request, limits: Limits) -> Handled {
             follow_up: FollowUp::Nothing,
         },
         Request::Action { action } => {
-            let starts = matches!(&action, SupervisorAction::Start { .. });
+            let starts = matches!(
+                &action,
+                SupervisorAction::Start { .. } | SupervisorAction::StartObjective { .. }
+            );
             let stops = matches!(&action, SupervisorAction::Stop);
             let outcome = engine::apply(&mut guard, action);
             let follow_up = if starts && outcome.applied {
@@ -906,6 +910,7 @@ fn respond(core: &SharedCore, request: Request, limits: Limits) -> Handled {
                     request: ObjectiveRequest {
                         project: guard.project.clone(),
                         work_ref: guard.ticket.clone(),
+                        objective: guard.custom_objective.clone(),
                     },
                     // The epoch IS the identity of the run: the stop that
                     // arrives later names the same run.
@@ -1413,6 +1418,7 @@ mod tests {
             ObjectiveRequest {
                 project: "gc".into(),
                 work_ref: None,
+                objective: None,
             },
             RunId(1),
         );

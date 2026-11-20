@@ -6,7 +6,9 @@
 //! reconciled by observing each authority, so a crash at any point resumes
 //! the same operation instead of moving the effects twice. The candidate
 //! moves only with the evidence that speaks for it, and the closure is
-//! only reported as closed when the re-read says so.
+//! only reported as closed when the re-read says so. An objective that
+//! owns no ticket is promoted with the same evidence demand, and the
+//! tracker is never written for it.
 
 use std::path::PathBuf;
 
@@ -17,7 +19,12 @@ use promote::journal::{CoordinatorJournal, IntentJournal};
 use promote::writer::{BacklogWorkWriter, TicketSnapshot, WorkWriter};
 use verify::runner::Candidate;
 
-use runner::ports::{Objective, Publication, PublisherError, PublisherPort, Verification};
+use runner::ports::{
+    Checkpointed, Closed, Closes, Objective, Publication, PublisherError, PublisherPort,
+    Verification,
+};
+
+use crate::live::checkpoint::{CandidateRef, LiveCheckpoints};
 
 /// The branch the candidate bundle carries: the worktree inside the
 /// sandbox is checked out as `main`, so the exported bundle names it.
@@ -46,6 +53,10 @@ impl VerifiedPublisher {
         }
     }
 
+    fn checkpoints(&self) -> LiveCheckpoints {
+        LiveCheckpoints::for_project(&self.project)
+    }
+
     /// Write the candidate bundle the promotion reads.
     fn write_bundle(&self, work_ref: &str, candidate: &Candidate) -> Result<(), PublisherError> {
         if let Some(parent) = self.bundle_path.parent() {
@@ -57,14 +68,9 @@ impl VerifiedPublisher {
             .map_err(|error| Self::failure(work_ref, format!("the candidate bundle: {error}")))
     }
 
-    /// The facts of the attempt, as the two authorities state them before
-    /// any effect runs.
-    fn intent_of(
-        &self,
-        objective: &Objective,
-        epoch: u64,
-    ) -> Result<PromotionIntent, PublisherError> {
-        let work_ref = objective.work_ref.as_str();
+    /// The base and the candidate the attempt fences itself to, as git
+    /// states them before any effect runs.
+    fn observed_candidate(&self, work_ref: &str) -> Result<(String, String), PublisherError> {
         let base = promote::git::current_ref(&self.project_dir, &self.managed_branch)
             .map_err(|error| Self::failure(work_ref, error.to_string()))?
             .ok_or_else(|| {
@@ -75,13 +81,26 @@ impl VerifiedPublisher {
             })?;
         let expected_candidate = promote::git::candidate_head(&self.bundle_path, CANDIDATE_BRANCH)
             .map_err(|error| Self::failure(work_ref, error.to_string()))?;
+        Ok((base, expected_candidate))
+    }
+
+    /// The facts of the attempt, as the two authorities state them before
+    /// any effect runs.
+    fn intent_of(
+        &self,
+        objective: &Objective,
+        epoch: u64,
+        base: &str,
+        expected_candidate: &str,
+    ) -> Result<PromotionIntent, PublisherError> {
+        let work_ref = objective.work_ref.as_str();
         PromotionIntent::new(PromotionFacts {
             project: self.project.clone(),
             work_ref: work_ref.to_string(),
             epoch,
             managed_branch: self.managed_branch.clone(),
-            expected_base: base,
-            expected_candidate,
+            expected_base: base.to_string(),
+            expected_candidate: expected_candidate.to_string(),
             target_status: CLOSED_STATUS.to_string(),
             note: "Evidence: the candidate was verified in a clean environment and promoted by compare-and-swap.".to_string(),
             // The criteria the checks are DECLARED under, never the count
@@ -98,6 +117,29 @@ impl VerifiedPublisher {
         self.writer
             .read_ticket(work_ref)
             .map_err(|error| error.to_string())
+    }
+
+    /// Settle the durable checkpoint of an effect that already moved.
+    ///
+    /// A checkpoint that cannot be confirmed NEVER re-runs the effect
+    /// and NEVER overstates the closure: the promotion is a fact, the
+    /// record is what is uncertain. The attempt then ends as promoted
+    /// with an unconfirmed record, never as a promotion failure that
+    /// would invite a second promotion.
+    fn confirm_checkpoint(
+        &self,
+        candidate_ref: CandidateRef,
+        closure: Closed,
+        detail: String,
+    ) -> (Closed, Checkpointed, String) {
+        match self.checkpoints().confirm(Some(candidate_ref)) {
+            Ok(_) => (closure, Checkpointed::Settled, detail),
+            Err(error) => (
+                closure,
+                Checkpointed::Uncertain,
+                format!("{detail}; the checkpoint was not confirmed: {error}"),
+            ),
+        }
     }
 }
 
@@ -151,6 +193,40 @@ impl PublisherPort for VerifiedPublisher {
             .as_ref()
             .ok_or_else(|| Self::failure(work_ref, "the verdict carries no evidence"))?;
         self.write_bundle(work_ref, candidate)?;
+        let (base, expected_candidate) = self.observed_candidate(work_ref)?;
+        let candidate_ref = || CandidateRef {
+            base: base.clone(),
+            head: expected_candidate.clone(),
+            bundle_digest: candidate.transport_digest.as_str().to_string(),
+        };
+
+        // An objective that owns no ticket moves its candidate with the
+        // same evidence demand, but no claim fences it and the tracker is
+        // never written for it.
+        if objective.closes == Closes::Nothing {
+            let commit = promote::git::promote_verified(
+                &self.project_dir,
+                &self.managed_branch,
+                &self.bundle_path,
+                CANDIDATE_BRANCH,
+                &base,
+                evidence,
+                work_ref,
+            )
+            .map_err(|error| Self::failure(work_ref, error.to_string()))?;
+            let detail = format!(
+                "promoted {commit} onto {}; the objective owns no ticket, so no work was closed",
+                self.managed_branch
+            );
+            let (closure, checkpoint, detail) =
+                self.confirm_checkpoint(candidate_ref(), Closed::NotRequired, detail);
+            return Ok(Publication {
+                revision: commit,
+                closure,
+                checkpoint,
+                detail: self.handoff_note(detail),
+            });
+        }
 
         // The journal and the claim live in the same durable store: the
         // intent is written there, before any effect.
@@ -166,7 +242,7 @@ impl PublisherPort for VerifiedPublisher {
                     "the work is not claimed: nothing fences the promotion to an attempt",
                 )
             })?;
-        let intent = self.intent_of(objective, epoch)?;
+        let intent = self.intent_of(objective, epoch, &base, &expected_candidate)?;
         let report = promote::flow::execute(
             PromotionRequest {
                 intent: &intent,
@@ -200,13 +276,40 @@ impl PublisherPort for VerifiedPublisher {
         };
 
         let closure = self.closure_of(work_ref);
-        let closed = closure
+        let re_read_closed = closure
             .as_ref()
             .is_ok_and(|snapshot| snapshot.status == CLOSED_STATUS);
+        let detail = detail_of(&report, &commit, &self.managed_branch, &closure);
+        // The attempt is settled: the durable record says the effect must
+        // not be applied again. A record that cannot be settled does not
+        // undo the promotion: it is reported as promoted and uncertain.
+        let (closure, checkpoint, detail) = self.confirm_checkpoint(
+            candidate_ref(),
+            if re_read_closed {
+                Closed::Confirmed
+            } else {
+                Closed::Unconfirmed
+            },
+            detail,
+        );
         Ok(Publication {
-            revision: commit.clone(),
-            closed,
-            detail: detail_of(&report, &commit, &self.managed_branch, &closure),
+            revision: commit,
+            closure,
+            checkpoint,
+            detail: self.handoff_note(detail),
         })
+    }
+}
+
+impl VerifiedPublisher {
+    /// The handoff path travels with the publication only when the file
+    /// is really there: an announced path that does not exist would send
+    /// the next session nowhere.
+    fn handoff_note(&self, detail: String) -> String {
+        let handoff = self.checkpoints().handoff_path();
+        match std::fs::metadata(&handoff) {
+            Ok(_) => format!("{detail}; handoff={}", handoff.display()),
+            Err(_) => detail,
+        }
     }
 }

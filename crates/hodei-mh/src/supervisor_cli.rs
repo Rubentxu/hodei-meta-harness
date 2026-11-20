@@ -282,20 +282,87 @@ fn provenance_label(provenance: &supervisor::protocol::Provenance) -> &'static s
     }
 }
 
-fn parse_action(args: &[String], name: &str) -> Option<SupervisorAction> {
+/// Parse a `start` into the action it names.
+///
+/// A custom objective is judged ONLY by the operator's termination
+/// criterion: an `--objective` without `--accept` would be an objective
+/// that can never be confirmed, so it is refused here, with its cause,
+/// instead of being sent to the runtime as an unconfirmable request.
+fn parse_start(args: &[String]) -> Result<SupervisorAction, String> {
+    let objective = opt_flag(args, "--objective");
+    let ticket = opt_flag(args, "--ticket");
+    let accept = opt_flag(args, "--accept");
+    let expect_exit = opt_flag(args, "--expect-exit");
+    let project = flag(args, "--project", "");
+    match objective {
+        Some(text) => {
+            if ticket.is_some() {
+                return Err(
+                    "a custom objective owns no ticket: name a ticket or an objective, not both"
+                        .to_string(),
+                );
+            }
+            let command = accept.ok_or_else(|| {
+                "a custom objective needs an operator termination criterion: pass --accept <command> (and optionally --expect-exit <N>); without one it could never be confirmed".to_string()
+            })?;
+            let expect_exit = match expect_exit {
+                Some(raw) => raw
+                    .parse::<i32>()
+                    .map_err(|_| format!("--expect-exit is not an integer: {raw}"))?,
+                None => 0,
+            };
+            Ok(SupervisorAction::StartObjective {
+                project,
+                objective: hodei_mh_run::runtime::CustomObjective {
+                    instruction: text,
+                    accept: goal::source::TerminationCriterion {
+                        command,
+                        expect_exit,
+                    },
+                },
+            })
+        }
+        None => {
+            if accept.is_some() || expect_exit.is_some() {
+                return Err(
+                    "--accept and --expect-exit belong to --objective: ticket work is judged by its own acceptance criteria"
+                        .to_string(),
+                );
+            }
+            Ok(SupervisorAction::Start {
+                project,
+                ticket,
+                revision: opt_flag(args, "--revision"),
+            })
+        }
+    }
+}
+
+/// How the CLI read the requested action: applied, unknown, or refused
+/// with the reason it must NOT be sent to the supervisor.
+#[derive(Debug)]
+enum ParsedAction {
+    Action(SupervisorAction),
+    Unknown,
+    Refused(String),
+}
+
+fn parse_action(args: &[String], name: &str) -> ParsedAction {
     match name {
-        "start" => Some(SupervisorAction::Start {
-            project: flag(args, "--project", ""),
-            ticket: opt_flag(args, "--ticket"),
-            revision: opt_flag(args, "--revision"),
-        }),
-        "pause" => Some(SupervisorAction::Pause),
-        "resume" => Some(SupervisorAction::Resume),
-        "stop" => Some(SupervisorAction::Stop),
-        "renew" => Some(SupervisorAction::Renew {
-            added_seconds: flag(args, "--added-seconds", "300").parse().ok()?,
-        }),
-        _ => None,
+        "start" => match parse_start(args) {
+            Ok(action) => ParsedAction::Action(action),
+            Err(reason) => ParsedAction::Refused(reason),
+        },
+        "pause" => ParsedAction::Action(SupervisorAction::Pause),
+        "resume" => ParsedAction::Action(SupervisorAction::Resume),
+        "stop" => ParsedAction::Action(SupervisorAction::Stop),
+        "renew" => match flag(args, "--added-seconds", "300").parse() {
+            Ok(added_seconds) => ParsedAction::Action(SupervisorAction::Renew { added_seconds }),
+            Err(_) => {
+                ParsedAction::Refused("--added-seconds must be a number of seconds".to_string())
+            }
+        },
+        _ => ParsedAction::Unknown,
     }
 }
 
@@ -335,9 +402,16 @@ pub async fn run_action(args: &[String]) -> i32 {
         eprintln!("usage: hodei-mh sup-action <start|pause|resume|stop|renew> [--socket PATH]");
         return 2;
     };
-    let Some(action) = parse_action(&args[1..], name) else {
-        eprintln!("unknown action {name}; expected start|pause|resume|stop|renew");
-        return 2;
+    let action = match parse_action(&args[1..], name) {
+        ParsedAction::Action(action) => action,
+        ParsedAction::Refused(reason) => {
+            eprintln!("refusing to send the action: {reason}");
+            return 2;
+        }
+        ParsedAction::Unknown => {
+            eprintln!("unknown action {name}; expected start|pause|resume|stop|renew");
+            return 2;
+        }
     };
     let socket = flag(&args[1..], "--socket", &default_socket());
     let mut client = match client::connect(&socket).await {
@@ -366,6 +440,18 @@ pub async fn run_action(args: &[String]) -> i32 {
                 return 1;
             }
         },
+        SupervisorAction::StartObjective { project, objective } if project.is_empty() => {
+            match client.snapshot().await {
+                Ok(snapshot) => SupervisorAction::StartObjective {
+                    project: snapshot.project,
+                    objective,
+                },
+                Err(e) => {
+                    eprintln!("cannot read the supervisor's project: {e}");
+                    return 1;
+                }
+            }
+        }
         other => other,
     };
     match client.action(action).await {
@@ -554,6 +640,7 @@ pub fn simulated_snapshot() -> Snapshot {
         phase: hodei_mh_run::run::Phase::Running,
         paused: false,
         ticket: Some("TASK-17".into()),
+        goal: None,
         revision: Some("0f3e91c".into()),
         // The simulated state measured nothing: it says UNKNOWN, the
         // same way a real supervisor says it when it has no telemetry.
@@ -612,8 +699,9 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrintOutcome, print_events, write_line};
+    use super::{ParsedAction, PrintOutcome, parse_action, print_events, write_line};
     use std::io;
+    use supervisor::protocol::SupervisorAction;
 
     struct Failing(io::ErrorKind);
 
@@ -728,6 +816,103 @@ mod tests {
             String::from_utf8(out).expect("utf-8"),
             "second\nthird\n",
             "each event is printed once"
+        );
+    }
+
+    fn cli(args: &[&str]) -> Vec<String> {
+        args.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn an_objective_carries_its_operator_criterion() {
+        let parsed = parse_action(
+            &cli(&[
+                "--project",
+                "gc",
+                "--objective",
+                "summarise the docs",
+                "--accept",
+                "test -f SUMMARY.md",
+                "--expect-exit",
+                "3",
+            ]),
+            "start",
+        );
+        match parsed {
+            ParsedAction::Action(SupervisorAction::StartObjective { project, objective }) => {
+                assert_eq!(project, "gc");
+                assert_eq!(objective.instruction, "summarise the docs");
+                assert_eq!(objective.accept.command, "test -f SUMMARY.md");
+                assert_eq!(objective.accept.expect_exit, 3);
+            }
+            other => panic!("the criterion travels with the objective: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_objective_without_a_criterion_is_refused_with_its_cause() {
+        // An unconfirmable objective must never reach the runtime: the
+        // refusal names the flag that is missing.
+        let parsed = parse_action(
+            &cli(&["--project", "gc", "--objective", "summarise the docs"]),
+            "start",
+        );
+        match parsed {
+            ParsedAction::Refused(reason) => {
+                assert!(reason.contains("--accept"), "{reason}");
+            }
+            other => panic!("an objective without a criterion is refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_objective_that_also_names_a_ticket_is_refused_not_dropped() {
+        // The CLI used to discard --ticket in silence, skipping the
+        // runtime's own "not both" refusal.
+        let parsed = parse_action(
+            &cli(&[
+                "--objective",
+                "summarise the docs",
+                "--accept",
+                "true",
+                "--ticket",
+                "TASK-9",
+            ]),
+            "start",
+        );
+        match parsed {
+            ParsedAction::Refused(reason) => {
+                assert!(reason.contains("not both"), "{reason}");
+            }
+            other => panic!("an objective never carries a ticket: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_criterion_without_an_objective_is_refused() {
+        let parsed = parse_action(&cli(&["--ticket", "TASK-9", "--accept", "true"]), "start");
+        assert!(
+            matches!(parsed, ParsedAction::Refused(ref reason) if reason.contains("--objective")),
+            "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_expect_exit_is_refused_with_the_value() {
+        let parsed = parse_action(
+            &cli(&[
+                "--objective",
+                "summarise",
+                "--accept",
+                "true",
+                "--expect-exit",
+                "soon",
+            ]),
+            "start",
+        );
+        assert!(
+            matches!(parsed, ParsedAction::Refused(ref reason) if reason.contains("soon")),
+            "{parsed:?}"
         );
     }
 }

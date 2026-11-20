@@ -133,6 +133,35 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_that_finds_a_claim_does_not_duplicate_it() {
+        let path = state_path("restart");
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+        let first = StoreClaims::open("project", &path, LIVE_HOLDER).expect("the store opens");
+        let held = first.claim("T-3").expect("the work is free");
+        assert_eq!(held.epoch, 1);
+        // The process goes away without releasing: the state dir is the
+        // only thing the next boot has.
+        drop(first);
+        let booted = StoreClaims::open("project", &path, LIVE_HOLDER).expect("the store reopens");
+        assert!(
+            matches!(booted.claim("T-3"), Err(ClaimError::Denied { ref holder }) if holder == LIVE_HOLDER),
+            "a restart must not grant a second claim on held work"
+        );
+        // The held epoch is still the fencing token of the attempt.
+        assert_eq!(
+            booted
+                .claims()
+                .expect("the held claims")
+                .get("T-3")
+                .map(String::as_str),
+            Some(LIVE_HOLDER)
+        );
+        booted.release("T-3", held.epoch);
+        assert_eq!(booted.claim("T-3").expect("the released work").epoch, 2);
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
     fn a_stale_epoch_does_not_release_the_current_claim() {
         let (claims, path) = claims("stale");
         let first = claims.claim("T-2").expect("the work is free");

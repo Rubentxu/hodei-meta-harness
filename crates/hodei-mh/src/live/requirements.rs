@@ -12,7 +12,7 @@ use hodei_mh_tracker::core::WorkItem;
 use serde::Deserialize;
 use verify::runner::Check;
 
-use runner::ports::{Objective, ObjectiveCheck, RequirementsError, RequirementsPort};
+use runner::ports::{Closes, Objective, ObjectiveCheck, RequirementsError, RequirementsPort};
 
 /// The prefix of a line that declares an executable check.
 pub const CHECK_PREFIX: &str = "check:";
@@ -148,6 +148,8 @@ pub fn requirements_from_view(raw: &str, item: &WorkItem) -> Result<Objective, R
         work_ref: item.id.clone(),
         instruction,
         checks,
+        run: None,
+        closes: Closes::Ticket,
     })
 }
 
