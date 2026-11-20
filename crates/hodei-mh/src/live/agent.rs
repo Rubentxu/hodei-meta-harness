@@ -20,7 +20,7 @@ use interact::resolver::{GrantSource, Resolution, resolve};
 use opensandbox::acp::{AcpAssembler, METHOD_NOT_FOUND, encode_error};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::frames::ServerEvent;
-use opensandbox::execd::pipe::PipeSession;
+use opensandbox::execd::pipe::{PipeError, PipeSession};
 use serde_json::{Value, json};
 use verify::git::{GitRevision, GitTree};
 use verify::runner::Candidate;
@@ -166,6 +166,11 @@ fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
 
 /// How long one ACP conversation may take.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How many characters of agent text a timeout summary keeps. The tail is
+/// the last thing the agent said before it stalled, so it is the part of
+/// the record that helps the reader.
+const TEXT_TAIL_LIMIT: usize = 200;
 
 /// How long the cleanup of the agent session may take.
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -602,11 +607,45 @@ impl AcpTurn {
     }
 }
 
+/// The pipe one ACP conversation travels on: server events in, stdin out.
+/// Production is the execd pipe; the offline tests script it, so the
+/// refusals and the timeouts can be observed without a container.
+#[async_trait::async_trait]
+pub trait AcpPipe: Send {
+    /// The next server event, or `None` once the pipe is closed.
+    async fn next_event(&mut self) -> Option<ServerEvent>;
+
+    /// Write bytes to the agent's stdin.
+    async fn send_stdin(&self, data: &[u8]) -> Result<(), PipeError>;
+}
+
+#[async_trait::async_trait]
+impl AcpPipe for PipeSession {
+    async fn next_event(&mut self) -> Option<ServerEvent> {
+        PipeSession::next_event(self).await
+    }
+
+    async fn send_stdin(&self, data: &[u8]) -> Result<(), PipeError> {
+        PipeSession::send_stdin(self, data).await
+    }
+}
+
+/// The last `limit` characters of `text`, in reading order.
+///
+/// The tail of a reversed iterator must be reversed back before it is
+/// printed: an error record that reads "L .noitaerc" tells the reader
+/// nothing about what the agent was doing.
+fn readable_tail(text: &str, limit: usize) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let start = characters.len().saturating_sub(limit);
+    characters[start..].iter().collect()
+}
+
 /// Drive one ACP conversation: initialize, open a session, send the
 /// prompt, answer the permission requests by protocol and wait for the
 /// end of the turn.
 pub async fn drive_agent(
-    pipe: &mut PipeSession,
+    pipe: &mut dyn AcpPipe,
     instruction: &str,
     cwd: &str,
     timeout: Duration,
@@ -705,7 +744,7 @@ pub async fn drive_agent(
     }
     turn.summary = format!(
         "timeout, text_tail={:?}",
-        agent_text.chars().rev().take(200).collect::<String>()
+        readable_tail(&agent_text, TEXT_TAIL_LIMIT)
     );
     turn.interactions = interactions;
     turn
@@ -833,6 +872,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     fn config() -> LiveConfig {
         LiveConfig {
@@ -1029,6 +1069,114 @@ mod tests {
                 turn.summary
             );
         }
+    }
+
+    #[test]
+    fn the_readable_tail_keeps_the_last_characters_in_order() {
+        assert_eq!(
+            readable_tail("hello", 200),
+            "hello",
+            "a short text is whole"
+        );
+        let text: String = (0..250).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let tail = readable_tail(&text, 200);
+        assert_eq!(tail.len(), 200, "the tail is capped, not the whole text");
+        assert_eq!(
+            tail,
+            text[text.len() - 200..],
+            "the LAST characters, in order"
+        );
+        assert_ne!(
+            tail,
+            tail.chars().rev().collect::<String>(),
+            "it reads forward: a mirrored tail tells the reader nothing"
+        );
+    }
+
+    fn stdout(message: Value) -> ServerEvent {
+        ServerEvent::Stdout(format!("{message}\n").into_bytes())
+    }
+
+    /// A scripted ACP pipe: the offline fake of the conversation surface.
+    /// Every event is already there, so nothing waits on anything.
+    struct FakePipe {
+        script: std::collections::VecDeque<ServerEvent>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn scripted(script: Vec<ServerEvent>) -> FakePipe {
+        FakePipe {
+            script: script.into(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AcpPipe for FakePipe {
+        async fn next_event(&mut self) -> Option<ServerEvent> {
+            self.script.pop_front()
+        }
+
+        async fn send_stdin(&self, data: &[u8]) -> Result<(), PipeError> {
+            self.sent
+                .lock()
+                .expect("the fake records stdin")
+                .push(String::from_utf8_lossy(data).to_string());
+            Ok(())
+        }
+    }
+
+    fn hello_initialize() -> Vec<ServerEvent> {
+        vec![
+            stdout(json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}})),
+            stdout(json!({"jsonrpc": "2.0", "id": 10, "result": {"sessionId": "s-1"}})),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_timeout_summary_carries_the_agent_text_tail_readable() {
+        // 300 digits: the last 200 are unique enough that a mirrored or
+        // middle-truncated tail cannot match them by accident.
+        let text: String = (0..300)
+            .map(|i| char::from_digit(i % 10, 10).unwrap())
+            .collect();
+        let tail: String = text
+            .chars()
+            .skip(text.chars().count() - TEXT_TAIL_LIMIT)
+            .collect();
+        assert_ne!(
+            tail,
+            tail.chars().rev().collect::<String>(),
+            "the fixture tail is not a palindrome: a mirror cannot pass"
+        );
+        let mut pipe = scripted(
+            hello_initialize()
+                .into_iter()
+                .chain([
+                    stdout(json!({"params": {"update": {"content": {"text": text}}}})),
+                    ServerEvent::Exit { exit_code: None },
+                ])
+                .collect(),
+        );
+        let turn = drive_agent(
+            &mut pipe,
+            "do it",
+            WORKTREE,
+            Duration::from_secs(60),
+            PermissionMode::AllowOnce,
+        )
+        .await;
+        assert!(!turn.completed);
+        assert!(
+            turn.summary.contains(&tail),
+            "the last {TEXT_TAIL_LIMIT} characters appear in order: {:?}",
+            &turn.summary[..turn.summary.len().min(120)]
+        );
+        let mirrored: String = tail.chars().rev().collect();
+        assert!(
+            !turn.summary.contains(&mirrored),
+            "the tail is not printed reversed"
+        );
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
