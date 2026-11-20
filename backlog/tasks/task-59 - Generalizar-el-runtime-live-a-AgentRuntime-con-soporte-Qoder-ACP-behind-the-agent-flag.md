@@ -3,10 +3,10 @@ id: TASK-59
 title: >-
   Generalizar el runtime live a AgentRuntime con soporte Qoder ACP behind the
   --agent flag
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-20T21:46:00Z'
-updated_date: '2026-11-20T21:46:00Z'
+updated_date: '2026-11-20T22:49:00Z'
 labels: []
 dependencies:
   - TASK-58
