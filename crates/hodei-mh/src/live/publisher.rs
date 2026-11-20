@@ -20,7 +20,8 @@ use promote::writer::{BacklogWorkWriter, TicketSnapshot, WorkWriter};
 use verify::runner::Candidate;
 
 use runner::ports::{
-    Closed, Closes, Objective, Publication, PublisherError, PublisherPort, Verification,
+    Checkpointed, Closed, Closes, Objective, Publication, PublisherError, PublisherPort,
+    Verification,
 };
 
 use crate::live::checkpoint::{CandidateRef, LiveCheckpoints};
@@ -69,10 +70,7 @@ impl VerifiedPublisher {
 
     /// The base and the candidate the attempt fences itself to, as git
     /// states them before any effect runs.
-    fn observed_candidate(
-        &self,
-        work_ref: &str,
-    ) -> Result<(String, String), PublisherError> {
+    fn observed_candidate(&self, work_ref: &str) -> Result<(String, String), PublisherError> {
         let base = promote::git::current_ref(&self.project_dir, &self.managed_branch)
             .map_err(|error| Self::failure(work_ref, error.to_string()))?
             .ok_or_else(|| {
@@ -123,20 +121,22 @@ impl VerifiedPublisher {
 
     /// Settle the durable checkpoint of an effect that already moved.
     ///
-    /// A checkpoint that cannot be confirmed NEVER re-runs the effect:
-    /// the promotion is a fact and is reported as promoted with an
-    /// unconfirmed checkpoint, never as a promotion failure inviting a
-    /// second promotion.
+    /// A checkpoint that cannot be confirmed NEVER re-runs the effect
+    /// and NEVER overstates the closure: the promotion is a fact, the
+    /// record is what is uncertain. The attempt then ends as promoted
+    /// with an unconfirmed record, never as a promotion failure that
+    /// would invite a second promotion.
     fn confirm_checkpoint(
         &self,
         candidate_ref: CandidateRef,
         closure: Closed,
         detail: String,
-    ) -> (Closed, String) {
+    ) -> (Closed, Checkpointed, String) {
         match self.checkpoints().confirm(Some(candidate_ref)) {
-            Ok(_) => (closure, detail),
+            Ok(_) => (closure, Checkpointed::Settled, detail),
             Err(error) => (
-                Closed::Unconfirmed,
+                closure,
+                Checkpointed::Uncertain,
                 format!("{detail}; the checkpoint was not confirmed: {error}"),
             ),
         }
@@ -218,11 +218,12 @@ impl PublisherPort for VerifiedPublisher {
                 "promoted {commit} onto {}; the objective owns no ticket, so no work was closed",
                 self.managed_branch
             );
-            let (closure, detail) =
+            let (closure, checkpoint, detail) =
                 self.confirm_checkpoint(candidate_ref(), Closed::NotRequired, detail);
             return Ok(Publication {
                 revision: commit,
                 closure,
+                checkpoint,
                 detail: self.handoff_note(detail),
             });
         }
@@ -280,8 +281,9 @@ impl PublisherPort for VerifiedPublisher {
             .is_ok_and(|snapshot| snapshot.status == CLOSED_STATUS);
         let detail = detail_of(&report, &commit, &self.managed_branch, &closure);
         // The attempt is settled: the durable record says the effect must
-        // not be applied again.
-        let (closure, detail) = self.confirm_checkpoint(
+        // not be applied again. A record that cannot be settled does not
+        // undo the promotion: it is reported as promoted and uncertain.
+        let (closure, checkpoint, detail) = self.confirm_checkpoint(
             candidate_ref(),
             if re_read_closed {
                 Closed::Confirmed
@@ -293,6 +295,7 @@ impl PublisherPort for VerifiedPublisher {
         Ok(Publication {
             revision: commit,
             closure,
+            checkpoint,
             detail: self.handoff_note(detail),
         })
     }

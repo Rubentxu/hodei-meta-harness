@@ -28,7 +28,7 @@ use verify::transport::TransportDigest;
 
 use runner::ports::{AgentError, AgentPort, Objective};
 
-use crate::live::checkpoint::{CandidateRef, GoalIdentity, LiveCheckpoints};
+use crate::live::checkpoint::{CandidateRef, LiveCheckpoints};
 use crate::live::session::SandboxSession;
 use crate::live::{GitIdentity, LiveConfig, LiveError, PermissionMode};
 
@@ -272,16 +272,9 @@ impl AcpAgent {
             .attach_agent(&command, WORKTREE)
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
-        // The durable record is written BEFORE the turn: a crash from here
-        // on leaves a pending checkpoint the boot classifies as uncertain.
-        let record = self
-            .checkpoints
-            .begin(
-                &GoalIdentity::of(work_ref, &objective.instruction, objective.run),
-                objective.run,
-                &agent_session.session_id,
-            )
-            .map_err(|error| Self::failure(work_ref, error))?;
+        // The record and its handoff were written BEFORE the claim, by
+        // the durable attempt port: a crash from here on leaves a
+        // pending checkpoint the boot classifies as uncertain.
         let instruction = instruction_for(&objective.instruction);
         let turn = drive_agent(
             &mut conversation,
@@ -291,11 +284,6 @@ impl AcpAgent {
             self.config.permission,
         )
         .await;
-        // The handoff is rendered from the checkpoint while the session it
-        // describes still exists.
-        if let Err(error) = self.checkpoints.write_handoff(&record) {
-            eprintln!("the live handoff could not be rendered: {error}");
-        }
         let _ = session
             .transport()
             .delete_session(&agent_session.session_id, SESSION_CLEANUP_TIMEOUT)

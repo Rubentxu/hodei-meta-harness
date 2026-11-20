@@ -5,13 +5,21 @@
 //! the attempt was still pending or already confirmed. A rollover always
 //! opens a NEW session, and a confirmed effect is never re-applied; a
 //! pending record is reported as uncertain instead of being executed
-//! again. The handoff is rendered from the checkpoint (never from a
-//! conversation), so a restart can say where the work stood.
+//! again, and it refuses the next attempt until it is resolved. The
+//! handoff is rendered from the checkpoint (never from a conversation)
+//! and travels WITH the Pending record, so a route the boot announces
+//! exists from the moment the record does. The stored instruction is
+//! never the raw text: the handoff's own redactor passes over it before
+//! it is persisted, and the record and the directory are private to the
+//! owner (mode `0600` and `0700`).
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
 
 use rollover::checkpoint::{Checkpoint, RolloverLedger};
-use rollover::handoff::render_handoff;
+use rollover::handoff::{redact_secrets, render_handoff};
+use runner::live::{AttemptGoal, AttemptRecordError, AttemptRecordPort};
 use serde::{Deserialize, Serialize};
 
 /// The file the durable record lives in, inside the project state dir.
@@ -19,6 +27,21 @@ pub const CHECKPOINT_FILE: &str = "live-checkpoint.json";
 
 /// The rendered handoff, inside the project state dir.
 pub const HANDOFF_FILE: &str = "HANDOFF.md";
+
+/// Write a file that only this user can read, and get the bytes onto the
+/// media before the caller publishes them (with a rename, or as the last
+/// word of the attempt).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
 
 /// How far the attempt the record describes got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +136,13 @@ pub enum CheckpointError {
     Handoff { goal: String, reason: String },
 }
 
+/// The instruction as it is persisted: the handoff's own redactor passes
+/// over it BEFORE the record is written, so what survives on the media is
+/// never the raw text.
+fn redacted(text: &str) -> String {
+    redact_secrets(text).trim_end_matches('\n').to_string()
+}
+
 /// The durable checkpoints of one project.
 #[derive(Debug, Clone)]
 pub struct LiveCheckpoints {
@@ -185,6 +215,11 @@ impl LiveCheckpoints {
                 session: session_id.to_string(),
             });
         }
+        // What the record keeps is the redacted instruction, never the
+        // raw text: a secret that reaches the objective never reaches
+        // the media through this path.
+        let next_action = redacted(&goal.next_action);
+        let references: Vec<String> = goal.references.iter().map(|r| redacted(r)).collect();
         let mut ledger = match &previous {
             Some(record) => RolloverLedger::initial(record.checkpoint.clone()),
             None => RolloverLedger::initial(Checkpoint {
@@ -192,9 +227,9 @@ impl LiveCheckpoints {
                 work_ref: goal.work_ref.clone(),
                 epoch: 0,
                 session_id: String::new(),
-                next_action: goal.next_action.clone(),
+                next_action: next_action.clone(),
                 decisions: Vec::new(),
-                references: goal.references.clone(),
+                references: references.clone(),
                 evidences: Vec::new(),
                 failed_strategies: Vec::new(),
             }),
@@ -204,8 +239,8 @@ impl LiveCheckpoints {
         let mut checkpoint = ledger.confirm();
         checkpoint.goal_id = goal.goal_id.clone();
         checkpoint.work_ref = goal.work_ref.clone();
-        checkpoint.next_action = goal.next_action.clone();
-        checkpoint.references = goal.references.clone();
+        checkpoint.next_action = next_action;
+        checkpoint.references = references;
         let record = LiveRecord {
             checkpoint,
             run,
@@ -247,6 +282,10 @@ impl LiveCheckpoints {
     }
 
     /// Render the handoff of `record` and return its path.
+    ///
+    /// The handoff travels WITH the record: it is written before the
+    /// turn starts, from the checkpoint alone, and never from a
+    /// conversation.
     pub fn write_handoff(&self, record: &LiveRecord) -> Result<PathBuf, CheckpointError> {
         let rendered =
             render_handoff(&record.checkpoint).map_err(|error| CheckpointError::Handoff {
@@ -254,37 +293,124 @@ impl LiveCheckpoints {
                 reason: error.to_string(),
             })?;
         let path = self.handoff_path();
-        std::fs::create_dir_all(&self.dir).map_err(|error| CheckpointError::Write {
+        let failure = |reason: String| CheckpointError::Write {
             path: path.display().to_string(),
-            reason: error.to_string(),
-        })?;
-        std::fs::write(&path, rendered).map_err(|error| CheckpointError::Write {
-            path: path.display().to_string(),
-            reason: error.to_string(),
-        })?;
+            reason,
+        };
+        supervisor::paths::private_dir(&self.dir).map_err(|error| failure(error.to_string()))?;
+        write_private(&path, rendered.as_bytes()).map_err(|error| failure(error.to_string()))?;
         Ok(path)
     }
 
     /// Replace the record atomically: a crash leaves either the previous
-    /// record or the new one, never a torn file.
+    /// record or the new one, never a torn file. The directory is private
+    /// (`0700`) and the bytes reach the media (`fsync`) before the rename.
     fn persist(&self, record: &LiveRecord) -> Result<(), CheckpointError> {
         let path = self.path();
         let failure = |reason: String| CheckpointError::Write {
             path: path.display().to_string(),
             reason,
         };
-        std::fs::create_dir_all(&self.dir).map_err(|error| failure(error.to_string()))?;
+        supervisor::paths::private_dir(&self.dir).map_err(|error| failure(error.to_string()))?;
         let encoded =
             serde_json::to_string_pretty(record).map_err(|error| failure(error.to_string()))?;
+        // A stable temporary name: a crash leaves one orphan `.tmp` that
+        // the next write truncates, never a growing pile of suffixes.
         let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, encoded).map_err(|error| failure(error.to_string()))?;
-        std::fs::rename(&temporary, &path).map_err(|error| failure(error.to_string()))
+        write_private(&temporary, encoded.as_bytes())
+            .map_err(|error| failure(error.to_string()))?;
+        if let Err(error) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(failure(error.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// The goal identity an attempt record describes: the run is part of it,
+/// so two attempts at the same reference never share a goal identity.
+fn identity(goal: &AttemptGoal) -> GoalIdentity {
+    GoalIdentity::of(&goal.work_ref, &goal.instruction, Some(goal.run))
+}
+
+/// The durable attempt record the live runtime opens before every claim:
+/// the same JSON checkpoint, seen through the port the runtime speaks.
+/// A confirmed record settles with nothing to redo; a pending one is
+/// uncertain and refuses the next attempt until it is resolved — the
+/// effect it describes is never re-applied to settle it.
+#[derive(Debug, Clone)]
+pub struct CheckpointRecords {
+    checkpoints: LiveCheckpoints,
+}
+
+impl CheckpointRecords {
+    /// The records of `project`, under its private state directory.
+    pub fn for_project(project: &str) -> Self {
+        Self {
+            checkpoints: LiveCheckpoints::for_project(project),
+        }
+    }
+
+    /// The records kept under a private state directory: the injection
+    /// point of the tests, and of any caller that owns its state dir.
+    #[allow(dead_code)]
+    pub fn under(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            checkpoints: LiveCheckpoints::under(dir),
+        }
+    }
+}
+
+impl AttemptRecordPort for CheckpointRecords {
+    fn recover(&self) -> Result<(), AttemptRecordError> {
+        match self.checkpoints.recover() {
+            Ok(Recovery::Fresh) | Ok(Recovery::NothingToRedo(_)) => Ok(()),
+            Ok(Recovery::Uncertain(record)) => Err(AttemptRecordError {
+                work_ref: record.checkpoint.work_ref.clone(),
+                reason: "the previous attempt is recorded as pending: its effects are unknown, \
+                        so it is neither redone nor overwritten — resolve the record \
+                        explicitly before starting another attempt"
+                    .into(),
+            }),
+            Err(error) => Err(AttemptRecordError {
+                work_ref: String::new(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    fn begin_attempt(&self, goal: &AttemptGoal) -> Result<(), AttemptRecordError> {
+        // A session id no previous record can carry: pid, run and clock,
+        // so the same-session refusal can never fire on a fresh attempt
+        // and every rollover really opens a NEW session.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.subsec_nanos())
+            .unwrap_or(0);
+        let session = format!("run-{}-{}-{nanos}", std::process::id(), goal.run);
+        let record = self
+            .checkpoints
+            .begin(&identity(goal), Some(goal.run), &session)
+            .map_err(|error| AttemptRecordError {
+                work_ref: goal.work_ref.clone(),
+                reason: error.to_string(),
+            })?;
+        // The handoff travels WITH the Pending record: a boot that
+        // advertises a route finds the file already on the media.
+        self.checkpoints
+            .write_handoff(&record)
+            .map_err(|error| AttemptRecordError {
+                work_ref: goal.work_ref.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -423,6 +549,138 @@ mod tests {
         assert!(rendered.contains("GC-7"), "rendered: {rendered:?}");
         assert!(rendered.contains("session-1"));
         assert!(!rendered.contains("abc123"), "{rendered}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_record_and_its_directory_are_private_to_the_owner() {
+        let dir = dir("modes");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        checkpoints
+            .begin(&goal("TASK-7"), Some(1), "session-1")
+            .expect("the record");
+        checkpoints
+            .write_handoff(&checkpoints.load().expect("load").expect("record"))
+            .expect("the handoff");
+
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the state directory is private");
+        for name in [CHECKPOINT_FILE, HANDOFF_FILE] {
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap_or_else(|_| panic!("{name} exists"))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{name} is readable only by its owner");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wide_directory_mode_is_tightened_before_the_record_lands() {
+        let dir = dir("tighten");
+        std::fs::create_dir_all(&dir).expect("the loose directory");
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("loosen");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        checkpoints
+            .begin(&goal("TASK-7"), Some(1), "session-1")
+            .expect("the record");
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the record never lands in a shared directory");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_persisted_record_never_carries_the_raw_instruction() {
+        let dir = dir("raw-secret");
+        let checkpoints = LiveCheckpoints::under(&dir);
+        let mut identity = goal("GC-7");
+        identity.next_action = "continue GC-7 with password=hunter2".into();
+        identity.references.push("api key sk-live-9988".into());
+        checkpoints
+            .begin(&identity, Some(1), "session-1")
+            .expect("the record");
+        let raw = std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).expect("the record");
+        assert!(raw.contains("GC-7"), "the identity survives: {raw}");
+        assert!(
+            !raw.contains("hunter2"),
+            "the secret is not on the media: {raw}"
+        );
+        assert!(!raw.contains("9988"), "the key is not on the media: {raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opening_an_attempt_writes_the_record_and_its_handoff_together() {
+        let dir = dir("records-handoff");
+        let records = CheckpointRecords::under(&dir);
+        records
+            .begin_attempt(&AttemptGoal {
+                work_ref: "TASK-7".into(),
+                instruction: "do the work".into(),
+                run: 3,
+            })
+            .expect("the attempt opens");
+        assert!(
+            dir.join(CHECKPOINT_FILE).exists(),
+            "the pending record is on the media"
+        );
+        assert!(
+            dir.join(HANDOFF_FILE).exists(),
+            "the handoff travels with the record, before the turn"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pending_record_refuses_the_next_attempt_and_a_confirmed_one_does_not() {
+        let dir = dir("records-refusal");
+        let records = CheckpointRecords::under(&dir);
+        let goal = AttemptGoal {
+            work_ref: "TASK-7".into(),
+            instruction: "do the work".into(),
+            run: 3,
+        };
+        records.begin_attempt(&goal).expect("the attempt opens");
+
+        // The Pending record is uncertain until it is resolved: the next
+        // attempt is refused, and the effect is never re-applied to settle it.
+        let refused = records.recover();
+        assert!(
+            matches!(&refused, Err(error) if error.work_ref == "TASK-7"),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(&refused, Err(error) if error.reason.contains("pending")),
+            "{refused:?}"
+        );
+
+        // Resolving the record explicitly (confirming it) lets the next
+        // attempt open.
+        LiveCheckpoints::under(&dir)
+            .confirm(None)
+            .expect("the record is confirmed");
+        records.recover().expect("a confirmed record settles");
+        records
+            .begin_attempt(&AttemptGoal { run: 4, ..goal })
+            .expect("the next attempt opens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_project_opens_its_first_attempt_without_a_prior_record() {
+        let dir = dir("records-fresh");
+        let records = CheckpointRecords::under(&dir);
+        records.recover().expect("nothing to recover");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

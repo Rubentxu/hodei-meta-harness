@@ -207,7 +207,13 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
         verifier,
         publisher,
         claims,
-    ))
+    )
+    // The live product keeps durable attempt records: the Pending record
+    // and its handoff are written before the claim, and a pending record
+    // refuses the next attempt. Never the in-memory default.
+    .with_records(Arc::new(checkpoint::CheckpointRecords::for_project(
+        &config.project,
+    ))))
 }
 
 /// Resolve the identity the harness commits the candidate with from the
