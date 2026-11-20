@@ -4,7 +4,7 @@ title: '[MH-A06] Conectar el supervisor de producto al bucle real de objetivos A
 status: Done
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T16:31:00Z'
+updated_date: '2026-11-20T17:13:00Z'
 labels:
   - audit-v0.2
   - product
@@ -90,3 +90,44 @@ Cierre AC4 con paridad demostrada. Bisect (worktree temporal 7d86143, mismo env,
 Los dos rojos preexistentes quedan registrados como descubrimientos independientes (TASK-45 contract drift pending-confirmation, TASK-46 profile-probe fuera de CI); ninguno bloquea AC4 porque el invariante observable — "probes equivalentes sustituidos solo tras comprobar paridad" — se cumple en ambos sentidos: la lane sigue existiendo (no se elimina) y el bisect demostró que lo que el UAT prueba (encadenado, refusal visible, checkpoint liquidado, JSONL sobre pipes, credential-wrapper 0 fugas) es un supervisor estricto de lo que los probes rojos cubren en el mismo host.
 Cierre total de TASK-34: AC1 (un solo Start, dos tickets encadenados, ambos Done, merge-base rc=0, 192 s); AC2 (pause/resume/stop/Renew Unsupported, refrendado run 3 y run 6 con sha c5bf65d3→62f4214e); AC3(i)(ii)(iii) refrendadas en el binario final; AC4 SHA+cierre+cancelación+liberación+paridad. Evidencia total en /tmp/uat-task34/{evidence,evidence2,evidence3,evidence4,evidence5,evidence6,bisect7d}. Métricas del ciclo completo: 6 merges (TASK-35, TASK-41 r1, TASK-40, TASK-41 r2, TASK-42, TASK-44, TASK-43), 1 worker agotado y continuado con handoff WIP adoptado, ~90 min UAT run 5 + ~21 min UAT run 6 + ~9 min bisect, 0 push/0 PR (el supervisor local hace los merges), 0 fugas de tokens en toda la evidencia.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T17:13:00Z
+
+---
+
+=== Resumen del ciclo completo (objetivo /goal) ===
+
+**Tareas cerradas en esta ventana (7d86143..4b89fc1):** TASK-35, TASK-40, TASK-41 (r1+r2), TASK-42, TASK-43, TASK-44, TASK-45, TASK-46. Adicionalmente, TASK-34 con AC4 verificado vía bisect.
+
+**Board:** 0 To Do, 0 In Progress, 46 Done.
+
+**Métricas agregadas del ciclo:**
+- Commits a main: 39 (chore 14, fix 13, merge 8, feat 2, test 1, docs 1) + cierre TASK-45 board commit 4b89fc1 = 40.
+- Merges de tareas: 9 (TASK-35, 40, 41×2, 42, 43, 44, 45, 46).
+- UATs de producto ejecutadas: run 5 (F1 rojo), run 6 (A/C/D/E/F1/F2/F3 verde), bisect 7d (regresión cero probada), lane TASK-46 (puerto no-default), lane TASK-45 (puerto no-default, sustitución assertion).
+- Tokens delegados (estimados en notificaciones de workers): ~15 M tokens / ~370 tool-uses combinados.
+- Estado recursos post-cierre: 0 contenedores sandbox-*, 0 redes lifecycle-server, 0 procesos supervisor/lifecycle product-path, 0 run-state reservations.
+- Próximos reintentos no aplicables: backlog vacío; el único hallazgo pendiente ya registrado como tareas descubrimiento está cerrado.
+
+**Aprendizajes:**
+1. Relevo por presupuesto con brief de 3 entregables nombrados (TASK-43 original 150 turnos → relevo 13 min). El brief ancho es antipatrón; la adopción del árbol parcial como commit 'fix' conservó el 90% del avance cuando git-control rechazó 'wip'.
+2. Bisect antes de reescribir probes (TASK-34 AC4): 6 asserts rojos en probes.sh; bisect entre HEAD 7d86143 y base 924daa1 demostró detalle byte-idéntico, regresión cero. Cerró AC4 con caveat honesto sin ensanchar scope.
+3. Invariante AGENTS.md 'probe solo se retira cuando la invariante está en el productivo' se respeta con evidencia offline, no con intención: TASK-45 opción (b) autorizada solo tras verificar product_flow.rs:115-127 + socket_integration.rs:294 + engine.rs:1132-1150 cubren la negativa.
+4. Triaje por tamaño antes de delegar: TASK-45 (arquiteconómico, 2 opciones) vs TASK-46 (~25 LOC, tractable). Clasificar antes de lanzar worker evita delegar una decisión humana.
+5. Probes que hard-codean puerto no discriminan producto (TASK-46): 9 asserts rojos 'estructuralmente' sin relación con release. La paridad puerto-no-default es evidencia de carril, no opcional.
+6. Carriles separados son la defensa contra falsos verdes: fast-check --all (segundos, sin Docker) nunca certifica probes.sh (minutos, con Docker+proxy+CLI). Cada tarea eligió carril correcto.
+7. git-control cierra tipos de commit; el rejection de 'wip' forzó 'fix' en checkpoint intermedio. Leer la whitelist antes de commit parcial.
+8. Adoptar operaciones vivas antes de relanzar UAT en provider ACP no disponible: esperar o cerrar con caveat honesto; relanzar habría desperdiciado ~40 min.
+
+**Handoffs y reservas reconciliadas:**
+- 7 ficheros HANDOFF.md bajo /tmp/uat-task34/state5/hodei-mh/uat5{a,d,e}/ y state6/uat6{a,d,e,f}/: evidencia histórica de runs previos, conservados (no borradoss).
+- 13 sockets /tmp/uat-task34/sup*.sock (runs 4/5/6): histórico; TASK-39 cerró la fuga productiva; no se purgan.
+- 0 reservas run-state activas verificadas.
+
+**Cierre del objetivo:** backlog vacío, recursos limpios, evidencias verificadas. No se inventan tareas nuevas para prolongar.
+
+---
+<!-- COMMENTS:END -->
