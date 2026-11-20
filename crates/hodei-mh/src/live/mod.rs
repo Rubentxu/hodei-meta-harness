@@ -13,7 +13,8 @@ pub mod requirements;
 pub mod session;
 pub mod verifier;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,15 @@ pub enum PermissionMode {
     Deny,
 }
 
+/// The git identity the harness authors the candidate commit with: the
+/// repository's configured `user.name` and `user.email`, so the promoted
+/// history carries the host's author and not the agent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
 /// The configuration of the live runtime, as the CLI states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConfig {
@@ -56,6 +66,10 @@ pub struct LiveConfig {
     pub managed_branch: String,
     /// How the agent answers permission requests.
     pub permission: PermissionMode,
+    /// The identity the harness commits the candidate with. The CLI leaves
+    /// it empty; the wiring resolves it from the host repository before
+    /// the agent runs.
+    pub author: Option<GitIdentity>,
 }
 
 impl LiveConfig {
@@ -86,6 +100,10 @@ pub enum LiveError {
     NotARepository { path: String },
     #[error("the managed branch '{branch}' does not exist in {path}")]
     MissingBranch { branch: String, path: String },
+    #[error(
+        "the repository {path} has no user.name/user.email: the harness authors the candidate commit with the host identity, so git must be configured"
+    )]
+    MissingIdentity { path: String },
     #[error("the tracker did not answer at boot: {0}")]
     Tracker(String),
     #[error("the claims of the project could not be opened: {0}")]
@@ -116,6 +134,12 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
             path: config.project_dir.display().to_string(),
         });
     }
+    // The harness authors the candidate commit, so the host identity must
+    // exist before any port is built.
+    let config = LiveConfig {
+        author: Some(host_identity(&config.project_dir)?),
+        ..config.clone()
+    };
     let tracker = Arc::new(BacklogTracker::new("backlog", &config.tracker_dir));
     tracker
         .snapshot()
@@ -160,6 +184,32 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
     ))
 }
 
+/// Resolve the identity the harness commits the candidate with from the
+/// host repository's configuration (local or global, as git resolves it).
+fn host_identity(project_dir: &Path) -> Result<GitIdentity, LiveError> {
+    let missing = || LiveError::MissingIdentity {
+        path: project_dir.display().to_string(),
+    };
+    let name = git_config(project_dir, "user.name").ok_or_else(missing)?;
+    let email = git_config(project_dir, "user.email").ok_or_else(missing)?;
+    Ok(GitIdentity { name, email })
+}
+
+/// One configured git value, or `None` when it is unset or empty.
+fn git_config(project_dir: &Path, key: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Build the live configuration from the CLI arguments.
 pub fn config_from_args(args: &[String], project: &str) -> Result<LiveConfig, LiveError> {
     fn value(args: &[String], name: &str) -> Option<String> {
@@ -195,6 +245,7 @@ pub fn config_from_args(args: &[String], project: &str) -> Result<LiveConfig, Li
         tracker_dir: PathBuf::from(required(args, "--tracker-dir")?),
         managed_branch: required(args, "--managed-branch")?,
         permission,
+        author: None,
     })
 }
 
@@ -262,5 +313,42 @@ mod tests {
         assert_eq!(config.permission, PermissionMode::AllowOnce);
         assert_eq!(config.proxy_url, crate::profile_run::DEFAULT_PROXY_URL);
         assert_eq!(config.project, "project");
+        assert_eq!(
+            config.author, None,
+            "the CLI states no identity: the wiring resolves it"
+        );
+    }
+
+    #[test]
+    fn the_host_identity_comes_from_the_repository_configuration() {
+        let dir = std::env::temp_dir().join(format!("hodei-live-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        hodei_mh_workspace::git::init_fixture_repo(&dir).expect("the fixture repository");
+        let configure = |key: &str, value: &str| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["config", "--local", key, value])
+                .status()
+                .expect("git is available");
+            assert!(status.success(), "git config {key}");
+        };
+
+        configure("user.name", "Harness Author");
+        configure("user.email", "harness@example.com");
+        let identity = host_identity(&dir).expect("the configured identity");
+        assert_eq!(identity.name, "Harness Author");
+        assert_eq!(identity.email, "harness@example.com");
+
+        // An empty local value is not an identity, even when a global one
+        // exists: the harness would commit under a name that says nothing.
+        configure("user.name", "");
+        match host_identity(&dir) {
+            Err(LiveError::MissingIdentity { path }) => {
+                assert_eq!(path, dir.display().to_string());
+            }
+            other => panic!("expected MissingIdentity, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

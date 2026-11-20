@@ -4,7 +4,9 @@
 //! The sandbox is created for the attempt alone and released on every
 //! path. The candidate is observed WHERE IT LIVES — the bundle, the head
 //! and the tree are read before the sandbox goes away — so the
-//! verification judges the very commit the agent produced.
+//! verification judges the very state the agent left. The commit itself
+//! is authored by the harness, with the host identity, so no agent
+//! attribution reaches the promoted history.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,7 +23,7 @@ use verify::transport::TransportDigest;
 use runner::ports::{AgentError, AgentPort, Objective};
 
 use crate::live::session::SandboxSession;
-use crate::live::{LiveConfig, LiveError, PermissionMode};
+use crate::live::{GitIdentity, LiveConfig, LiveError, PermissionMode};
 
 /// The worktree the agent works in, inside the sandbox.
 pub const WORKTREE: &str = "/workspace/work";
@@ -125,6 +127,12 @@ impl AcpAgent {
         objective: &Objective,
     ) -> Result<Candidate, AgentError> {
         let work_ref = objective.work_ref.as_str();
+        let author = self.config.author.as_ref().ok_or_else(|| {
+            Self::failure(
+                work_ref,
+                "the host git identity is not wired: the harness authors the candidate commit, so it must be resolved before the agent runs",
+            )
+        })?;
         let base = self.build_bundle(work_ref).await?;
         let bundle = tokio::fs::read(self.config.bundle_path())
             .await
@@ -162,6 +170,22 @@ impl AcpAgent {
                 format!("the agent did not finish its turn: {}", turn.summary),
             ));
         }
+        // The harness authors the candidate commit: whatever the agent
+        // committed on its own is squashed into one commit carrying the
+        // host identity and a policy-neutral message.
+        let trees = session
+            .run_checked(&staged_trees_command(WORKTREE, &base))
+            .await
+            .map_err(|error| Self::failure(work_ref, error))?;
+        let (index_tree, base_tree) = staged_trees(&trees)
+            .ok_or_else(|| Self::failure(work_ref, "the staged worktree named no tree"))?;
+        if let Some(refusal) = unchanged_stage(work_ref, index_tree, base_tree) {
+            return Err(refusal);
+        }
+        session
+            .run_checked(&commit_command(WORKTREE, &base, author, work_ref))
+            .await
+            .map_err(|error| Self::failure(work_ref, error))?;
         session
             .run_checked(&export_command())
             .await
@@ -180,12 +204,6 @@ impl AcpAgent {
             .map_err(|error| Self::failure(work_ref, error))?;
         let revision =
             GitRevision::parse(head.trim()).map_err(|error| Self::failure(work_ref, error))?;
-        if revision.as_str() == base {
-            return Err(Self::failure(
-                work_ref,
-                "the agent produced no new commit: HEAD is still the managed state",
-            ));
-        }
         let tree = GitTree::parse(tree.trim()).map_err(|error| Self::failure(work_ref, error))?;
         Ok(Candidate {
             revision,
@@ -354,11 +372,57 @@ fn export_command() -> String {
     format!("git -C {WORKTREE} bundle create {OUTGOING_BUNDLE} --all")
 }
 
+/// The command that stages the worktree and prints the index tree and the
+/// base tree, so the two can be compared without leaving the sandbox.
+fn staged_trees_command(worktree: &str, base: &str) -> String {
+    format!(
+        "git -C {worktree} add -A && git -C {worktree} write-tree && git -C {worktree} rev-parse {base_tree}",
+        worktree = crate::probe_util::shell_quote(worktree),
+        base_tree = crate::probe_util::shell_quote(&format!("{base}^{{tree}}")),
+    )
+}
+
+/// The two trees printed by [`staged_trees_command`].
+fn staged_trees(output: &str) -> Option<(&str, &str)> {
+    let mut trees = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    Some((trees.next()?, trees.next()?))
+}
+
+/// The refusal when the staged worktree is still the base state, so there
+/// is nothing to promote.
+fn unchanged_stage(work_ref: &str, index_tree: &str, base_tree: &str) -> Option<AgentError> {
+    (index_tree.trim() == base_tree.trim()).then(|| AgentError {
+        work_ref: work_ref.to_string(),
+        reason: "the agent produced no changes to the managed state: the staged worktree is still the base tree".to_string(),
+    })
+}
+
+/// The command that records the final state of the worktree as ONE commit
+/// on top of the base, authored by the harness with the host identity.
+///
+/// The soft reset drops any commit the agent made on its own without
+/// touching the worktree, so its attribution and trailers never reach the
+/// promoted history.
+fn commit_command(worktree: &str, base: &str, author: &GitIdentity, work_ref: &str) -> String {
+    let message = format!("hodei-mh: verified work for {work_ref}");
+    format!(
+        "git -C {worktree} add -A && git -C {worktree} reset -q --soft {base} && git -C {worktree} -c user.name={name} -c user.email={email} commit -q -m {message}",
+        worktree = crate::probe_util::shell_quote(worktree),
+        base = crate::probe_util::shell_quote(base),
+        name = crate::probe_util::shell_quote(&author.name),
+        email = crate::probe_util::shell_quote(&author.email),
+        message = crate::probe_util::shell_quote(&message),
+    )
+}
+
 /// The instruction the agent receives: the objective, and the mechanics
 /// of the sandbox it works in.
 fn instruction_for(instruction: &str) -> String {
     format!(
-        "{}\n\nWork inside {WORKTREE}. Commit your changes with git (user hodei-mh <hodei-mh@local>). Do not push.",
+        "{}\n\nWork inside {WORKTREE}: edit the files there. Do not commit: the harness records the final state of the worktree as the candidate commit. Do not add Co-authored-by or any other attribution trailers, and do not push.",
         instruction.trim()
     )
 }
@@ -538,6 +602,17 @@ mod tests {
             tracker_dir: PathBuf::from("/tmp/project"),
             managed_branch: "hodei-mh/main".into(),
             permission: PermissionMode::AllowOnce,
+            author: Some(GitIdentity {
+                name: "Harness Author".into(),
+                email: "harness@example.com".into(),
+            }),
+        }
+    }
+
+    fn harness_identity() -> GitIdentity {
+        GitIdentity {
+            name: "Harness Author".into(),
+            email: "harness@example.com".into(),
         }
     }
 
@@ -568,6 +643,11 @@ mod tests {
         let instruction = instruction_for("do the work");
         assert!(instruction.starts_with("do the work"));
         assert!(instruction.contains(WORKTREE));
+        // The harness authors the commit: the agent is told to leave the
+        // history alone, and no agent identity is announced anywhere.
+        assert!(instruction.contains("Do not commit"));
+        assert!(instruction.contains("Co-authored-by"));
+        assert!(!instruction.contains("hodei-mh@local"));
     }
 
     #[test]
@@ -616,6 +696,41 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    /// Run a command string exactly as the sandbox shell would, in the
+    /// fixture repository.
+    ///
+    /// The fixture runs a PLAIN git, like the sandbox does: the host may
+    /// install a policy front-end as a shell script earlier on PATH, and
+    /// that front-end does not judge the sandbox. The global and system
+    /// git configuration are emptied for the same reason.
+    fn run_shell(dir: &Path, command: &str) -> String {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let plain: Vec<PathBuf> = std::env::split_paths(&path)
+            .filter(|directory| {
+                let candidate = directory.join("git");
+                !std::fs::read(&candidate)
+                    .map(|bytes| bytes.starts_with(b"#!"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let plain = std::env::join_paths(&plain).unwrap_or(path);
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(dir)
+            .env("PATH", plain)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("sh is available");
+        assert!(
+            output.status.success(),
+            "sh -c {command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn fixture_repo(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("hodei-live-agent-{}-{tag}", std::process::id()));
@@ -646,6 +761,112 @@ mod tests {
             .expect("the base of the managed branch");
         assert_eq!(base, managed, "the base is the managed state");
         assert_ne!(base, main, "the base is not the main branch");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn the_candidate_commit_quotes_identity_base_and_message() {
+        let author = GitIdentity {
+            name: "Rubén's Agent".into(),
+            email: "ruben@example.com".into(),
+        };
+        let work_ref = "TASK-1's work";
+        let command = commit_command(WORKTREE, "abc123", &author, work_ref);
+        let message = "hodei-mh: verified work for TASK-1's work";
+        assert!(
+            command.contains(&crate::probe_util::shell_quote(message)),
+            "the message is one quoted word: {command}"
+        );
+        assert!(
+            command.contains(&crate::probe_util::shell_quote(&author.name)),
+            "the identity name is quoted: {command}"
+        );
+        assert!(command.contains(&crate::probe_util::shell_quote(&author.email)));
+        assert!(command.contains(&crate::probe_util::shell_quote("abc123")));
+        assert!(command.contains(&crate::probe_util::shell_quote(WORKTREE)));
+        // The single quote of the work reference never leaves its quotes.
+        assert!(
+            command.contains(r#"'hodei-mh: verified work for TASK-1'\''s work'"#),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn the_harness_squashes_the_agent_commit_into_one_candidate_commit() {
+        let repo = fixture_repo("squash");
+        let base = commit_file(&repo, "managed.txt", "managed\n", "managed state");
+        // The agent commits on its own, under its own identity and with
+        // an attribution trailer.
+        std::fs::write(repo.join("agent.txt"), "agent work\n").expect("the agent file");
+        git(&repo, &["add", "-A"]);
+        let agent = hodei_mh_workspace::git::commit_index(
+            &repo,
+            "chore: do it\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>",
+        )
+        .expect("the agent commit");
+        assert_ne!(agent, base);
+        // And leaves one file uncommitted.
+        std::fs::write(repo.join("uncommitted.txt"), "harness records this\n")
+            .expect("the uncommitted file");
+
+        let worktree = repo.to_str().expect("the fixture path is UTF-8");
+        let command = commit_command(worktree, &base, &harness_identity(), "TASK-9");
+        run_shell(&repo, &command);
+
+        assert_eq!(
+            git(&repo, &["rev-parse", "HEAD^"]),
+            base,
+            "one child of base"
+        );
+        assert_eq!(
+            git(&repo, &["rev-list", "--count", &format!("{base}..HEAD")]),
+            "1",
+            "the agent commit was squashed away"
+        );
+        assert_eq!(git(&repo, &["log", "-1", "--format=%an"]), "Harness Author");
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%ae"]),
+            "harness@example.com"
+        );
+        assert_eq!(git(&repo, &["log", "-1", "--format=%cn"]), "Harness Author");
+        assert_eq!(
+            git(&repo, &["log", "-1", "--format=%ce"]),
+            "harness@example.com"
+        );
+        let message = git(&repo, &["log", "-1", "--format=%B"]);
+        assert_eq!(message, "hodei-mh: verified work for TASK-9");
+        assert!(!message.contains("Co-Authored-By"));
+        assert!(
+            !git(&repo, &["log", "-1", "--format=%ae|%ce"]).contains("hodei-mh@local"),
+            "no agent identity survives in the candidate commit"
+        );
+        assert!(
+            git(&repo, &["ls-tree", "-r", "--name-only", "HEAD"])
+                .lines()
+                .any(|line| line == "uncommitted.txt"),
+            "the uncommitted file is part of the candidate tree"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_worktree_that_still_matches_the_base_is_refused() {
+        let repo = fixture_repo("no-changes");
+        let base = commit_file(&repo, "managed.txt", "managed\n", "managed state");
+        let worktree = repo.to_str().expect("the fixture path is UTF-8");
+        let output = run_shell(&repo, &staged_trees_command(worktree, &base));
+        let (index_tree, base_tree) = staged_trees(&output).expect("the two trees");
+        assert_eq!(index_tree, base_tree, "nothing changed on the worktree");
+
+        let refusal = unchanged_stage("TASK-9", index_tree, base_tree).expect("the refusal");
+        assert_eq!(refusal.work_ref, "TASK-9");
+        assert!(
+            refusal.reason.contains("no changes"),
+            "the refusal says what is missing: {}",
+            refusal.reason
+        );
 
         let _ = std::fs::remove_dir_all(&repo);
     }
