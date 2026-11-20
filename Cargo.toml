@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/opensandbox", "crates/hodei-mh-interact", "crates/hodei-mh-budget", "crates/hodei-mh", "crates/hodei-mh-runner", "crates/hodei-mh-workspace", "crates/hodei-mh-tracker", "crates/hodei-mh-coordinator", "crates/hodei-mh-run", "crates/hodei-mh-goal", "crates/hodei-mh-rollover", "crates/hodei-mh-verify", "crates/hodei-mh-promote", "crates/hodei-mh-release", "crates/hodei-mh-supervisor", "crates/hodei-mh-profiles", "crates/lifecycle-server"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 
