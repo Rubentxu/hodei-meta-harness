@@ -6,7 +6,7 @@
 //! that was really observed. A verdict that is not backed by evidence is
 //! never produced here.
 
-use verify::runner::{Candidate, CleanRunner};
+use verify::runner::{Candidate, Check, CleanRunner};
 
 use runner::ports::{Objective, Verification, VerifierError, VerifierPort};
 
@@ -23,9 +23,16 @@ impl VerifierPort for CleanVerifier {
         objective: &Objective,
         candidate: &Candidate,
     ) -> Result<Verification, VerifierError> {
+        // The verifier judges the executable checks; the criterion that
+        // declares each one is the closure's business.
+        let checks: Vec<Check> = objective
+            .checks
+            .iter()
+            .map(|declared| declared.check.clone())
+            .collect();
         let evidence = self
             .runner
-            .verify(&objective.work_ref, candidate, &objective.checks)
+            .verify(&objective.work_ref, candidate, &checks)
             .await
             .map_err(|error| VerifierError {
                 work_ref: objective.work_ref.clone(),

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use run::run::Phase;
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome, RunId};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
@@ -65,6 +66,13 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// How many times the request limit the supervisor is willing to
 /// discard before it gives up on a client that does not stop sending.
 const DRAIN_FACTOR: usize = 4;
+
+/// How many attempts one run may chain after confirmed objectives.
+///
+/// A confirmed objective keeps the session alive and the run selects the
+/// next work; the bound keeps that chain from becoming an unbounded loop
+/// nobody observes. Reaching it ends the run with a visible verdict.
+pub const MAX_CHAINED_ATTEMPTS: usize = 32;
 
 /// How long the supervisor waits for the rest of an abusive request.
 ///
@@ -524,23 +532,59 @@ async fn handle_connection(
         if line.trim().is_empty() {
             continue;
         }
-        let handled = respond_line(&core, runtime.as_ref(), &line, limits).await;
-        write_answer(&mut writer, &handled.response, limits).await?;
-        // The runtime runs OUTSIDE the lock: the core is never held
-        // across an await.
-        match handled.follow_up {
-            FollowUp::Nothing => {}
-            FollowUp::Execute { request, run } => {
-                spawn_execution(core.clone(), runtime.clone(), pending.clone(), request, run);
-            }
-            FollowUp::Cancel { run } => {
-                cancel_execution(runtime.as_ref(), &pending, run, CANCEL_GRACE).await;
-                // The attempt has ended, whichever way: a new one may run.
-                lock_core(&core).winding_down = false;
-            }
-        }
+        serve_line(
+            &core,
+            runtime.as_ref(),
+            &pending,
+            &line,
+            limits,
+            &mut writer,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// Serve one request line: answer it, then apply what it asked for.
+///
+/// The follow-up runs even when the answer could not be written: a Stop
+/// that only reached a closed socket would leave its attempt running, and
+/// a Start would wedge in `starting` with nobody executing it. The first
+/// write failure, if any, is returned AFTER the follow-up has been
+/// applied.
+async fn serve_line<W>(
+    core: &SharedCore,
+    runtime: Option<&Arc<dyn ObjectiveRuntime>>,
+    pending: &Pending,
+    line: &str,
+    limits: Limits,
+    writer: &mut W,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let handled = respond_line(core, runtime, line, limits).await;
+    let written = write_answer(writer, &handled.response, limits).await;
+    // The runtime runs OUTSIDE the lock: the core is never held across an
+    // await.
+    match handled.follow_up {
+        FollowUp::Nothing => {}
+        FollowUp::Execute { request, run } => {
+            spawn_execution(
+                core.clone(),
+                runtime.cloned(),
+                pending.clone(),
+                request,
+                run,
+            );
+        }
+        FollowUp::Cancel { run } => {
+            cancel_execution(runtime, pending, run, CANCEL_GRACE).await;
+            // The attempt has ended, whichever way: a new one may run.
+            lock_core(core).winding_down = false;
+        }
+    }
+    written
 }
 
 /// Read and DISCARD what an abusive client keeps sending.
@@ -573,11 +617,10 @@ async fn drain_input(reader: &mut BufReader<OwnedReadHalf>, limit: usize, grace:
 }
 
 /// Write one answer, within the deadline and within the size limit.
-async fn write_answer(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &Response,
-    limits: Limits,
-) -> std::io::Result<()> {
+async fn write_answer<W>(writer: &mut W, response: &Response, limits: Limits) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut payload = serde_json::to_string(response).unwrap_or_default();
     payload.push('\n');
     // A client that never reads must not hold the connection forever.
@@ -613,6 +656,12 @@ fn peer_is_ours(_stream: &UnixStream) -> bool {
 ///
 /// The runtime NEVER runs while the core is locked: the lock is taken
 /// only to read the epoch and to apply the outcome.
+///
+/// A confirmed objective does not end the session: the core keeps the run
+/// live, so the same run asks the runtime for its next selection
+/// (`work_ref: None`) instead of waiting for a Start the engine would
+/// refuse while the run is in flight. The chain is bounded; an idle
+/// outcome, a rejected or failed one and a stop all end it.
 fn spawn_execution(
     core: SharedCore,
     runtime: Option<Arc<dyn ObjectiveRuntime>>,
@@ -625,45 +674,32 @@ fn spawn_execution(
         // cannot happen; the guard keeps the failure honest anyway.
         return;
     };
+    let project = request.project.clone();
     let handle = tokio::spawn(async move {
-        let started =
-            tokio::time::timeout(CONFIRMATION_DEADLINE, runtime.start(run, request)).await;
-        match started {
-            Ok(Ok(objective)) => {
-                {
-                    let mut guard = lock_core(&core);
-                    engine::confirm_runtime(&mut guard, run.number(), &runtime.identity());
-                }
-                // The objective ends on its own time; its verdict is
-                // recorded when it does.
-                let outcome = objective.completion().await;
-                let mut guard = lock_core(&core);
-                engine::record_outcome(&mut guard, run.number(), outcome);
+        let mut attempt = request;
+        for _ in 0..MAX_CHAINED_ATTEMPTS {
+            if !run_attempt(&core, &runtime, run, attempt).await {
+                return;
             }
-            Ok(Err(error)) => {
-                let mut guard = lock_core(&core);
-                engine::record_outcome(
-                    &mut guard,
-                    run.number(),
-                    ObjectiveOutcome::Failed {
-                        reason: error.to_string(),
-                    },
-                );
-            }
-            Err(_elapsed) => {
-                let mut guard = lock_core(&core);
-                engine::record_outcome(
-                    &mut guard,
-                    run.number(),
-                    ObjectiveOutcome::Failed {
-                        reason: format!(
-                            "the runtime did not confirm the objective within {}s",
-                            CONFIRMATION_DEADLINE.as_secs()
-                        ),
-                    },
-                );
-            }
+            // The objective held: the next selection belongs to the SAME
+            // run, and it is never a named one.
+            attempt = ObjectiveRequest {
+                project: project.clone(),
+                work_ref: None,
+            };
         }
+        // The bound was reached with the run still live: it is ended with
+        // a visible verdict instead of leaving a run nobody executes.
+        let mut guard = lock_core(&core);
+        engine::record_outcome(
+            &mut guard,
+            run.number(),
+            ObjectiveOutcome::Failed {
+                reason: format!(
+                    "the objective kept holding for {MAX_CHAINED_ATTEMPTS} chained attempts: the supervisor stopped selecting work for it"
+                ),
+            },
+        );
     });
     // Keep the handle so a Stop can cancel the in-flight execution.
     let mut slot = pending
@@ -679,6 +715,61 @@ fn spawn_execution(
     if let Some((_, previous)) = slot.replace((run, handle)) {
         previous.abort();
     }
+}
+
+/// Run ONE attempt of `run` and record what the runtime reports.
+///
+/// Returns whether the run may chain another attempt: the outcome was a
+/// confirmed objective and the core still holds this same run, live and
+/// unpaused, with no stop raised against it. The check happens under the
+/// same lock that records the outcome, so a stop that lands first always
+/// wins.
+async fn run_attempt(
+    core: &SharedCore,
+    runtime: &Arc<dyn ObjectiveRuntime>,
+    run: RunId,
+    request: ObjectiveRequest,
+) -> bool {
+    let started = tokio::time::timeout(CONFIRMATION_DEADLINE, runtime.start(run, request)).await;
+    let outcome = match started {
+        Ok(Ok(objective)) => {
+            {
+                let mut guard = lock_core(core);
+                // The first attempt moves the run from `starting` to
+                // `running`. A chained attempt runs inside a run that is
+                // already running: its own confirmation is its outcome.
+                if guard
+                    .run
+                    .as_ref()
+                    .is_some_and(|state| *state.phase() == Phase::Starting)
+                {
+                    engine::confirm_runtime(&mut guard, run.number(), &runtime.identity());
+                }
+            }
+            // The objective ends on its own time; its verdict is
+            // recorded when it does.
+            objective.completion().await
+        }
+        Ok(Err(error)) => ObjectiveOutcome::Failed {
+            reason: error.to_string(),
+        },
+        Err(_elapsed) => ObjectiveOutcome::Failed {
+            reason: format!(
+                "the runtime did not confirm the objective within {}s",
+                CONFIRMATION_DEADLINE.as_secs()
+            ),
+        },
+    };
+    let mut guard = lock_core(core);
+    engine::record_outcome(&mut guard, run.number(), outcome.clone());
+    matches!(outcome, ObjectiveOutcome::Confirmed { .. })
+        && guard.epoch == run.number()
+        && !guard.paused
+        && guard.stop_reason.is_none()
+        && guard
+            .run
+            .as_ref()
+            .is_some_and(|state| state.is_live() && *state.phase() == Phase::Running)
 }
 
 /// Stop the execution of `run`: the user stopped the run.
@@ -889,7 +980,9 @@ mod tests {
     use super::*;
     use crate::protocol::SupervisorAction;
     use run::runtime::{ObjectiveHandle, RenewOutcome, RuntimeError, RuntimeIdentity};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     /// A runtime whose renewal answer is scripted: the server must pass it
     /// through, not invent one.
@@ -985,6 +1078,82 @@ mod tests {
             }
             other => panic!("expected action outcome, got {other:?}"),
         }
+    }
+
+    /// A writer whose peer is gone: every write fails.
+    struct ClosedWriter;
+
+    impl tokio::io::AsyncWrite for ClosedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the client closed the socket",
+            )))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_follow_up_of_a_line_runs_even_when_the_answer_cannot_be_written() {
+        // A Start whose answer is lost must still reach the runtime: the
+        // run would wedge in `starting` otherwise.
+        let recorded = Arc::new(RecordingRuntime::default());
+        let runtime: Arc<dyn ObjectiveRuntime> = recorded.clone();
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::live("recording"),
+        )));
+        let pending: Pending = Arc::new(Mutex::new(None));
+        let line =
+            r#"{"req":"action","action":{"action":"start","project":"gc","ticket":"TASK-9"}}"#;
+
+        let written = serve_line(
+            &core,
+            Some(&runtime),
+            &pending,
+            line,
+            Limits::default(),
+            &mut ClosedWriter,
+        )
+        .await;
+
+        assert!(
+            written.is_err(),
+            "the write failure is returned to the connection"
+        );
+        let (held_run, handle) = pending
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the start spawned its execution");
+        assert_eq!(held_run, RunId(1));
+        handle.await.expect("the execution ends");
+        assert_eq!(
+            recorded.started(),
+            vec![RunId(1)],
+            "the objective reached the runtime although the answer was lost"
+        );
+        assert!(
+            recorded.cancelled().is_empty(),
+            "nothing was stopped: the follow-up of the start is not a stop"
+        );
     }
 
     #[test]

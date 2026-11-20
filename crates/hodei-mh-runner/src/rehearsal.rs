@@ -6,6 +6,7 @@
 //! says that nothing was closed: a rehearsal never pretends to be a
 //! live execution.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use run::runtime::{
@@ -20,7 +21,7 @@ use verify::transport::TransportDigest;
 
 use crate::core::GoalRunner;
 use crate::ports::{
-    AgentError, AgentPort, Objective, Publication, PublisherError, PublisherPort,
+    AgentError, AgentPort, Objective, ObjectiveCheck, Publication, PublisherError, PublisherPort,
     RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
 };
 
@@ -83,10 +84,10 @@ impl RequirementsPort for ScriptedRequirements {
         Ok(Objective {
             work_ref: item.id.clone(),
             instruction: format!("rehearse the work of {} ({})", item.id, item.title),
-            checks: vec![Check {
+            checks: vec![ObjectiveCheck::free(Check {
                 id: "AC-1".into(),
                 command: format!("rehearse {}", item.id),
-            }],
+            })],
         })
     }
 }
@@ -219,6 +220,11 @@ impl Gates {
     }
 }
 
+/// The holder an already-ran item is claimed by in the rehearsal's own
+/// selection: the rehearsal closes nothing, so the tracker would offer
+/// the same work again; the runtime remembers what it ran and skips it.
+const ALREADY_RAN_HOLDER: &str = "trial-already-ran";
+
 /// The rehearsal runtime: it names itself a rehearsal, it selects work
 /// from a fixed scenario and it publishes nothing.
 pub struct TrialRuntime {
@@ -229,6 +235,10 @@ pub struct TrialRuntime {
     /// Whether the scripted verifier holds the objective. The rehearsal
     /// that does not hold is the one that publishes nothing.
     holds: bool,
+    /// The work this runtime already ran. The rehearsal closes nothing, so
+    /// without this memory every selection would pick the same item again;
+    /// with it, the run ends idle when no NEW work is left.
+    ran: Mutex<Vec<String>>,
 }
 
 impl TrialRuntime {
@@ -251,7 +261,28 @@ impl TrialRuntime {
             finish: None,
             publisher,
             holds,
+            ran: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The already-ran work as the selection sees it: held by the trial
+    /// itself, so no later selection repeats it.
+    fn ran_held(&self) -> BTreeMap<String, String> {
+        let ran = self
+            .ran
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ran.iter()
+            .map(|work_ref| (work_ref.clone(), ALREADY_RAN_HOLDER.to_string()))
+            .collect()
+    }
+
+    /// Remember the work an attempt executed, so no later selection repeats it.
+    fn record_ran(&self, work_ref: &str) {
+        self.ran
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(work_ref.to_string());
     }
 
     /// The runner of ONE objective: the scenario plus the work the
@@ -314,8 +345,11 @@ impl ObjectiveRuntime for TrialRuntime {
             accept.notified().await;
         }
         let runner = self.runner_for(request.work_ref.as_deref());
+        // The work this rehearsal already ran is held by the trial itself:
+        // a chained selection moves to the NEXT work and the run ends
+        // idle when nothing new is left.
         let selected = runner
-            .select(request.work_ref.as_deref())
+            .select_in(request.work_ref.as_deref(), &self.ran_held())
             .await
             .map_err(|error| RuntimeError(error.to_string()))?;
         let Some(item) = selected else {
@@ -323,6 +357,7 @@ impl ObjectiveRuntime for TrialRuntime {
                 reason: "no eligible work".into(),
             }));
         };
+        self.record_ran(&item.id);
         let objective = runner
             .objective_of(&item)
             .map_err(|error| RuntimeError(error.to_string()))?;
@@ -334,6 +369,18 @@ impl ObjectiveRuntime for TrialRuntime {
             }
             runner.execute(&objective).await
         }))
+    }
+
+    /// The rehearsal winds down when the stop reaches it: the gates it
+    /// waits on are released, so a stopped chain ends by its own verdict
+    /// instead of waiting out the cancel grace and being aborted.
+    fn cancel(&self, _run: RunId) {
+        if let Some(accept) = &self.accept {
+            accept.notify_one();
+        }
+        if let Some(finish) = &self.finish {
+            finish.notify_one();
+        }
     }
 
     /// The rehearsal simulates the renewal it was asked for: it has no
@@ -428,6 +475,70 @@ mod tests {
         let recorded = runtime.publications();
         assert_eq!(recorded.len(), 1);
         assert!(!recorded[0].closed);
+    }
+
+    #[tokio::test]
+    async fn the_rehearsal_chain_selects_new_work_and_never_repeats_what_it_ran() {
+        // The chained selection of a live run: after the objective the
+        // client named, every unnamed selection asks for the NEXT work
+        // of the same run. The rehearsal closes nothing, so the only
+        // thing that moves the chain forward is what this runtime
+        // already ran; with no NEW work left the run ends idle.
+        let runtime = TrialRuntime::new();
+        let named = runtime
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: Some("TASK-9".into()),
+                },
+            )
+            .await
+            .expect("the named work is rehearsed")
+            .completion()
+            .await;
+        assert!(
+            matches!(&named, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "TASK-9"),
+            "{named:?}"
+        );
+
+        // The chained attempt names nothing: the runtime selects, and it
+        // must not repeat the work it already ran.
+        let next = runtime
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: None,
+                },
+            )
+            .await
+            .expect("the chain selects again")
+            .completion()
+            .await;
+        assert!(
+            matches!(&next, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "T-1"),
+            "the chain moves to the next new work: {next:?}"
+        );
+
+        // T-1 is already ran and T-2 stays blocked by a rehearsal that
+        // closes nothing: there is no new work, and the chain ends idle.
+        let idle = runtime
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "trial".into(),
+                    work_ref: None,
+                },
+            )
+            .await
+            .expect("the runtime answers")
+            .completion()
+            .await;
+        assert!(
+            matches!(idle, ObjectiveOutcome::Idle { .. }),
+            "no new work left is idle, never a repeat: {idle:?}"
+        );
     }
 
     #[tokio::test]

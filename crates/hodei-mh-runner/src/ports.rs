@@ -9,6 +9,36 @@ use tracker::core::WorkItem;
 use verify::evidence::EvidenceSet;
 use verify::runner::{Candidate, Check};
 
+/// A check the objective declares, with the acceptance criterion that
+/// declares it.
+///
+/// The index is the one the tracker states for the criterion, never a
+/// position in a list: a check declared in the description, or under a
+/// criterion the tracker does not index, carries no index instead of a
+/// guessed one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectiveCheck {
+    /// The executable check.
+    pub check: Check,
+    /// The acceptance criterion that declares it, when one does.
+    pub ac: Option<usize>,
+}
+
+impl ObjectiveCheck {
+    /// A check declared outside any acceptance criterion.
+    pub fn free(check: Check) -> Self {
+        Self { check, ac: None }
+    }
+
+    /// A check declared under an acceptance criterion.
+    pub fn in_ac(check: Check, ac: usize) -> Self {
+        Self {
+            check,
+            ac: Some(ac),
+        }
+    }
+}
+
 /// The work to execute and the requirements that decide whether it held.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Objective {
@@ -16,14 +46,33 @@ pub struct Objective {
     pub work_ref: String,
     /// What the agent is asked to do.
     pub instruction: String,
-    /// The checks that decide whether the objective held.
-    pub checks: Vec<Check>,
+    /// The checks that decide whether the objective held, each with the
+    /// criterion that declares it.
+    pub checks: Vec<ObjectiveCheck>,
 }
 
 impl Objective {
     /// The ids of the checks that must hold for the objective to count.
     pub fn required(&self) -> Vec<String> {
-        self.checks.iter().map(|check| check.id.clone()).collect()
+        self.checks
+            .iter()
+            .map(|declared| declared.check.id.clone())
+            .collect()
+    }
+
+    /// The acceptance criteria the checks are declared under, in the
+    /// order they are declared and without repeats.
+    ///
+    /// These are the criteria a closure checks: a check the description
+    /// declares maps to no criterion and is not guessed into one.
+    pub fn check_ac(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = Vec::new();
+        for index in self.checks.iter().filter_map(|declared| declared.ac) {
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
+        indices
     }
 }
 

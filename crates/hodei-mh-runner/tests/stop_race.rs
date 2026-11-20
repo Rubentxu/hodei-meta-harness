@@ -12,7 +12,7 @@ use run::run::Phase;
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId};
 use runner::live::{ClaimError, ClaimPort, Claimed, LiveRuntime};
 use runner::ports::{
-    AgentError, AgentPort, Objective, Publication, PublisherError, PublisherPort,
+    AgentError, AgentPort, Objective, ObjectiveCheck, Publication, PublisherError, PublisherPort,
     RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
 };
 use supervisor::engine::{self, Transition};
@@ -30,10 +30,10 @@ impl RequirementsPort for FixedRequirements {
         Ok(Objective {
             work_ref: item.id.clone(),
             instruction: format!("do {}", item.id),
-            checks: vec![Check {
+            checks: vec![ObjectiveCheck::free(Check {
                 id: "AC-1".into(),
                 command: "true".into(),
-            }],
+            })],
         })
     }
 }

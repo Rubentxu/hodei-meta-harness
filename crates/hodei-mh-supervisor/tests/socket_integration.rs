@@ -21,6 +21,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A runtime that confirms immediately and reports a confirmed outcome.
 /// The supervisor's own test needs no agent: what it proves is the
 /// contract between the controller and a runtime.
+///
+/// A start that names no work asks for the NEXT selection of the same
+/// run; the stub answers with an attempt that is still in flight, so the
+/// session stays running after the confirmed objective.
 struct StubRuntime;
 
 #[async_trait::async_trait]
@@ -34,8 +38,11 @@ impl ObjectiveRuntime for StubRuntime {
         _run: RunId,
         request: ObjectiveRequest,
     ) -> Result<ObjectiveHandle, RuntimeError> {
+        let Some(work_ref) = request.work_ref else {
+            return Ok(ObjectiveHandle::new(std::future::pending()));
+        };
         Ok(ObjectiveHandle::finished(ObjectiveOutcome::Confirmed {
-            work_ref: request.work_ref.unwrap_or_else(|| "TASK-9".into()),
+            work_ref,
             detail: "the stub confirmed the objective".into(),
         }))
     }
@@ -646,6 +653,278 @@ async fn the_answer_states_the_version_of_the_contract() {
         response.protocol_version(),
         supervisor::protocol::PROTOCOL_VERSION
     );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A runtime that records what every start asked for, keeps its first
+/// attempt pending until the test releases it, and answers with the
+/// scripted outcomes in order.
+struct ChainingRuntime {
+    starts: Mutex<Vec<Option<String>>>,
+    outcomes: Mutex<std::collections::VecDeque<ObjectiveOutcome>>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl ChainingRuntime {
+    fn new(outcomes: Vec<ObjectiveOutcome>) -> Arc<Self> {
+        Arc::new(Self {
+            starts: Mutex::new(Vec::new()),
+            outcomes: Mutex::new(outcomes.into()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    fn starts(&self) -> Vec<Option<String>> {
+        self.starts
+            .lock()
+            .map(|starts| starts.clone())
+            .unwrap_or_default()
+    }
+
+    fn release_first(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectiveRuntime for ChainingRuntime {
+    fn identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity::live("chaining")
+    }
+
+    async fn start(
+        &self,
+        _run: RunId,
+        request: ObjectiveRequest,
+    ) -> Result<ObjectiveHandle, RuntimeError> {
+        let first = {
+            let mut starts = self.starts.lock().expect("the starts");
+            starts.push(request.work_ref);
+            starts.len() == 1
+        };
+        let outcome = self
+            .outcomes
+            .lock()
+            .expect("the outcomes")
+            .pop_front()
+            .unwrap_or(ObjectiveOutcome::Idle {
+                reason: "nothing else to do".into(),
+            });
+        let release = self.release.clone();
+        Ok(ObjectiveHandle::new(async move {
+            if first {
+                release.notified().await;
+            }
+            outcome
+        }))
+    }
+
+    fn cancel(&self, _run: RunId) {
+        // A stop reaches the attempt it names: the pending completion ends,
+        // the way a real attempt winds down when it is stopped.
+        self.release.notify_one();
+    }
+}
+
+/// Wait until an outcome of the given kind is in the record, and return
+/// its payload.
+///
+/// The confirmation is asynchronous; the wait yields instead of sleeping,
+/// and a deadline that expires FAILS the test instead of passing quietly.
+async fn wait_for_outcome(
+    client: &mut supervisor::client::SupervisorClient,
+    outcome: &str,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = client.events(1, None).await.expect("events");
+        let recorded = page
+            .events
+            .iter()
+            .find(|event| event.kind == "objective/outcome" && event.payload["outcome"] == outcome)
+            .map(|event| event.payload.clone());
+        if let Some(payload) = recorded {
+            return payload;
+        }
+        if Instant::now() >= deadline {
+            panic!("the {outcome} outcome was never recorded");
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A supervisor serving a runtime that confirms and then selects again.
+async fn chaining_supervisor(
+    tag: &str,
+    outcomes: Vec<ObjectiveOutcome>,
+) -> (
+    String,
+    Arc<Mutex<engine::SupervisorCore>>,
+    Arc<ChainingRuntime>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let path = temp_socket_path(tag);
+    let core = Arc::new(Mutex::new(engine::core_with_runtime(
+        format!("gc-fixture-{tag}"),
+        RuntimeIdentity::live("chaining"),
+    )));
+    let runtime = ChainingRuntime::new(outcomes);
+    let bound = server::bind(&path, &format!("gc-fixture-{tag}"))
+        .await
+        .expect("bind");
+    let server_task = tokio::spawn(server::serve(
+        bound,
+        core.clone(),
+        Some(runtime.clone() as Arc<dyn ObjectiveRuntime>),
+        server::Limits::default(),
+    ));
+    (path, core, runtime, server_task)
+}
+
+fn confirmed(work_ref: &str) -> ObjectiveOutcome {
+    ObjectiveOutcome::Confirmed {
+        work_ref: work_ref.into(),
+        detail: "the objective held".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_confirmed_objective_starts_the_next_attempt_of_the_same_run() {
+    let (path, core, runtime, server_task) =
+        chaining_supervisor("chain-next", vec![confirmed("TASK-9")]).await;
+    let mut client = client::connect(&path).await.expect("connect");
+    client
+        .action(SupervisorAction::Start {
+            project: "gc-fixture-chain-next".into(),
+            ticket: Some("TASK-9".into()),
+            revision: None,
+        })
+        .await
+        .expect("start");
+    wait_for_phase(&mut client, run::run::Phase::Running).await;
+
+    // The objective holds: the same run asks for the NEXT selection
+    // instead of waiting for a Start the engine would refuse.
+    runtime.release_first();
+    wait_for_phase(&mut client, run::run::Phase::Idle).await;
+    assert_eq!(
+        runtime.starts(),
+        vec![Some("TASK-9".to_string()), None],
+        "the second attempt names no work: the runtime selects it"
+    );
+    let epochs: Vec<u64> = {
+        let guard = core.lock().expect("lock");
+        guard.events.iter().map(|event| event.epoch).collect()
+    };
+    assert!(
+        epochs.iter().all(|epoch| *epoch <= 1),
+        "the next attempt belongs to the same run: {epochs:?}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_paused_run_does_not_start_the_next_attempt() {
+    let (path, core, runtime, server_task) =
+        chaining_supervisor("chain-paused", vec![confirmed("TASK-9")]).await;
+    let mut client = client::connect(&path).await.expect("connect");
+    client
+        .action(SupervisorAction::Start {
+            project: "gc-fixture-chain-paused".into(),
+            ticket: Some("TASK-9".into()),
+            revision: None,
+        })
+        .await
+        .expect("start");
+    wait_for_phase(&mut client, run::run::Phase::Running).await;
+    let pause = client.action(SupervisorAction::Pause).await.expect("pause");
+    assert!(pause.applied, "{}", pause.detail);
+
+    runtime.release_first();
+    wait_for_outcome(&mut client, "confirmed").await;
+    assert_eq!(
+        runtime.starts(),
+        vec![Some("TASK-9".to_string())],
+        "a paused run selects nothing"
+    );
+    let snapshot: Snapshot = client.snapshot().await.expect("snapshot");
+    assert_eq!(snapshot.phase, run::run::Phase::Running);
+    assert!(snapshot.paused);
+
+    drop(core);
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn a_stopped_run_does_not_start_the_next_attempt() {
+    let (path, _core, runtime, server_task) =
+        chaining_supervisor("chain-stopped", vec![confirmed("TASK-9")]).await;
+    let mut client = client::connect(&path).await.expect("connect");
+    client
+        .action(SupervisorAction::Start {
+            project: "gc-fixture-chain-stopped".into(),
+            ticket: Some("TASK-9".into()),
+            revision: None,
+        })
+        .await
+        .expect("start");
+    wait_for_phase(&mut client, run::run::Phase::Running).await;
+
+    // The stop reaches the pending attempt; its confirmed verdict is
+    // recorded beside the stop, and no next attempt may follow it.
+    let stop = client.action(SupervisorAction::Stop).await.expect("stop");
+    assert!(stop.applied, "{}", stop.detail);
+    assert_eq!(
+        runtime.starts(),
+        vec![Some("TASK-9".to_string())],
+        "a stopped run selects nothing"
+    );
+    let snapshot: Snapshot = client.snapshot().await.expect("snapshot");
+    assert_eq!(snapshot.phase, run::run::Phase::Stopped);
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn the_chain_ends_the_run_with_a_visible_verdict_at_the_attempt_bound() {
+    // Objectives that keep holding forever must not turn the run into an
+    // unbounded chain nobody observes: at the bound the supervisor stops
+    // selecting, and the run ends with THAT verdict visible.
+    let outcomes: Vec<ObjectiveOutcome> = (0..server::MAX_CHAINED_ATTEMPTS)
+        .map(|attempt| confirmed(&format!("TASK-{attempt}")))
+        .collect();
+    let (path, _core, runtime, server_task) = chaining_supervisor("chain-bound", outcomes).await;
+    let mut client = client::connect(&path).await.expect("connect");
+    client
+        .action(SupervisorAction::Start {
+            project: "gc-fixture-chain-bound".into(),
+            ticket: Some("TASK-0".into()),
+            revision: None,
+        })
+        .await
+        .expect("start");
+    wait_for_phase(&mut client, run::run::Phase::Running).await;
+    runtime.release_first();
+
+    let payload = wait_for_outcome(&mut client, "failed").await;
+    let reason = payload["reason"].as_str().unwrap_or_default().to_string();
+    assert!(
+        reason.contains(&server::MAX_CHAINED_ATTEMPTS.to_string()),
+        "the verdict names the bound that was hit: {reason}"
+    );
+    assert_eq!(
+        runtime.starts().len(),
+        server::MAX_CHAINED_ATTEMPTS,
+        "the chain stops selecting at the bound"
+    );
+    let snapshot: Snapshot = client.snapshot().await.expect("snapshot");
+    assert_eq!(snapshot.phase, run::run::Phase::Stopped);
 
     server_task.abort();
     let _ = std::fs::remove_file(&path);
