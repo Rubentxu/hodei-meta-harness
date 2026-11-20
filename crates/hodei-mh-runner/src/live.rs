@@ -5,7 +5,7 @@
 //! never reaches the agent. The attempt ends in ONE terminal value, and
 //! the claim is released exactly once whichever way it ends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -186,11 +186,15 @@ impl Drop for ClaimGuard {
 }
 
 /// The cancellation state of the runtime: the attempt in flight and the
-/// stop that arrived before that attempt installed its flag.
+/// stops that arrived before their attempts installed their flags.
 ///
 /// The state is shared through an `Arc` so the attempt and whoever raises
 /// the stop read the SAME answer: a stop is never addressed to an attempt
 /// that has not started, and never to the one that came after it.
+///
+/// Every pending stop is remembered by the run it names, so stops for
+/// different runs never overwrite each other. A pending stop lives until
+/// the run it names installs its flag or a newer run supersedes it.
 #[derive(Debug, Default)]
 struct Cancellations {
     state: Mutex<CancellationState>,
@@ -198,10 +202,10 @@ struct Cancellations {
 
 #[derive(Debug, Default)]
 struct CancellationState {
-    /// A stop for a run whose attempt has not installed its flag yet. It
-    /// is held here so the attempt begins already cancelled instead of
-    /// running work nobody wants anymore.
-    early: Option<RunId>,
+    /// The stops of the runs whose attempts have not installed their flag
+    /// yet. They are held here so those attempts begin already cancelled
+    /// instead of running work nobody wants anymore.
+    early: BTreeSet<RunId>,
     /// The run whose attempt is in flight, with the flag it reads.
     current: Option<(RunId, Arc<AtomicBool>)>,
 }
@@ -223,12 +227,11 @@ impl Cancellations {
         {
             return flag.clone();
         }
-        let stopped_early = state.early == Some(run);
-        // A stop kept for a run that is not this one and cannot be newer
-        // than it is history: this install supersedes it.
-        if state.early.is_some_and(|early| early <= run) {
-            state.early = None;
-        }
+        // The pending stops are addressed by run, so this install consumes
+        // only its own. The stops of older runs are history: this install
+        // supersedes them. The stops of newer runs stay pending.
+        let stopped_early = state.early.remove(&run);
+        state.early.retain(|pending| *pending > run);
         let cancelled = Arc::new(AtomicBool::new(stopped_early));
         if state
             .current
@@ -253,7 +256,9 @@ impl Cancellations {
                 flag.store(true, Ordering::SeqCst);
             }
             Some((current, _)) if *current > run => {}
-            _ => state.early = Some(run),
+            _ => {
+                state.early.insert(run);
+            }
         }
     }
 }
@@ -299,10 +304,10 @@ impl LiveRuntime {
     /// Ask the attempt of `run` to stop after the agent returns. The
     /// attempt then releases its claim without verifying or publishing.
     ///
-    /// A stop for a run whose attempt has not started yet is REMEMBERED:
-    /// the attempt begins already cancelled, so a stop raised while the
-    /// run was starting is never lost. A stop for an older run than the
-    /// attempt in flight never reaches it.
+    /// A stop for a run whose attempt has not started yet is REMEMBERED by
+    /// that run: the attempt begins already cancelled, so a stop raised
+    /// while the run was starting is never lost. A stop for an older run
+    /// than the attempt in flight never reaches it.
     pub fn cancel(&self, run: RunId) {
         self.cancellations.cancel(run);
     }
@@ -1140,6 +1145,76 @@ mod tests {
             vec![("T-1".to_string(), 17)],
             "the claim goes back instead of staying held"
         );
+    }
+
+    #[tokio::test]
+    async fn every_pending_stop_is_remembered_by_its_run() {
+        // Two stops raised before their attempts start, each naming a
+        // different run: the second one must not overwrite the first, so
+        // run 1's attempt still begins cancelled when it finally starts.
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(19));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        runtime.cancel(RunId(1));
+        runtime.cancel(RunId(2));
+        let outcome = start(&runtime, RunId(1), None)
+            .await
+            .expect("the runtime accepts the objective")
+            .completion()
+            .await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Failed { ref reason } if reason.contains("cancelled")),
+            "the stop of run 1 survives the stop of run 2: {outcome:?}"
+        );
+        assert_eq!(
+            agent.calls(),
+            0,
+            "a stopped attempt never reaches the agent"
+        );
+        assert_eq!(publisher.calls(), 0);
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 19)],
+            "the claim goes back instead of staying held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_stop_does_not_cancel_a_different_run() {
+        // A pending stop names the run it was raised for: the attempt of
+        // another run is not cancelled by it.
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(23));
+        let runtime = runtime_with(
+            vec![item("T-1", WorkStatus::Open)],
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        runtime.cancel(RunId(1));
+        let outcome = start(&runtime, RunId(2), None)
+            .await
+            .expect("the runtime accepts the objective")
+            .completion()
+            .await;
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "T-1"),
+            "a stop for run 1 must not cancel run 2: {outcome:?}"
+        );
+        assert_eq!(agent.calls(), 1);
+        assert_eq!(publisher.calls(), 1);
+        assert_eq!(claims.releases(), vec![("T-1".to_string(), 23)]);
     }
 
     #[tokio::test]
