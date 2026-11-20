@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-11-20T21:46:00Z'
-updated_date: '2026-11-20T21:46:00Z'
+updated_date: '2026-11-20T23:25:00Z'
 labels: []
 dependencies:
   - TASK-58
@@ -35,3 +35,15 @@ Cierre del circuito, dependiente de TASK-58 y TASK-59: una sola corrida end-to-e
 - [ ] #1 scripts/probes.sh --preflight pasa
 - [ ] #2 la evidencia de la corrida está pegada en la tarea
 <!-- DOD:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T23:25:00Z
+
+---
+
+Bloqueo externo (no técnico): la UAT live necesita un QODER_PERSONAL_ACCESS_TOKEN real en el entorno del supervisor — solo lo aporta el usuario. Todo lo verificable sin credencial ya está en main vía TASK-59 (--agent qoder, refusal sin PAT, staging verificado). Se lanza en cuanto el usuario aporte el PAT por entorno.
+
+---
+<!-- COMMENTS:END -->

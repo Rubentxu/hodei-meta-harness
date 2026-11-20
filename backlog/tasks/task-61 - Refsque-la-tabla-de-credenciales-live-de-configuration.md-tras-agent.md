@@ -1,9 +1,10 @@
 ---
 id: TASK-61
 title: Refsque la tabla de credenciales live de configuration.md tras --agent
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-20T23:23:00Z'
+updated_date: '2026-11-20T23:25:00Z'
 labels:
   - descubrimiento
 dependencies: []

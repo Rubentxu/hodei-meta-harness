@@ -3,9 +3,10 @@ id: TASK-56
 title: >-
   El install.sh muestra 'latest' en lugar de la versión resuelta al instalar sin
   VERSION
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-20T21:11:00Z'
+updated_date: '2026-11-20T23:25:00Z'
 labels: []
 dependencies: []
 priority: medium
