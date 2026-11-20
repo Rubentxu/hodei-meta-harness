@@ -3,7 +3,6 @@
 //! read-only, its disconnect does not alter the objective) and the Ratatui
 //! TUI. ALL of them are clients of the SAME socket contract.
 
-use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,6 +55,45 @@ fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<(), i32> {
         Err(error) => {
             eprintln!("cannot write the supervisor output: {error}");
             Err(1)
+        }
+    }
+}
+
+/// How one batch of log lines ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintOutcome {
+    /// Every line reached the output.
+    Printed,
+    /// The reader closed the pipe: there is nobody left to log to.
+    Closed,
+    /// The output failed for another reason, and the failure was reported.
+    Failed,
+}
+
+/// Print the pending events in order, advancing the cursor past exactly
+/// the lines that reached the output.
+///
+/// A line that could not be written is NOT counted as printed: a cursor
+/// that moved past it would drop it from the log without saying so. The
+/// failure itself is returned, never swallowed.
+fn print_events(
+    out: &mut impl std::io::Write,
+    pending: &[(u64, String)],
+    printed_seq: &mut u64,
+) -> PrintOutcome {
+    for (seq, line) in pending {
+        match write_line(out, line) {
+            Ok(()) => *printed_seq = *seq,
+            Err(0) => return PrintOutcome::Closed,
+            Err(_) => return PrintOutcome::Failed,
+        }
+    }
+    match out.flush() {
+        Ok(()) => PrintOutcome::Printed,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => PrintOutcome::Closed,
+        Err(error) => {
+            eprintln!("cannot flush the supervisor output: {error}");
+            PrintOutcome::Failed
         }
     }
 }
@@ -150,58 +188,89 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
             .unwrap_or_else(|| "(none wired — a Start is refused)".to_string())
     ));
     let log_core = core.clone();
+    // A log that cannot be written is a failure of the command, not a
+    // detail to swallow: the watcher says so and the controller ends with
+    // an explicit error instead of serving blind.
+    let (output_failure, mut output_failed) = tokio::sync::oneshot::channel::<()>();
     // The log watcher prints every event as it is recorded — provenance
     // included, credentials already redacted by the engine. Flush after
-    // every line: a service whose log is stuck in a buffer is no log.
+    // every batch: a service whose log is stuck in a buffer is no log.
     tokio::spawn(async move {
         // The log follows the SEQUENCE, not an index: the engine's history
         // is a ring buffer, so an index would reprint or skip events.
         let mut printed_seq: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let pending: Vec<String> = {
+            let pending: Vec<(u64, String)> = {
                 // A poisoned lock must not silence the log: recover the core
                 // and keep printing (the supervisor marks itself degraded).
                 let guard = match log_core.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let lines: Vec<String> = guard
+                guard
                     .events
                     .iter()
-                    .filter(|e| e.seq > printed_seq)
-                    .map(|e| {
-                        format!(
-                            "[{}] {}\n",
-                            provenance_label(&e.provenance),
-                            render_event(e)
+                    .filter(|event| event.seq > printed_seq)
+                    .map(|event| {
+                        (
+                            event.seq,
+                            format!(
+                                "[{}] {}",
+                                provenance_label(&event.provenance),
+                                render_event(event)
+                            ),
                         )
                     })
-                    .collect();
-                if let Some(last) = guard.events.last() {
-                    printed_seq = last.seq;
-                }
-                lines
+                    .collect()
             };
             if pending.is_empty() {
                 continue;
             }
-            let mut out = std::io::stdout().lock();
-            for line in &pending {
-                let _ = out.write_all(line.as_bytes());
+            let outcome = {
+                let mut out = std::io::stdout().lock();
+                print_events(&mut out, &pending, &mut printed_seq)
+            };
+            match outcome {
+                PrintOutcome::Printed => {}
+                // The reader closed the pipe (`sup-events | head`): nobody
+                // is listening, and the controller keeps serving. Waiting
+                // forever keeps the failure channel open.
+                PrintOutcome::Closed => std::future::pending::<()>().await,
+                PrintOutcome::Failed => {
+                    let _ = output_failure.send(());
+                    return;
+                }
             }
-            let _ = out.flush();
         }
     });
     // The runtime goes WITH the controller: the server hands the objective
     // to it, and its confirmation is what moves the run to `Running`.
     // Serving without it would accept the Start and leave the run in
     // `Starting` forever.
-    let served = server::serve(bound, core, runtime, server::Limits::default()).await;
-    if served.is_err() {
-        return 1;
+    let mut served = tokio::spawn(server::serve(
+        bound,
+        core,
+        runtime,
+        server::Limits::default(),
+    ));
+    tokio::select! {
+        result = &mut served => match result {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                eprintln!("the control surface stopped: {error}");
+                1
+            }
+            Err(error) => {
+                eprintln!("the control surface task failed: {error}");
+                1
+            }
+        },
+        _ = &mut output_failed => {
+            served.abort();
+            1
+        }
     }
-    0
 }
 
 fn provenance_label(provenance: &supervisor::protocol::Provenance) -> &'static str {
@@ -543,7 +612,7 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_line;
+    use super::{PrintOutcome, print_events, write_line};
     use std::io;
 
     struct Failing(io::ErrorKind);
@@ -551,6 +620,38 @@ mod tests {
     impl io::Write for Failing {
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(self.0.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that accepts `budget` bytes and then fails.
+    struct FailingAfter {
+        budget: usize,
+        kind: io::ErrorKind,
+        written: Vec<u8>,
+    }
+
+    impl FailingAfter {
+        fn new(budget: usize, kind: io::ErrorKind) -> Self {
+            Self {
+                budget,
+                kind,
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl io::Write for FailingAfter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer.len() > self.budget {
+                return Err(self.kind.into());
+            }
+            self.budget -= buffer.len();
+            self.written.extend_from_slice(buffer);
+            Ok(buffer.len())
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -580,6 +681,53 @@ mod tests {
         assert_eq!(
             write_line(&mut Failing(io::ErrorKind::StorageFull), "line"),
             Err(1)
+        );
+    }
+
+    #[test]
+    fn a_real_write_failure_is_reported_and_keeps_the_cursor_honest() {
+        // The first line reaches the output, the second does not: the
+        // cursor stops at the first one, so no event is counted as
+        // printed without having been printed, and no event is printed
+        // twice.
+        let mut out = FailingAfter::new("second\n".len(), io::ErrorKind::StorageFull);
+        let pending = vec![(2, "second".to_string()), (3, "third".to_string())];
+        let mut printed = 1;
+        assert_eq!(
+            print_events(&mut out, &pending, &mut printed),
+            PrintOutcome::Failed
+        );
+        assert_eq!(printed, 2, "only the written event advanced the cursor");
+        assert_eq!(String::from_utf8(out.written).expect("utf-8"), "second\n");
+    }
+
+    #[test]
+    fn a_closed_reader_stops_the_log_without_counting_a_line_as_printed() {
+        let mut out = FailingAfter::new(0, io::ErrorKind::BrokenPipe);
+        let pending = vec![(2, "second".to_string())];
+        let mut printed = 1;
+        assert_eq!(
+            print_events(&mut out, &pending, &mut printed),
+            PrintOutcome::Closed
+        );
+        assert_eq!(printed, 1, "nothing was written, nothing was counted");
+        assert!(out.written.is_empty());
+    }
+
+    #[test]
+    fn every_written_event_advances_the_cursor() {
+        let mut out: Vec<u8> = Vec::new();
+        let pending = vec![(2, "second".to_string()), (3, "third".to_string())];
+        let mut printed = 1;
+        assert_eq!(
+            print_events(&mut out, &pending, &mut printed),
+            PrintOutcome::Printed
+        );
+        assert_eq!(printed, 3);
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            "second\nthird\n",
+            "each event is printed once"
         );
     }
 }

@@ -106,6 +106,8 @@ pub enum LiveError {
     MissingIdentity { path: String },
     #[error("the tracker did not answer at boot: {0}")]
     Tracker(String),
+    #[error("git in {path} could not answer: {detail}")]
+    Git { path: String, detail: String },
     #[error("the claims of the project could not be opened: {0}")]
     Claims(String),
 }
@@ -122,18 +124,9 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
             path: config.project_dir.display().to_string(),
         });
     }
-    let branch = promote::git::current_ref(&config.project_dir, &config.managed_branch).map_err(
-        |error| LiveError::MissingBranch {
-            branch: config.managed_branch.clone(),
-            path: format!("{}: {error}", config.project_dir.display()),
-        },
-    )?;
-    if branch.is_none() {
-        return Err(LiveError::MissingBranch {
-            branch: config.managed_branch.clone(),
-            path: config.project_dir.display().to_string(),
-        });
-    }
+    // The managed branch must exist before any port is built: the
+    // promotion moves that branch, and it cannot move what is not there.
+    managed_head(&config.project_dir, &config.managed_branch)?;
     // The harness authors the candidate commit, so the host identity must
     // exist before any port is built.
     let config = LiveConfig {
@@ -167,6 +160,9 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
         project_dir: config.project_dir.clone(),
         managed_branch: config.managed_branch.clone(),
         bundle_path: config.bundle_path(),
+        // The journal of the promotion intents is the coordinator state
+        // where the attempt holds its claim: the intent is fenced to it.
+        state_db: hodei_mh_coordinator::paths::project_state_db(&config.project),
         writer: promote::writer::BacklogWorkWriter {
             bin: "backlog".into(),
             working_dir: config.tracker_dir.clone(),
@@ -190,24 +186,62 @@ fn host_identity(project_dir: &Path) -> Result<GitIdentity, LiveError> {
     let missing = || LiveError::MissingIdentity {
         path: project_dir.display().to_string(),
     };
-    let name = git_config(project_dir, "user.name").ok_or_else(missing)?;
-    let email = git_config(project_dir, "user.email").ok_or_else(missing)?;
+    let git = |detail: String| LiveError::Git {
+        path: project_dir.display().to_string(),
+        detail,
+    };
+    let name = git_config(project_dir, "user.name")
+        .map_err(git)?
+        .ok_or_else(missing)?;
+    let email = git_config(project_dir, "user.email")
+        .map_err(git)?
+        .ok_or_else(missing)?;
     Ok(GitIdentity { name, email })
 }
 
-/// One configured git value, or `None` when it is unset or empty.
-fn git_config(project_dir: &Path, key: &str) -> Option<String> {
+/// The head of the managed branch.
+///
+/// A branch that git reports as missing is a missing branch; a git that
+/// could not answer is THAT failure, never mistaken for a missing branch.
+fn managed_head(project_dir: &Path, managed_branch: &str) -> Result<String, LiveError> {
+    match promote::git::current_ref(project_dir, managed_branch) {
+        Ok(Some(head)) => Ok(head),
+        Ok(None) => Err(LiveError::MissingBranch {
+            branch: managed_branch.to_string(),
+            path: project_dir.display().to_string(),
+        }),
+        Err(error) => Err(LiveError::Git {
+            path: project_dir.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+/// One configured git value.
+///
+/// `None` means git answered that the key is unset. Anything else that
+/// went wrong is an error with git's own words: an unanswered question is
+/// not an unset value.
+fn git_config(project_dir: &Path, key: &str) -> Result<Option<String>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(project_dir)
         .args(["config", "--get", key])
         .output()
-        .ok()?;
+        .map_err(|error| format!("git config --get {key}: {error}"))?;
     if !output.status.success() {
-        return None;
+        // `git config --get` exits 1 when the key has no value.
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "git config --get {key} exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    Ok((!value.is_empty()).then_some(value))
 }
 
 /// Build the live configuration from the CLI arguments.
@@ -350,5 +384,39 @@ mod tests {
             other => panic!("expected MissingIdentity, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_managed_branch_that_git_knows_is_absent_is_a_missing_branch() {
+        let dir = std::env::temp_dir().join(format!("hodei-live-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        hodei_mh_workspace::git::init_fixture_repo(&dir).expect("the fixture repository");
+        match managed_head(&dir, "hodei-mh/main") {
+            Err(LiveError::MissingBranch { branch, .. }) => assert_eq!(branch, "hodei-mh/main"),
+            other => panic!("expected MissingBranch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_failing_to_answer_is_surfaced_instead_of_blamed_on_the_checkout() {
+        // Neither a missing branch nor a missing identity: git itself could
+        // not answer, and the harness must say so instead of guessing. A
+        // directory git cannot even enter is such a case.
+        let dir = std::env::temp_dir().join(format!("hodei-live-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        match managed_head(&dir, "hodei-mh/main") {
+            Err(LiveError::Git { detail, .. }) => assert!(
+                detail.contains("rev-parse"),
+                "the git command is named: {detail}"
+            ),
+            other => panic!("expected LiveError::Git, got {other:?}"),
+        }
+        match host_identity(&dir) {
+            Err(LiveError::Git { detail, .. }) => {
+                assert!(detail.contains("user.name"), "the key is named: {detail}")
+            }
+            other => panic!("expected LiveError::Git, got {other:?}"),
+        }
     }
 }

@@ -531,7 +531,8 @@ mod tests {
 
     use super::*;
     use crate::ports::{
-        AgentError, Publication, PublisherError, RequirementsError, Verification, VerifierError,
+        AgentError, ObjectiveCheck, Publication, PublisherError, RequirementsError, Verification,
+        VerifierError,
     };
     use tracker::core::{WorkItem, WorkStatus};
     use tracker::fake::FakeTracker;
@@ -546,10 +547,10 @@ mod tests {
             Ok(Objective {
                 work_ref: item.id.clone(),
                 instruction: format!("do {}", item.id),
-                checks: vec![Check {
+                checks: vec![ObjectiveCheck::free(Check {
                     id: "AC-1".into(),
                     command: "true".into(),
-                }],
+                })],
             })
         }
     }
@@ -1074,6 +1075,140 @@ mod tests {
         );
         assert_eq!(publisher.calls(), 1);
         assert_eq!(claims.releases(), vec![("T-1".to_string(), 13)]);
+    }
+
+    /// A tracker whose snapshot MOVES: the closing publisher marks the
+    /// work it published as done, the way the official tracker does when
+    /// the closure lands. The chained selection then advances instead of
+    /// being offered the same work again.
+    #[derive(Clone)]
+    struct SharedTracker {
+        items: Arc<Mutex<Vec<WorkItem>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TrackerRead for SharedTracker {
+        async fn snapshot(&self) -> Result<Vec<WorkItem>, tracker::core::TrackerError> {
+            Ok(self
+                .items
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone())
+        }
+    }
+
+    struct ClosingPublisher {
+        tracker: SharedTracker,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PublisherPort for ClosingPublisher {
+        async fn publish(
+            &self,
+            objective: &Objective,
+            _candidate: &Candidate,
+            _verification: &Verification,
+        ) -> Result<Publication, PublisherError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut items = self
+                .tracker
+                .items
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(item) = items.iter_mut().find(|item| item.id == objective.work_ref) {
+                item.status = WorkStatus::Done;
+            }
+            Ok(Publication {
+                revision: "1f0c3a5b".into(),
+                closed: true,
+                detail: "the closure moved the ticket".into(),
+            })
+        }
+    }
+
+    fn closing_runtime(
+        items: Vec<WorkItem>,
+        claims: Arc<FakeClaims>,
+        agent: Arc<CountingAgent>,
+    ) -> (LiveRuntime, Arc<ClosingPublisher>) {
+        let tracker = SharedTracker {
+            items: Arc::new(Mutex::new(items)),
+        };
+        let publisher = Arc::new(ClosingPublisher {
+            tracker,
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(publisher.tracker.clone()),
+            Arc::new(FixedRequirements),
+            agent,
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims,
+        );
+        (runtime, publisher)
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_objective_within_one_run_selects_the_next_ticket() {
+        // The runtime half of the chain: the supervisor asks the SAME run
+        // again with no named work, and the selection has moved on — the
+        // closed ticket is gone from the eligible set.
+        let agent = Arc::new(CountingAgent::default());
+        let claims = Arc::new(FakeClaims::granting(41));
+        let (runtime, publisher) = closing_runtime(
+            vec![item("T-1", WorkStatus::Open), item("T-2", WorkStatus::Open)],
+            claims.clone(),
+            agent.clone(),
+        );
+
+        let first = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(&first, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "T-1"),
+            "{first:?}"
+        );
+        let second = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(&second, ObjectiveOutcome::Confirmed { work_ref, .. } if work_ref == "T-2"),
+            "the chained selection takes the NEXT ticket: {second:?}"
+        );
+        assert_eq!(agent.seen(), vec!["T-1".to_string(), "T-2".to_string()]);
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 41), ("T-2".to_string(), 41)],
+            "each attempt gives its claim back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chained_selection_with_nothing_eligible_ends_idle_without_effects() {
+        // The refusal path at the runtime level: once the only ticket is
+        // closed, the next unnamed selection costs no claim, no agent
+        // call and no effect — the chain has nothing left to run.
+        let agent = Arc::new(CountingAgent::default());
+        let claims = Arc::new(FakeClaims::granting(43));
+        let (runtime, publisher) = closing_runtime(
+            vec![item("T-1", WorkStatus::Open)],
+            claims.clone(),
+            agent.clone(),
+        );
+
+        let first = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(&first, ObjectiveOutcome::Confirmed { .. }),
+            "{first:?}"
+        );
+        let second = outcome_of_start(&runtime, None).await;
+        assert!(
+            matches!(&second, ObjectiveOutcome::Idle { .. }),
+            "{second:?}"
+        );
+        assert_eq!(agent.calls(), 1, "idle selection costs no agent call");
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(claims.claim_calls(), 1, "nothing new is claimed");
     }
 
     #[tokio::test]

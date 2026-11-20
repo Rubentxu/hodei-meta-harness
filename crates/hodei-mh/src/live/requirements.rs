@@ -12,7 +12,7 @@ use hodei_mh_tracker::core::WorkItem;
 use serde::Deserialize;
 use verify::runner::Check;
 
-use runner::ports::{Objective, RequirementsError, RequirementsPort};
+use runner::ports::{Objective, ObjectiveCheck, RequirementsError, RequirementsPort};
 
 /// The prefix of a line that declares an executable check.
 pub const CHECK_PREFIX: &str = "check:";
@@ -81,14 +81,24 @@ struct TaskDocument {
 
 #[derive(Debug, Deserialize)]
 struct Criterion {
+    /// The number the tracker states for the criterion. It is the index a
+    /// closure checks; it is never derived from the position in the list.
+    #[serde(default)]
+    index: Option<u64>,
     #[serde(default)]
     text: String,
 }
 
+/// A declared `check:` line and the acceptance criterion that declares
+/// it, when one does.
+type DeclaredLine<'a> = (Option<usize>, &'a str);
+
 /// The objective a task view states, or the reason it states none.
 ///
 /// The instruction is the title and the description; the checks are the
-/// `check:` lines of the description and of the acceptance criteria.
+/// `check:` lines of the description and of the acceptance criteria. A
+/// check declared under a criterion carries the NUMBER the tracker states
+/// for it, so the closure checks the criteria the checks belong to.
 pub fn requirements_from_view(raw: &str, item: &WorkItem) -> Result<Objective, RequirementsError> {
     let view: TaskView = serde_json::from_str(raw).map_err(|error| RequirementsError {
         work_ref: item.id.clone(),
@@ -105,17 +115,23 @@ pub fn requirements_from_view(raw: &str, item: &WorkItem) -> Result<Objective, R
         view.task.title.trim(),
         view.task.description.trim()
     );
-    let declared: Vec<&str> = view
-        .task
-        .description
-        .lines()
-        .chain(
-            view.task
-                .acceptance_criteria
-                .iter()
-                .map(|ac| ac.text.as_str()),
-        )
-        .collect();
+    // A line of the description belongs to no criterion; a line of a
+    // criterion belongs to the number the tracker states for it. A
+    // criterion the tracker does not number maps to none: the index is
+    // not guessed from a position.
+    let mut declared: Vec<DeclaredLine<'_>> = Vec::new();
+    for line in view.task.description.lines() {
+        declared.push((None, line));
+    }
+    for criterion in &view.task.acceptance_criteria {
+        let ac = criterion
+            .index
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index > 0);
+        for line in criterion.text.lines() {
+            declared.push((ac, line));
+        }
+    }
     let checks = checks_of(&declared).map_err(|reason| RequirementsError {
         work_ref: item.id.clone(),
         reason,
@@ -135,10 +151,14 @@ pub fn requirements_from_view(raw: &str, item: &WorkItem) -> Result<Objective, R
     })
 }
 
-/// The executable checks a set of lines declares, in order.
-fn checks_of(lines: &[&str]) -> Result<Vec<Check>, String> {
+/// The executable checks a set of declared lines states, in order.
+///
+/// A check keeps the criterion it was declared under. A line that is not
+/// a `check:` line is not a check, and a check the description declares
+/// is attached to no acceptance criterion.
+fn checks_of(declared: &[DeclaredLine<'_>]) -> Result<Vec<ObjectiveCheck>, String> {
     let mut checks = Vec::new();
-    for line in lines {
+    for (ac, line) in declared {
         let trimmed = line.trim();
         let Some(command) = trimmed.strip_prefix(CHECK_PREFIX) else {
             continue;
@@ -149,9 +169,13 @@ fn checks_of(lines: &[&str]) -> Result<Vec<Check>, String> {
                 "the line '{trimmed}' declares a check without a command"
             ));
         }
-        checks.push(Check {
+        let check = Check {
             id: format!("check-{}", checks.len() + 1),
             command: command.to_string(),
+        };
+        checks.push(match ac {
+            Some(index) => ObjectiveCheck::in_ac(check, *index),
+            None => ObjectiveCheck::free(check),
         });
     }
     Ok(checks)
@@ -204,7 +228,72 @@ mod tests {
             objective.required(),
             vec!["check-1".to_string(), "check-2".to_string()]
         );
-        assert_eq!(objective.checks[1].command, "grep -q ok out.txt");
+        assert_eq!(objective.checks[1].check.command, "grep -q ok out.txt");
+        assert!(
+            objective.check_ac().is_empty(),
+            "a check the description declares belongs to no criterion"
+        );
+    }
+
+    /// A view whose criteria are numbered by the tracker, interleaving
+    /// criteria that declare no check.
+    fn numbered_view() -> String {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "task-view",
+            "task": {
+                "id": "T-1",
+                "title": "Do the work",
+                "description": "Do it.",
+                "acceptanceCriteria": [
+                    {"index": 1, "text": "the file exists", "checked": false},
+                    {"index": 2, "text": "check: test -f a.txt", "checked": false},
+                    {"index": 3, "text": "the code is documented", "checked": false},
+                    {"index": 4, "text": "check: test -f b.txt", "checked": false},
+                ],
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_check_carries_the_criterion_that_declares_it_not_its_position() {
+        // The criteria that declare checks are 2 and 4; marking the first
+        // two criteria by COUNT would check the wrong ones.
+        let objective = requirements_from_view(&numbered_view(), &item("T-1"))
+            .expect("the task declares checks");
+        assert_eq!(
+            objective
+                .checks
+                .iter()
+                .map(|declared| declared.check.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test -f a.txt", "test -f b.txt"]
+        );
+        assert_eq!(objective.check_ac(), vec![2, 4]);
+    }
+
+    #[test]
+    fn a_criterion_the_tracker_does_not_number_maps_to_no_index() {
+        let view = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "task-view",
+            "task": {
+                "id": "T-1",
+                "title": "Do the work",
+                "description": "Do it.",
+                "acceptanceCriteria": [{"text": "check: cargo test", "checked": false}],
+            }
+        })
+        .to_string();
+        let objective =
+            requirements_from_view(&view, &item("T-1")).expect("the task declares a check");
+        assert_eq!(objective.checks[0].check.command, "cargo test");
+        assert_eq!(
+            objective.check_ac(),
+            Vec::<usize>::new(),
+            "a criterion without a stated number is not guessed"
+        );
     }
 
     #[test]
@@ -218,7 +307,7 @@ mod tests {
         let objective =
             requirements_from_view(&view("Do it.", &["check: cargo test"]), &item("T-1"))
                 .expect("the criterion declares a check");
-        assert_eq!(objective.checks[0].command, "cargo test");
+        assert_eq!(objective.checks[0].check.command, "cargo test");
     }
 
     #[test]

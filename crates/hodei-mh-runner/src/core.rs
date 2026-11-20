@@ -163,7 +163,7 @@ impl GoalRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::{AgentError, PublisherError, Verification, VerifierError};
+    use crate::ports::{AgentError, ObjectiveCheck, PublisherError, Verification, VerifierError};
     use std::sync::Mutex;
     use tracker::core::WorkStatus;
     use verify::git::{GitRevision, GitTree};
@@ -200,10 +200,10 @@ mod tests {
             Ok(Objective {
                 work_ref: item.id.clone(),
                 instruction: format!("do {}", item.id),
-                checks: vec![verify::runner::Check {
+                checks: vec![ObjectiveCheck::free(verify::runner::Check {
                     id: "AC-1".into(),
                     command: "true".into(),
-                }],
+                })],
             })
         }
     }

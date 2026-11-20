@@ -151,14 +151,19 @@ async fn the_cli_reaches_running_only_through_the_runtime_confirmation() {
     assert!(start_out.contains("applied"), "{start_out}");
 
     // The run reaches `running` ONLY because the runtime confirmed it.
-    let running = wait_for(&socket, "phase: running").await;
+    // The confirmation event IS that transition, recorded durably: a
+    // chained rehearsal settles as soon as its scenario runs out of new
+    // work, so the test reads the log and the stable fields of the
+    // snapshot — never a transient phase it could race.
+    let confirmed = wait_for_event(&socket, "objective/confirmed").await;
     assert!(
-        running.contains("ticket: TASK-9"),
-        "the named work is the one that ran: {running}"
+        confirmed.contains("runtime=rehearsal"),
+        "only the runtime the snapshot names can confirm the objective: {confirmed}"
     );
+    let status = wait_for(&socket, "ticket: TASK-9").await;
     assert!(
-        running.contains("runtime: rehearsal"),
-        "a rehearsal never passes for a live run: {running}"
+        status.contains("runtime: rehearsal"),
+        "a rehearsal never passes for a live run: {status}"
     );
 
     // And the rehearsal closed nothing: the objective says so. The
@@ -168,6 +173,14 @@ async fn the_cli_reaches_running_only_through_the_runtime_confirmation() {
     assert!(
         events.contains("nothing was closed"),
         "the rehearsal publishes nothing: {events}"
+    );
+
+    // The chain settles BY ITSELF when nothing new is eligible: the
+    // named work ran first, and no Stop was needed to end the session.
+    let settled = wait_for_event(&socket, "outcome=idle").await;
+    assert!(
+        settled.contains("work_ref=TASK-9"),
+        "the named work is the one that ran: {settled}"
     );
 }
 
@@ -207,15 +220,25 @@ async fn every_public_supervisor_command_still_answers() {
 
     let (code, stdout, stderr) = capture(&["sup-action", "start", "--socket", &socket]).await;
     assert_eq!(code, 0, "sup-action start answers: {stdout}{stderr}");
-    wait_for(&socket, "phase: running").await;
 
+    // The rehearsal chains until its scenario runs out of NEW work, and
+    // the chain then settles the session BY ITSELF: the log carries the
+    // verdict, and no Stop was needed to free the session.
+    let events = wait_for_event(&socket, "outcome=idle").await;
+    assert!(
+        events.contains("objective/outcome"),
+        "the chained objective is in the log: {events}"
+    );
+
+    // PAUSE and RESUME still answer: the chain settled the run, so they
+    // are refused with the reason, never silently dropped.
     let (code, stdout, stderr) = capture(&["sup-action", "pause", "--socket", &socket]).await;
-    assert_eq!(code, 0, "sup-action pause answers: {stdout}{stderr}");
-    assert!(stdout.contains("applied"), "{stdout}");
+    assert_eq!(code, 1, "sup-action pause answers: {stdout}{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
 
     let (code, stdout, stderr) = capture(&["sup-action", "resume", "--socket", &socket]).await;
-    assert_eq!(code, 0, "sup-action resume answers: {stdout}{stderr}");
-    assert!(stdout.contains("applied"), "{stdout}");
+    assert_eq!(code, 1, "sup-action resume answers: {stdout}{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
 
     let (code, stdout, stderr) = capture(&["sup-events", "--socket", &socket]).await;
     assert_eq!(code, 0, "sup-events answers: {stdout}{stderr}");
@@ -242,7 +265,13 @@ async fn every_public_supervisor_command_still_answers() {
     );
 
     let (code, stdout, stderr) = capture(&["sup-action", "stop", "--socket", &socket]).await;
-    assert_eq!(code, 0, "sup-action stop answers: {stdout}{stderr}");
+    assert_eq!(code, 1, "sup-action stop answers: {stdout}{stderr}");
+    assert!(stdout.contains("refused"), "{stdout}");
+
+    // A settled run starts again: the chain ending idle freed the
+    // session, so the next objective is applied without a Stop.
+    let (code, stdout, stderr) = capture(&["sup-action", "start", "--socket", &socket]).await;
+    assert_eq!(code, 0, "the next start is applied: {stdout}{stderr}");
     assert!(stdout.contains("applied"), "{stdout}");
 }
 

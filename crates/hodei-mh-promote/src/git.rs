@@ -75,11 +75,21 @@ fn must(repo: &Path, context: &str, args: &[&str]) -> Result<String, PromoteErro
 /// Current commit of a local branch; `None` when the branch does not exist.
 pub fn current_ref(repo: &Path, branch: &str) -> Result<Option<String>, PromoteError> {
     let reference = format!("refs/heads/{branch}");
-    let (ok, out, _err) = run_git(repo, &["rev-parse", "--verify", "--quiet", &reference])?;
-    if !ok {
+    let (ok, out, err) = run_git(repo, &["rev-parse", "--verify", "--quiet", &reference])?;
+    if ok {
+        return Ok(Some(out.trim().to_string()));
+    }
+    // `--quiet` reports an unknown revision as a failure with no message.
+    // A failure WITH a message is git being unable to answer at all — not a
+    // repository, an unreadable directory — and it is not a missing branch.
+    let detail = err.trim();
+    if detail.is_empty() {
         return Ok(None);
     }
-    Ok(Some(out.trim().to_string()))
+    Err(PromoteError::Git {
+        context: format!("rev-parse {reference}"),
+        detail: detail.to_string(),
+    })
 }
 
 /// Candidate head read straight from the bundle (no fetch needed).
@@ -336,6 +346,24 @@ mod tests {
                 &["config", "--local", key, "true"],
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_git_that_cannot_answer_is_not_a_missing_branch() {
+        // An unknown revision is a missing branch...
+        let repo = temp_dir("missing-ref");
+        init_repo(&repo);
+        assert_eq!(current_ref(&repo, "hodei-mh/main").unwrap(), None);
+        // ...but a directory git cannot even read is git's own failure,
+        // never reported as a branch that is not there.
+        let not_a_repository = temp_dir("not-a-repository");
+        match current_ref(&not_a_repository, "hodei-mh/main") {
+            Err(PromoteError::Git { detail, .. }) => assert!(
+                detail.contains("not a git repository") || detail.contains("no es un repositorio"),
+                "the underlying failure is surfaced: {detail}"
+            ),
+            other => panic!("expected the underlying git failure, got {other:?}"),
         }
     }
 

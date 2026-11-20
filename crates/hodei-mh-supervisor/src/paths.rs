@@ -118,7 +118,14 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
     {
         private_dir(parent)?;
     }
-    std::fs::create_dir(path)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        // Another creator won the race between the check above and this
+        // call: the directory is theirs only if it passes the checks for
+        // an existing one.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return private_dir(path),
+        Err(error) => return Err(error),
+    }
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     Ok(())
 }

@@ -8,8 +8,11 @@
 //! is authored by the harness, with the host identity, so no agent
 //! attribution reaches the promoted history.
 
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::fs::OpenOptions;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opensandbox::acp::AcpAssembler;
 use opensandbox::control::ControlPlane;
@@ -40,11 +43,122 @@ const ADAPTER_PACKAGE: &str = "@zed-industries/claude-code-acp@0.16.2";
 /// Where the adapter is staged inside the sandbox.
 const ADAPTER_ROOT: &str = "/workspace/ccacp";
 
-/// The host directory the adapter is packed from.
-const ADAPTER_PACKAGE_DIR: &str = "hodei-ccacp";
+/// The subdirectory of the harness state that holds the staged adapters.
+const ADAPTER_STATE_DIR: &str = "adapters";
 
-/// The archive that carries the adapter into the sandbox.
-const ADAPTER_ARCHIVE: &str = "hodei-ccacp.tgz";
+/// How long the archive of the adapter lives: it is removed as soon as it
+/// is read.
+struct AdapterArchive {
+    path: PathBuf,
+}
+
+impl AdapterArchive {
+    /// Create a uniquely named archive that nobody else can take over.
+    ///
+    /// The name carries the process, the time and a counter, and the file
+    /// is opened with `O_EXCL` and mode `0600`: a name somebody prepared
+    /// beforehand is skipped, never written through.
+    fn create(directory: &Path) -> std::io::Result<Self> {
+        static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        for _ in 0..16 {
+            let name = format!(
+                "adapter-{}-{nanos}-{}.tgz",
+                std::process::id(),
+                ATTEMPT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = directory.join(name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("no free adapter archive name in {}", directory.display()),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AdapterArchive {
+    /// The archive never outlives the staging that created it, whichever
+    /// way that staging ends.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The directory the pinned adapter is installed in: private state of this
+/// user, under the harness state.
+///
+/// It is NOT a predictable path in the world-writable temporary directory:
+/// an adapter staged from a path any local user could prepare is an
+/// adapter they could replace.
+fn adapter_install_dir() -> std::io::Result<PathBuf> {
+    let root = hodei_mh_coordinator::paths::state_root();
+    let adapters = root.join(ADAPTER_STATE_DIR);
+    let owned = adapters.join(supervisor::paths::current_uid().to_string());
+    for directory in [root.as_path(), adapters.as_path(), owned.as_path()] {
+        ensure_private_dir(directory)?;
+    }
+    Ok(owned)
+}
+
+/// Make `directory` a directory only this user can enter, refusing a
+/// symbolic link and a directory owned by somebody else.
+///
+/// The mode of a directory says nothing about who can replace what is
+/// inside it; the owner does. A symbolic link is refused BEFORE anything
+/// is written through it.
+fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is a symbolic link: refusing to stage the adapter through it",
+                    directory.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    supervisor::paths::private_dir(directory)?;
+    let meta = std::fs::symlink_metadata(directory)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", directory.display()),
+        ));
+    }
+    if meta.uid() != supervisor::paths::current_uid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} belongs to uid {}, not to uid {}",
+                directory.display(),
+                meta.uid(),
+                supervisor::paths::current_uid()
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// How long one ACP conversation may take.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -237,7 +351,9 @@ impl AcpAgent {
         session: &SandboxSession,
         work_ref: &str,
     ) -> Result<(), AgentError> {
-        let install_dir = std::env::temp_dir().join(ADAPTER_PACKAGE_DIR);
+        let install_dir = adapter_install_dir().map_err(|error| {
+            Self::failure(work_ref, format!("the private adapter directory: {error}"))
+        })?;
         let adapter = install_dir.join("node_modules/.bin/claude-code-acp");
         if !adapter.exists() {
             let status = tokio::process::Command::new("npm")
@@ -259,11 +375,12 @@ impl AcpAgent {
                 ));
             }
         }
-        let archive = std::env::temp_dir().join(ADAPTER_ARCHIVE);
+        let archive = AdapterArchive::create(&install_dir)
+            .map_err(|error| Self::failure(work_ref, format!("the adapter archive: {error}")))?;
         let status = tokio::process::Command::new("tar")
             .args([
                 "czf",
-                archive.to_string_lossy().as_ref(),
+                archive.path().to_string_lossy().as_ref(),
                 "-C",
                 install_dir.to_string_lossy().as_ref(),
                 "node_modules",
@@ -277,7 +394,7 @@ impl AcpAgent {
                 "the adapter archive could not be built",
             ));
         }
-        let bytes = tokio::fs::read(&archive)
+        let bytes = tokio::fs::read(archive.path())
             .await
             .map_err(|error| Self::failure(work_ref, format!("the adapter archive: {error}")))?;
         session
@@ -589,6 +706,7 @@ fn permission_answer(message: &Value, permission: PermissionMode) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -869,5 +987,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn staging_dir(tag: &str) -> PathBuf {
+        // The fixture lives under the same base the product uses: the
+        // state root of this user.
+        let dir = hodei_mh_coordinator::paths::state_root()
+            .join(format!("agent-staging-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn the_adapter_directory_is_private_to_this_user() {
+        let dir = staging_dir("private");
+        ensure_private_dir(&dir).expect("the directory is created");
+        let mode = std::fs::symlink_metadata(&dir).expect("metadata").mode() & 0o777;
+        assert_eq!(mode, 0o700, "only its owner enters the directory");
+        // Asking again is idempotent, and an existing directory with a
+        // wider mode is tightened instead of trusted.
+        std::fs::set_permissions(&dir, PermissionsExt::from_mode(0o755)).expect("widen");
+        ensure_private_dir(&dir).expect("the directory is tightened");
+        let mode = std::fs::symlink_metadata(&dir).expect("metadata").mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symlinked_adapter_directory_is_refused() {
+        let base = staging_dir("symlink");
+        std::fs::create_dir_all(&base).expect("the fixture base");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("the target directory");
+        let link = base.join(ADAPTER_STATE_DIR);
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("the symbolic link");
+
+        let refusal = ensure_private_dir(&link).expect_err("a symbolic link is not a private dir");
+        assert_eq!(refusal.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(refusal.to_string().contains("symbolic link"), "{refusal}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_adapter_archive_is_unique_private_and_removed_on_every_path() {
+        let dir = staging_dir("archive");
+        ensure_private_dir(&dir).expect("the private directory");
+
+        let first = AdapterArchive::create(&dir).expect("the archive is created");
+        let second = AdapterArchive::create(&dir).expect("a second archive is created");
+        assert_ne!(first.path(), second.path(), "every staging owns its name");
+        let meta = std::fs::symlink_metadata(first.path()).expect("metadata");
+        assert_eq!(meta.mode() & 0o777, 0o600, "only its owner reads it");
+        assert!(meta.uid() == supervisor::paths::current_uid());
+
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(
+            !path.exists(),
+            "the archive does not outlive the staging that created it"
+        );
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
