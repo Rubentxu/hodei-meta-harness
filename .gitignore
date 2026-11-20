@@ -12,3 +12,6 @@ __pycache__/
 
 # Reports of the supervised task loop (the receipts of the run, not the product)
 build/
+
+# Local agent settings of other tools (not product)
+/.qoder
