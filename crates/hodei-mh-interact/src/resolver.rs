@@ -108,10 +108,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_network_require_visible_review() {
+    fn an_unknown_tool_routes_to_the_sandbox_and_network_requires_review() {
         let policy = InteractionPolicy::sandbox_first();
         let decision = resolve(&policy, &permission("mystery", ToolKind::Unknown));
-        assert!(matches!(decision, Resolution::HumanRequired { .. }));
+        assert_eq!(decision, Resolution::RoutedToSandbox);
 
         let decision = resolve(&policy, &permission("WebFetch", ToolKind::Network));
         assert!(matches!(decision, Resolution::HumanRequired { .. }));

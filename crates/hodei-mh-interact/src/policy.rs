@@ -20,14 +20,25 @@ pub struct InteractionPolicy {
 }
 
 impl InteractionPolicy {
-    /// The product default: reads are ordinary, writes/executions/terminals
-    /// happen inside the sandbox, networks need review, unknown tools are
-    /// never auto-anything.
+    /// The product default: reads are ordinary, writes, executions,
+    /// terminals and unknown tools run inside the sandbox, and networks
+    /// need review.
+    ///
+    /// Unknown tools are routed to the sandbox because the host never
+    /// advertises fs/terminal callbacks, so no host-side path could run
+    /// them anyway; they are never auto-allowed, because we do not know
+    /// what they do. Human review for an unknown tool happens only when
+    /// the operator opts into the deny-all policy.
     pub fn sandbox_first() -> Self {
         Self {
             auto_allow: vec![ToolKind::Read],
-            sandbox_routed: vec![ToolKind::Write, ToolKind::Execute, ToolKind::Terminal],
-            requires_human: vec![ToolKind::Network, ToolKind::Unknown],
+            sandbox_routed: vec![
+                ToolKind::Write,
+                ToolKind::Execute,
+                ToolKind::Terminal,
+                ToolKind::Unknown,
+            ],
+            requires_human: vec![ToolKind::Network],
         }
     }
 
@@ -68,7 +79,50 @@ mod tests {
         assert!(!policy.auto_allow.contains(&ToolKind::Unknown));
         assert!(policy.sandbox_routed.contains(&ToolKind::Write));
         assert!(policy.sandbox_routed.contains(&ToolKind::Execute));
-        assert!(policy.requires_human.contains(&ToolKind::Unknown));
+        assert!(policy.sandbox_routed.contains(&ToolKind::Unknown));
+        assert!(!policy.requires_human.contains(&ToolKind::Unknown));
+    }
+
+    /// Unknown tools run in the sandbox: with empty host client capabilities
+    /// there is no host callback that could execute them, so a human review
+    /// would stop the run without reducing any risk.
+    #[test]
+    fn unknown_tools_go_to_the_sandbox_and_never_the_host() {
+        let policy = InteractionPolicy::sandbox_first();
+        assert!(
+            host_client_capabilities()["clientCapabilities"]
+                .as_object()
+                .is_some_and(|caps| caps.is_empty()),
+            "the host advertises no callbacks, so no tool can run on it"
+        );
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Write,
+            ToolKind::Execute,
+            ToolKind::Terminal,
+            ToolKind::Unknown,
+        ] {
+            assert!(
+                !policy.requires_human.contains(&kind),
+                "{kind:?} must not need a human review"
+            );
+        }
+        assert_eq!(policy.requires_human, vec![ToolKind::Network]);
+        for kind in [
+            ToolKind::Write,
+            ToolKind::Execute,
+            ToolKind::Terminal,
+            ToolKind::Unknown,
+        ] {
+            assert!(
+                !policy.auto_allow.contains(&kind),
+                "{kind:?} must never be auto-allowed"
+            );
+            assert!(
+                policy.sandbox_routed.contains(&kind),
+                "{kind:?} must be routed to the sandbox"
+            );
+        }
     }
 
     #[test]
