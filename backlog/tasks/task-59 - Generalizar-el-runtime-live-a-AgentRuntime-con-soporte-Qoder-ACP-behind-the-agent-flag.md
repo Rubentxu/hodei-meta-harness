@@ -3,10 +3,10 @@ id: TASK-59
 title: >-
   Generalizar el runtime live a AgentRuntime con soporte Qoder ACP behind the
   --agent flag
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-20T21:46:00Z'
-updated_date: '2026-11-20T22:49:00Z'
+updated_date: '2026-11-20T23:23:00Z'
 labels: []
 dependencies:
   - TASK-58
@@ -23,15 +23,27 @@ Slice de código sobre crates/hodei-mh/src/live/ según las conclusiones del spi
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 qoder como agente live es seleccionable con --agent qoder sin tocar código de Claude Code; default intacto
-- [ ] #2 ProcessEnvOnly se mantiene para la credencial Qoder: prohibido argv, prohibido registro; test que lo afirma
-- [ ] #3 Los tests ACP corren offline con fakes para las dos variantes; ningún test duerme
-- [ ] #4 --agent valor-desconocido refusa con exit y mensaje específicos
-- [ ] #5 cli-reference y quickstart documentan la nueva flag con anclajes reales
+- [x] #1 qoder como agente live es seleccionable con --agent qoder sin tocar código de Claude Code; default intacto
+- [x] #2 ProcessEnvOnly se mantiene para la credencial Qoder: prohibido argv, prohibido registro; test que lo afirma
+- [x] #3 Los tests ACP corren offline con fakes para las dos variantes; ningún test duerme
+- [x] #4 --agent valor-desconocido refusa con exit y mensaje específicos
+- [x] #5 cli-reference y quickstart documentan la nueva flag con anclajes reales
 <!-- AC:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 scripts/fast-check.sh --all pasa
-- [ ] #2 cargo clippy --workspace --all-targets -- -D warnings pasa
+- [x] #1 scripts/fast-check.sh --all pasa
+- [x] #2 cargo clippy --workspace --all-targets -- -D warnings pasa
 <!-- DOD:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T23:23:00Z
+
+---
+
+Aceptado por el supervisor. Worker w59 READY_FOR_REVIEW @825a49d; diff --name-only 5f3f6a5..HEAD = superficie contratada exacta (live/runtime.rs nuevo, agent.rs, mod.rs, session.rs, main.rs USAGE, cli-reference, quickstart). Verificación independiente: ADT AgentRuntime{ClaudeCodeAcp,QoderAcp}+AgentArtifact con from_cli_value/expected_values; pines reales Qoder 1.1.94 (url+sha256+manifest, no inventados); ancla de cero-regresión claude_code_keeps_the_published_launch_command byte-a-byte vs v0.1.2; tests offline citados existen (runtime.rs:329, agent.rs:1261, mod.rs:443). Evidencia worker: fast-check --all PASS, clippy -D warnings limpio, 169+14 tests ok, refusals reales (--agent codex exit 1; qoder sin PAT refusal específico; default intacto). Merge --no-ff 450b321 a main; scripts/fast-check.sh --all post-merge exit 0 (fast-check: PASS). Descubierto registrado como TASK-61 (configuration.md staleness de anclajes pre-–agent). Pendiente honesto: layout interno del tarball qodercli no observado (test -x refuerza loudly) y prompt/streaming+PAT real = TASK-60.
+
+---
+<!-- COMMENTS:END -->
