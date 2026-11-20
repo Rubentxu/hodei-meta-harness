@@ -742,13 +742,18 @@ pub async fn drive_agent(
         interactions: Vec::new(),
         refusal: None,
     };
+    let mut pipe_closed = false;
     while Instant::now() < deadline {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(10), pipe.next_event())
-            .await
-            .ok()
-            .flatten()
-        else {
-            continue;
+        let event = match tokio::time::timeout(Duration::from_secs(10), pipe.next_event()).await {
+            // A cleanly closed pipe answers `None` forever without ever
+            // blocking: continuing would busy-spin to the deadline at
+            // full CPU and record the closed turn as a timeout.
+            Ok(None) => {
+                pipe_closed = true;
+                break;
+            }
+            Ok(Some(event)) => event,
+            Err(_elapsed) => continue,
         };
         match event {
             ServerEvent::Stdout(bytes) => {
@@ -824,11 +829,20 @@ pub async fn drive_agent(
             _ => {}
         }
     }
-    turn.summary = format!(
-        "timeout after {}s, text_tail={:?}",
-        timeout.as_secs(),
-        readable_tail(&agent_text, TEXT_TAIL_LIMIT)
-    );
+    turn.summary = if pipe_closed {
+        // Named apart from the timeout: a closed socket is the agent's
+        // adapter going away, not a model that was slow.
+        format!(
+            "the pipe closed cleanly before the turn completed, text_tail={:?}",
+            readable_tail(&agent_text, TEXT_TAIL_LIMIT)
+        )
+    } else {
+        format!(
+            "timeout after {}s, text_tail={:?}",
+            timeout.as_secs(),
+            readable_tail(&agent_text, TEXT_TAIL_LIMIT)
+        )
+    };
     turn.interactions = interactions;
     turn
 }
@@ -1517,6 +1531,48 @@ mod tests {
             turn.interactions[0].starts_with("permission refused:"),
             "the record says the interaction was refused: {}",
             turn.interactions[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cleanly_closed_pipe_ends_the_turn_at_once_with_its_own_reason() {
+        // The scripted fake answers None from here on without ever
+        // blocking: the old loop called next_event again and again
+        // until the deadline at full CPU. The drive must end AT the
+        // close, and the reason must not read like a timeout.
+        let mut pipe = scripted(
+            hello_initialize()
+                .into_iter()
+                .chain([stdout(
+                    json!({"params": {"update": {"content": {"text": "half a thought"}}}}),
+                )])
+                .collect(),
+        );
+        let started = Instant::now();
+        let turn = drive_agent(
+            &mut pipe,
+            "do it",
+            WORKTREE,
+            Duration::from_secs(120),
+            PermissionMode::AllowOnce,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(!turn.completed, "a closed pipe is not a completed turn");
+        assert!(
+            turn.summary
+                .contains("the pipe closed cleanly before the turn completed"),
+            "the summary names the clean close: {}",
+            turn.summary
+        );
+        assert!(
+            !turn.summary.contains("timeout"),
+            "a clean close is never reported as a timeout: {}",
+            turn.summary
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the drive returned at the close, not at the deadline: {elapsed:?}"
         );
     }
 
