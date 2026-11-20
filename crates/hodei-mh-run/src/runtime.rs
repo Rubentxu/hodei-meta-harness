@@ -95,6 +95,19 @@ impl ObjectiveOutcome {
     }
 }
 
+/// What the runtime answered when asked to extend a managed ttl.
+///
+/// Only a runtime can confirm a renewal: the engine records what it
+/// answered and never invents the new value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "renewal", rename_all = "snake_case")]
+pub enum RenewOutcome {
+    /// The runtime extended the environment and states the ttl it now has.
+    Confirmed { ttl_seconds: u64 },
+    /// The runtime has no renewable ttl, with the reason it does not.
+    Unsupported { reason: String },
+}
+
 /// A runtime that could not take the objective.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the runtime refused the objective: {0}")]
@@ -156,6 +169,17 @@ pub trait ObjectiveRuntime: Send + Sync {
 
     /// Take the objective and confirm it.
     async fn start(&self, request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError>;
+
+    /// Extend the ttl of the managed environment by `added_seconds`.
+    ///
+    /// The default is honest about what most runtimes can do: without a
+    /// renewable environment the answer is `Unsupported` with its reason,
+    /// never a simulated confirmation.
+    async fn renew(&self, _added_seconds: u64) -> RenewOutcome {
+        RenewOutcome::Unsupported {
+            reason: format!("{} does not support a ttl renewal", self.identity().label()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +219,38 @@ mod tests {
         assert!(encoded.contains("\"outcome\":\"rejected\""), "{encoded}");
         let back: ObjectiveOutcome = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(back, outcome);
+    }
+
+    struct NonRenewableRuntime;
+
+    #[async_trait::async_trait]
+    impl ObjectiveRuntime for NonRenewableRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::live("non-renewable")
+        }
+
+        async fn start(&self, _request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+            Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
+                reason: "nothing to do".into(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_a_renewable_ttl_says_so() {
+        let renewal = NonRenewableRuntime.renew(300).await;
+        assert!(
+            matches!(renewal, RenewOutcome::Unsupported { ref reason } if reason.contains("ttl renewal")),
+            "{renewal:?}"
+        );
+    }
+
+    #[test]
+    fn a_renewal_survives_the_wire_with_its_kind() {
+        let confirmed = RenewOutcome::Confirmed { ttl_seconds: 420 };
+        let encoded = serde_json::to_string(&confirmed).expect("encode");
+        assert!(encoded.contains("\"renewal\":\"confirmed\""), "{encoded}");
+        let back: RenewOutcome = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(back, confirmed);
     }
 }

@@ -6,7 +6,9 @@
 //! supervisor's engine — and it only reports what it did.
 
 pub mod core;
+pub mod live;
 pub mod ports;
 pub mod rehearsal;
 
 pub use core::{GoalRunner, RunnerError};
+pub use live::{AttemptEnd, ClaimError, ClaimPort, Claimed, LiveRuntime, outcome_of};

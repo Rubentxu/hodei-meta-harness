@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use run::runtime::{
-    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RuntimeError,
-    RuntimeIdentity,
+    ObjectiveHandle, ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome,
+    RuntimeError, RuntimeIdentity,
 };
 use tokio::sync::Notify;
 use tracker::core::{WorkItem, WorkStatus};
@@ -331,6 +331,15 @@ impl ObjectiveRuntime for TrialRuntime {
             runner.execute(&objective).await
         }))
     }
+
+    /// The rehearsal simulates the renewal it was asked for: it has no
+    /// environment whose ttl could be extended, but it also has nothing
+    /// to refuse — the simulated ttl is the addition itself.
+    async fn renew(&self, added_seconds: u64) -> RenewOutcome {
+        RenewOutcome::Confirmed {
+            ttl_seconds: added_seconds,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,5 +425,14 @@ mod tests {
             run::runtime::RuntimeKind::Rehearsal
         );
         assert!(runtime.identity().label().starts_with("rehearsal"));
+    }
+
+    #[tokio::test]
+    async fn the_rehearsal_confirms_its_simulated_ttl() {
+        let runtime = TrialRuntime::new();
+        assert_eq!(
+            runtime.renew(300).await,
+            RenewOutcome::Confirmed { ttl_seconds: 300 }
+        );
     }
 }
