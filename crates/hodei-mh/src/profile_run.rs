@@ -49,6 +49,10 @@ const CACHE_ARCHIVE_IN_SANDBOX: &str = "/tmp/hodei-build-cache.tgz";
 /// large, but a wedged command must not hold the run forever.
 const CACHE_IO_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a cache residue (a staged archive, a half-restored scope) may
+/// take to be removed before the removal is abandoned.
+const CACHE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The host cache store: `$XDG_CACHE_HOME/hodei-mh/build-cache`, or
 /// `$HOME/.cache/hodei-mh/build-cache`, or a temporary directory.
 fn default_cache_store_root() -> String {
@@ -162,31 +166,32 @@ fn archive_names(store_root: &str) -> Vec<String> {
 /// cannot be completed leaves the scope directory EMPTY: a half-extracted
 /// archive is not a cache, and a build must not inherit it.
 async fn restore_cache_into_sandbox(
-    execd: &ExecdEndpoint,
+    transport: &ExecdClient,
     bytes: Vec<u8>,
     scope_dir: &str,
 ) -> Value {
-    let uploaded = opensandbox::execd::api::upload_file(execd, bytes, CACHE_ARCHIVE_IN_SANDBOX)
-        .await
-        .is_ok();
+    let uploaded =
+        opensandbox::execd::api::upload_file(transport.endpoint(), bytes, CACHE_ARCHIVE_IN_SANDBOX)
+            .await
+            .is_ok();
     if !uploaded {
         return json!({"status": "cold", "reason": "uploading the cache archive failed"});
     }
-    let extracted = opensandbox::execd::oneshot::run(
-        execd,
+    let extracted = oneshot::run(
+        transport,
         &format!(
             "mkdir -p '{scope_dir}' && tar xzf {CACHE_ARCHIVE_IN_SANDBOX} -C '{scope_dir}' && rm -f {CACHE_ARCHIVE_IN_SANDBOX}"
         ),
-        CACHE_IO_TIMEOUT,
+        Deadline::in_budget(CACHE_IO_TIMEOUT),
     )
     .await;
     if extracted.succeeded() {
         return json!({"status": "warm", "scope_dir": scope_dir});
     }
-    let cleaned = opensandbox::execd::oneshot::run(
-        execd,
+    let cleaned = oneshot::run(
+        transport,
         &format!("rm -rf '{scope_dir}'"),
-        Duration::from_secs(30),
+        Deadline::in_budget(CACHE_CLEANUP_TIMEOUT),
     )
     .await
     .succeeded();
@@ -201,16 +206,16 @@ async fn restore_cache_into_sandbox(
 /// manifest, evict the oldest entries until the quota fits and remove
 /// archives no entry describes.
 async fn store_build_cache(
-    execd: &ExecdEndpoint,
+    transport: &ExecdClient,
     settings: &CacheSettings,
     key: &str,
     scope_dir: &str,
     manifest: &mut CacheManifest,
 ) -> Value {
-    let archived = opensandbox::execd::oneshot::run(
-        execd,
+    let archived = oneshot::run(
+        transport,
         &format!("tar czf {CACHE_ARCHIVE_IN_SANDBOX} -C '{scope_dir}' ."),
-        CACHE_IO_TIMEOUT,
+        Deadline::in_budget(CACHE_IO_TIMEOUT),
     )
     .await;
     if !archived.succeeded() {
@@ -219,14 +224,18 @@ async fn store_build_cache(
             "reason": "the cache directory could not be archived inside the sandbox",
         });
     }
-    let bytes = match opensandbox::execd::api::download_file(execd, CACHE_ARCHIVE_IN_SANDBOX).await
+    let bytes = match opensandbox::execd::api::download_file(
+        transport.endpoint(),
+        CACHE_ARCHIVE_IN_SANDBOX,
+    )
+    .await
     {
         Ok(bytes) => bytes,
         Err(error) => {
-            let _ = opensandbox::execd::oneshot::run(
-                execd,
+            let _ = oneshot::run(
+                transport,
                 &format!("rm -f {CACHE_ARCHIVE_IN_SANDBOX}"),
-                Duration::from_secs(30),
+                Deadline::in_budget(CACHE_CLEANUP_TIMEOUT),
             )
             .await;
             return json!({
@@ -235,10 +244,10 @@ async fn store_build_cache(
             });
         }
     };
-    let _ = opensandbox::execd::oneshot::run(
-        execd,
+    let _ = oneshot::run(
+        transport,
         &format!("rm -f {CACHE_ARCHIVE_IN_SANDBOX}"),
-        Duration::from_secs(30),
+        Deadline::in_budget(CACHE_CLEANUP_TIMEOUT),
     )
     .await;
     let size_bytes = bytes.len() as u64;
@@ -953,7 +962,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
                         RestoreVerdict::Verified => {
                             cached_bytes = bytes.len() as u64;
                             cache_restore =
-                                restore_cache_into_sandbox(&execd, bytes, scope_dir).await;
+                                restore_cache_into_sandbox(&transport, bytes, scope_dir).await;
                         }
                         RestoreVerdict::RejectedCorrupted { reason } => {
                             // A cache that is not the one recorded is
@@ -1022,7 +1031,7 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
         (true, Some(scope_dir)) => {
             store_build_cache(
-                &execd,
+                &transport,
                 &cache_settings,
                 &cache_key,
                 scope_dir,
