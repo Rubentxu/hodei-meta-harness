@@ -4,7 +4,7 @@ title: '[MH-A06] Conectar el supervisor de producto al bucle real de objetivos A
 status: In Progress
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T14:44:00Z'
+updated_date: '2026-11-20T16:21:00Z'
 labels:
   - audit-v0.2
   - product
@@ -76,4 +76,13 @@ AC2 PASS (refrendado): stop/pause/renew/Renew Unsupported ya probados en evidenc
 AC3 MARCADA [x]: (i) candidato insatisfacible — no promociona ni cierra, probado con camino real en run 4 C_events (el mismo camino sigue intacto en main; en run 5 el escenario D no llegó al check por TASK-42); (ii) permiso denegado — PASS NUEVO en run 5 E_events seq 4: evento agent.permission_refused con tool/policy estructurados, turno 91 s (< 180 s), sha_before==sha_after, ticket To Do, claims []; la corrección de TASK-41 r1/r2 está en el binario; (iii) tablero vacío no consume sandbox ni tokens — PASS C_events 2 s idle, C_containers.txt vacío.
 AC4 NO se marca aún: propio binario ✓ (shas.txt), SHA ✓, cierre ✓ (A_chaining), liberación ✓ (release.txt: 0 supervisores/0 lifecycle/0 sandboxes/0 redes owner, hodei-proxy intacto), cancelación ya probada en run 3 B_* con el mismo camino (sin regresión). Falta la cláusula final "los probes equivalentes se sustituyen solo tras comprobar paridad" — no se ejecutó scripts/probes.sh en la run 5. Se reejecutará cuando TASK-42 cierre para certificar paridad en el binario final.
 Tres descubrimientos abiertos que bloquean el cierre limpio de TASK-34: TASK-42 (allow-once refuses tool kind Unknown), TASK-43 (refusal sin efecto deja Pending y bloquea reintentos — el fix 3 de TASK-35 es conservador de más), TASK-44 (sup-events formato legible vs JSONL). TASK-34 permanece In Progress hasta TASK-42+43 cerrados y AC4 con probes parity.
+
+UAT run 6 (2026-11-20 15:35-15:55 UTC, main 924daa1, sha hodei-mh release 62f4214e…, lifecycle 961241f7…; evidencia /tmp/uat-task34/evidence6/). Fix-closure F1/F2/F3 en el binario final:
+F1 (TASK-42): repo-f con comando Bash compuesto tool kind "other" bajo allow-once PROMUEVE de59009 y TASK-1 queda Done; el string "tool kind Unknown requires explicit review" = 0 ocurrencias en F/D_events.jsonl+logs; D6 llegó por fin a la puerta del check: rejected "the evidence does not satisfy check-1", sin sha change, ticket To Do intacto (AC3(i) ahora demostrable en el binario final).
+F2 (TASK-43): tras el refusal terminal de E6 (--permission deny, 82 s), segundo Start en el MISMO socket aplicado como epoch 2 con checkpoint liquidado a SettledNoEffect y handoff "no candidate, no promotion, no closure" (E6_second_start.txt, E6_state_record_after.txt).
+F3 (TASK-44): sup-events --since 0 bajo pipe = JSONL 100% parseable en los 5 sockets; --pretty fuerza legible; --jsonl --pretty rechazado exit 2 con causa de exclusividad (*_events_refused.txt).
+AC1 refrendada en binario final: A6 completó TASK-1 y TASK-2 en UN solo Start, ambos Done, merge-base --is-ancestor rc=0 (6c62795→1cc8ff1, 192 s). AC2 PASS. AC3(i)(ii)(iii) PASS (D6/E6/C6). AC4 sub-evidencia release: 0 procesos, 0 sandboxes, 0 redes owner, byte-scan 4316 ficheros 0 fugas, shas.txt presente; liberación OK.
+PARITY PENDIENTE: P6 probes.sh --rounds 1 en main 924daa1 falló 3/6 probes (supervisor 5 asserts, profile 9 asserts, multiproject 1 step); release/verify/trust PASS. Preflight PASS (imágenes presentes, proxy hodei-uat-proxy4, Backlog CLI 1.55.3). Los fallos son preexistentes o regresiones — en curso bisect comparando con main 7d86143. AC4 NO se marca hasta el triage.
+Anomalía nueva registrada (report): el brief sugería HODEI_MH_PROXY_CHECK_URL=http://127.0.0.1:8888 pero ese puerto no está publicado al host por hodei-uat-proxy4; el driver UAT usó el origin host-reachable correcto y preflight pasó; hay que fijar ese valor en los docs de operator (no bloquea producto).
+Task interna abierta: clasificar P6 (regresión vs preexistente) para decidir si AC4 se cierra con caveat (preexistente) o exige fix primero (regresión).
 <!-- SECTION:NOTES:END -->
