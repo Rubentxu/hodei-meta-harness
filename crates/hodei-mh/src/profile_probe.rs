@@ -19,7 +19,53 @@ struct Check {
     detail: String,
 }
 
-async fn run_capture(bin: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+/// The carriage the lane hands the probe: where the control plane lives
+/// and which proxy the sandboxes are expected to use. Defaults keep the
+/// CI geometry (port 8081) so callers without args behave as before.
+struct Carriage {
+    server: String,
+    proxy_url: Option<String>,
+}
+
+impl Carriage {
+    /// Parse `--server` and `--proxy-url` from the lane's args, once.
+    fn from_args(args: &[String]) -> Self {
+        Self {
+            server: flag(args, "--server", "http://127.0.0.1:8081"),
+            proxy_url: optional_flag(args, "--proxy-url"),
+        }
+    }
+}
+
+fn flag(args: &[String], name: &str, default: &str) -> String {
+    optional_flag(args, name).unwrap_or_else(|| default.to_string())
+}
+
+fn optional_flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+}
+
+/// Rebuild a subcommand argv with the lane's server and proxy: the flags
+/// go at the end, and a flag the base already carries is never doubled.
+/// Pure — no I/O, so the exact ordering is unit-testable offline.
+fn probe_command(base: &[&str], server: &str, proxy: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = base.iter().map(|a| a.to_string()).collect();
+    if !argv.iter().any(|a| a == "--server") {
+        argv.push("--server".to_string());
+        argv.push(server.to_string());
+    }
+    if let Some(proxy) = proxy.filter(|_| !argv.iter().any(|a| a == "--proxy-url")) {
+        argv.push("--proxy-url".to_string());
+        argv.push(proxy.to_string());
+    }
+    argv
+}
+
+async fn run_capture(bin: &std::path::Path, args: &[String]) -> (i32, String, String) {
     let output = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
@@ -73,8 +119,8 @@ fn make_jvm_project(root: &std::path::Path) -> bool {
 
 /// The ids of the sandboxes the lifecycle server currently lists. Used to
 /// OBSERVE that the doctor creates nothing.
-async fn list_sandbox_ids() -> Vec<String> {
-    let client = ControlPlane::new("http://127.0.0.1:8081");
+async fn list_sandbox_ids(server: &str) -> Vec<String> {
+    let client = ControlPlane::new(server);
     let value: serde_json::Value = match client.get(ControlPlane::sandboxes_path()).send().await {
         Ok(response) => response.json().await.unwrap_or_default(),
         Err(_) => return Vec::new(),
@@ -109,8 +155,9 @@ fn missing_facts(
     format!("missing={missing:?}; observed_limits={observed_limits}; image_digest={image_digest}")
 }
 
-pub async fn run(_args: &[String]) -> i32 {
+pub async fn run(args: &[String]) -> i32 {
     let started = Instant::now();
+    let carriage = Carriage::from_args(args);
     let mut checks: Vec<Check> = Vec::new();
     let bin = std::env::current_exe().expect("current binary");
     let base = std::env::temp_dir().join(format!("hodei-profile-probe-{}", std::process::id()));
@@ -126,13 +173,17 @@ pub async fn run(_args: &[String]) -> i32 {
     // ---- AC-4: unavailable image → informed REFUSE, no YOLO fallback ----
     let (refuse_code, refuse_out, _) = run_capture(
         &bin,
-        &[
-            "profile-run",
-            "--image",
-            "doesnotexist:9",
-            "--project",
-            rust_a.to_string_lossy().as_ref(),
-        ],
+        &probe_command(
+            &[
+                "profile-run",
+                "--image",
+                "doesnotexist:9",
+                "--project",
+                rust_a.to_string_lossy().as_ref(),
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
     )
     .await;
     let refused_cleanly = refuse_code == 1
@@ -154,13 +205,17 @@ pub async fn run(_args: &[String]) -> i32 {
     let user_image = "rust:1-bookworm";
     let (user_code, user_out, user_err) = run_capture(
         &bin,
-        &[
-            "profile-run",
-            "--image",
-            user_image,
-            "--project",
-            rust_b.to_string_lossy().as_ref(),
-        ],
+        &probe_command(
+            &[
+                "profile-run",
+                "--image",
+                user_image,
+                "--project",
+                rust_b.to_string_lossy().as_ref(),
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
     )
     .await;
     let user_refused_for_digest = user_out.contains("local image digest does not match");
@@ -177,9 +232,17 @@ pub async fn run(_args: &[String]) -> i32 {
     // ---- AC-1: doctor is non-destructive and reports pinned versions ----
     // The sandbox list BEFORE and AFTER the doctor must be identical: the
     // doctor claims to be read-only, so it is OBSERVED to be.
-    let sandboxes_before = list_sandbox_ids().await;
-    let (doctor_code, doctor_out, _) = run_capture(&bin, &["doctor", "--profile", "rust"]).await;
-    let sandboxes_after = list_sandbox_ids().await;
+    let sandboxes_before = list_sandbox_ids(&carriage.server).await;
+    let (doctor_code, doctor_out, _) = run_capture(
+        &bin,
+        &probe_command(
+            &["doctor", "--profile", "rust"],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
+    )
+    .await;
+    let sandboxes_after = list_sandbox_ids(&carriage.server).await;
     let non_destructive = sandboxes_before == sandboxes_after;
     let doctor_honest = doctor_code == 0
         && doctor_out.contains("PROCEED")
@@ -200,17 +263,21 @@ pub async fn run(_args: &[String]) -> i32 {
     // ---- AC-2 (Rust): REAL build with a registry dependency -------------
     let (rust_code, rust_out, rust_err) = run_capture(
         &bin,
-        &[
-            "profile-run",
-            "--profile",
-            "rust",
-            "--project",
-            rust_a.to_string_lossy().as_ref(),
-            "--cpu",
-            "1",
-            "--memory",
-            "1Gi",
-        ],
+        &probe_command(
+            &[
+                "profile-run",
+                "--profile",
+                "rust",
+                "--project",
+                rust_a.to_string_lossy().as_ref(),
+                "--cpu",
+                "1",
+                "--memory",
+                "1Gi",
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
     )
     .await;
     let rust_record: serde_json::Value = serde_json::from_str(&rust_out).unwrap_or_default();
@@ -252,17 +319,21 @@ pub async fn run(_args: &[String]) -> i32 {
     // ---- AC-2 (JVM): REAL build with two interdependent classes ---------
     let (jvm_code, jvm_out, _) = run_capture(
         &bin,
-        &[
-            "profile-run",
-            "--profile",
-            "jvm",
-            "--project",
-            jvm.to_string_lossy().as_ref(),
-            "--cpu",
-            "1",
-            "--memory",
-            "1Gi",
-        ],
+        &probe_command(
+            &[
+                "profile-run",
+                "--profile",
+                "jvm",
+                "--project",
+                jvm.to_string_lossy().as_ref(),
+                "--cpu",
+                "1",
+                "--memory",
+                "1Gi",
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
     )
     .await;
     let jvm_record: serde_json::Value = serde_json::from_str(&jvm_out).unwrap_or_default();
@@ -300,13 +371,17 @@ pub async fn run(_args: &[String]) -> i32 {
     // ---- AC-2: per-project caches cannot cross-contaminate --------------
     let (rust_b_code, rust_b_out, _) = run_capture(
         &bin,
-        &[
-            "profile-run",
-            "--profile",
-            "rust",
-            "--project",
-            rust_b.to_string_lossy().as_ref(),
-        ],
+        &probe_command(
+            &[
+                "profile-run",
+                "--profile",
+                "rust",
+                "--project",
+                rust_b.to_string_lossy().as_ref(),
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ),
     )
     .await;
     let cache_a = rust_record["cache_dir"].as_str().unwrap_or_default();
@@ -334,13 +409,17 @@ pub async fn run(_args: &[String]) -> i32 {
             .unwrap_or(0)
     );
     let with_token = tokio::process::Command::new(&bin)
-        .args([
-            "profile-run",
-            "--profile",
-            "rust",
-            "--project",
-            rust_a.to_string_lossy().as_ref(),
-        ])
+        .args(probe_command(
+            &[
+                "profile-run",
+                "--profile",
+                "rust",
+                "--project",
+                rust_a.to_string_lossy().as_ref(),
+            ],
+            &carriage.server,
+            carriage.proxy_url.as_deref(),
+        ))
         .env("ANTHROPIC_AUTH_TOKEN", &real_token)
         .stdin(Stdio::null())
         .output()
@@ -421,5 +500,84 @@ pub async fn run(_args: &[String]) -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Carriage, probe_command};
+
+    #[test]
+    fn the_probe_command_prepends_the_server_and_proxy_once() {
+        let argv = probe_command(
+            &["profile-run", "--image", "rust:1-bookworm"],
+            "http://127.0.0.1:18087",
+            Some("http://hodei-proxy:8888"),
+        );
+        assert_eq!(
+            argv,
+            [
+                "profile-run",
+                "--image",
+                "rust:1-bookworm",
+                "--server",
+                "http://127.0.0.1:18087",
+                "--proxy-url",
+                "http://hodei-proxy:8888",
+            ]
+        );
+
+        // A base that already carries the flags is never doubled.
+        let kept = probe_command(
+            &[
+                "profile-run",
+                "--server",
+                "http://127.0.0.1:9999",
+                "--proxy-url",
+                "http://other:1234",
+            ],
+            "http://127.0.0.1:18087",
+            Some("http://hodei-proxy:8888"),
+        );
+        assert_eq!(
+            kept,
+            [
+                "profile-run",
+                "--server",
+                "http://127.0.0.1:9999",
+                "--proxy-url",
+                "http://other:1234",
+            ]
+        );
+
+        // No proxy given: the argv behaves as before the fix.
+        let no_proxy = probe_command(&["profile-run"], "http://127.0.0.1:8081", None);
+        assert_eq!(
+            no_proxy,
+            ["profile-run", "--server", "http://127.0.0.1:8081"]
+        );
+    }
+
+    #[test]
+    fn the_probe_reads_server_and_proxy_from_carriage_args() {
+        let args: Vec<String> = [
+            "--server",
+            "http://127.0.0.1:18087",
+            "--proxy-url",
+            "http://hodei-proxy:8888",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let carriage = Carriage::from_args(&args);
+        assert_eq!(carriage.server, "http://127.0.0.1:18087");
+        assert_eq!(
+            carriage.proxy_url.as_deref(),
+            Some("http://hodei-proxy:8888")
+        );
+
+        let empty = Carriage::from_args(&[]);
+        assert_eq!(empty.server, "http://127.0.0.1:8081");
+        assert_eq!(empty.proxy_url, None);
     }
 }
