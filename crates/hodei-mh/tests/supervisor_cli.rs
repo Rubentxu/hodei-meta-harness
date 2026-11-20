@@ -69,10 +69,14 @@ async fn wait_for(socket: &str, needle: &str) -> String {
 /// The verdict of an objective is recorded after its confirmation, so a
 /// test that reads the log the moment the run is `running` would be
 /// racing. This waits for the event itself.
+///
+/// The needle is a piece of the READABLE tail, and a captured stdout is
+/// a pipe, so this client names the channel it reads instead of taking
+/// the machine-readable default.
 async fn wait_for_event(socket: &str, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let (code, stdout, stderr) = capture(&["sup-events", "--socket", socket]).await;
+        let (code, stdout, stderr) = capture(&["sup-events", "--socket", socket, "--pretty"]).await;
         if code == 0 && stdout.contains(needle) {
             return stdout;
         }
@@ -501,5 +505,94 @@ async fn an_objective_without_a_criterion_names_the_flag_it_needs() {
     assert!(
         !stderr.contains("Connection refused"),
         "the incomplete request is refused before the socket is touched: {stderr}"
+    );
+}
+
+/// The event log, read by a script: every line one JSON object.
+///
+/// A captured stdout IS a pipe, so this is the channel the probes and the
+/// UAT oracles get without naming a flag: what they parse is the event as
+/// the socket carries it, never a rendering of it.
+#[tokio::test]
+async fn events_reach_a_pipe_as_one_json_object_per_line() {
+    let controller = Controller::start("events-jsonl", true).await;
+    let socket = controller.socket.clone();
+    wait_for(&socket, "phase:").await;
+
+    let (code, stdout, stderr) =
+        capture(&["sup-events", "--socket", &socket, "--since", "0"]).await;
+    assert_eq!(code, 0, "the machine channel answers: {stdout}{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(!lines.is_empty(), "the boot event is in the log");
+    for line in &lines {
+        let read: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|error| panic!("not JSON: {line} ({error})"));
+        assert!(read["kind"].is_string(), "the kind is a field: {line}");
+        assert!(
+            read.get("payload").is_some() && read.get("provenance").is_some(),
+            "the line carries the whole event the socket carries: {line}"
+        );
+    }
+    let boot = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["kind"] == "supervisor/boot")
+        .expect("the boot event reaches the machine channel");
+    assert_eq!(boot["seq"], 1, "the sequence travels as a field");
+    assert!(
+        boot["provenance"]["prov"] == "automatic",
+        "the provenance travels as a field: {boot}"
+    );
+}
+
+/// The readable tail is still the tail a person reads, and it is still
+/// what `--pretty` forces when stdout is not a terminal.
+#[tokio::test]
+async fn the_pretty_flag_answers_the_readable_tail_on_a_pipe() {
+    let controller = Controller::start("events-pretty", true).await;
+    let socket = controller.socket.clone();
+    wait_for(&socket, "phase:").await;
+
+    let (code, stdout, stderr) = capture(&["sup-events", "--socket", &socket, "--pretty"]).await;
+    assert_eq!(code, 0, "the readable channel answers: {stdout}{stderr}");
+    let first = stdout
+        .lines()
+        .next()
+        .expect("the boot event is printed")
+        .to_string();
+    assert!(
+        first.starts_with("[auto] "),
+        "the tag prefixes the line: {first}"
+    );
+    assert!(
+        first.contains("supervisor/boot"),
+        "the kind is named: {first}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&first).is_err(),
+        "the readable tail is not the machine channel: {first}"
+    );
+}
+
+/// The two channels are exclusive, and the clash is refused before the
+/// socket is touched: a contradictory request is never sent.
+#[tokio::test]
+async fn the_two_event_channels_asked_for_together_are_refused() {
+    let (code, _stdout, stderr) = capture(&[
+        "sup-events",
+        "--socket",
+        "/unused-by-this-test.sock",
+        "--jsonl",
+        "--pretty",
+    ])
+    .await;
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("--jsonl and --pretty are exclusive"),
+        "the refusal names both flags: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Connection refused"),
+        "the contradictory request is refused before the socket is touched: {stderr}"
     );
 }

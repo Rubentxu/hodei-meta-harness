@@ -3,6 +3,7 @@
 //! read-only, its disconnect does not alter the objective) and the Ratatui
 //! TUI. ALL of them are clients of the SAME socket contract.
 
+use std::io::IsTerminal;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -212,16 +213,7 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
                     .events
                     .iter()
                     .filter(|event| event.seq > printed_seq)
-                    .map(|event| {
-                        (
-                            event.seq,
-                            format!(
-                                "[{}] {}",
-                                provenance_label(&event.provenance),
-                                render_event(event)
-                            ),
-                        )
-                    })
+                    .map(|event| (event.seq, render_event_line(event, EmitFormat::Human)))
                     .collect()
             };
             if pending.is_empty() {
@@ -511,8 +503,91 @@ async fn read_history(
     Ok((events, oldest_lost))
 }
 
+/// The channel `hodei-mh sup-events` writes its answer on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitFormat {
+    /// The readable tail: a provenance tag and the rendered event.
+    Human,
+    /// One JSON object per line, exactly as the socket carries it.
+    Jsonl,
+}
+
+/// The channel the flags and stdout ask for, or the reason they clash.
+#[derive(Debug, PartialEq, Eq)]
+enum EmitChoice {
+    Format(EmitFormat),
+    Refused(String),
+}
+
+/// Resolve the output channel from the flags and what stdout really is.
+///
+/// Pure: reading a file descriptor is an effect, so the caller reads it
+/// and hands the fact over. The flags win over the terminal because a
+/// script that names a channel means it even when a person pipes it into
+/// a pager. With no flag the channel follows stdout: a pipe, a file or a
+/// subprocess parses the answer, and a parser reads JSON, not a tail.
+fn resolve_emit(args: &[String], stdout_is_terminal: bool) -> EmitChoice {
+    let jsonl = args.iter().any(|a| a == "--jsonl");
+    let pretty = args.iter().any(|a| a == "--pretty");
+    match (jsonl, pretty) {
+        (true, true) => EmitChoice::Refused(
+            "--jsonl and --pretty are exclusive (--jsonl is one JSON object per line for a script, --pretty is the readable tail for a person)".to_string(),
+        ),
+        (true, false) => EmitChoice::Format(EmitFormat::Jsonl),
+        (false, true) => EmitChoice::Format(EmitFormat::Human),
+        (false, false) => EmitChoice::Format(if stdout_is_terminal {
+            EmitFormat::Human
+        } else {
+            EmitFormat::Jsonl
+        }),
+    }
+}
+
+/// The line one event becomes in the chosen channel.
+///
+/// The machine channel is the event AS THE WIRE CARRIES IT — the same
+/// fields the socket's answer has — so a `jq` consumer and the CLI can
+/// never read two different renderings of one event. `serde_json`
+/// escapes the control characters inside the strings, so one event is
+/// always exactly one line.
+fn render_event_line(event: &StructuredEvent, format: EmitFormat) -> String {
+    match format {
+        EmitFormat::Human => {
+            format!(
+                "[{}] {}",
+                provenance_label(&event.provenance),
+                render_event(event)
+            )
+        }
+        EmitFormat::Jsonl => match serde_json::to_string(event) {
+            Ok(line) => line,
+            // A body that cannot be encoded must not vanish and must not
+            // print a line that pretends to be the event: the failure is
+            // carried as a line that says what failed.
+            Err(error) => serde_json::json!({
+                "seq": event.seq,
+                "epoch": event.epoch,
+                "render_error": error.to_string(),
+            })
+            .to_string(),
+        },
+    }
+}
+
 /// `hodei-mh sup-events`: replay structured events from a sequence.
+///
+/// `--jsonl` writes one JSON object per line and `--pretty` the readable
+/// tail; with neither, the answer is JSONL when stdout is a pipe or a
+/// file (scripts, probes and UAT oracles parse it) and the readable tail
+/// when stdout is a terminal (a person reads it).
 pub async fn run_events(args: &[String]) -> i32 {
+    let format = match resolve_emit(args, std::io::stdout().is_terminal()) {
+        EmitChoice::Format(format) => format,
+        EmitChoice::Refused(reason) => {
+            eprintln!("refusing to read the events: {reason}");
+            return 2;
+        }
+    };
     let socket = flag(args, "--socket", &default_socket());
     let since: u64 = flag(args, "--since", "0").parse().unwrap_or(0);
     let mut client = match client::connect(&socket).await {
@@ -527,18 +602,22 @@ pub async fn run_events(args: &[String]) -> i32 {
             if let Some(oldest) = oldest_lost {
                 // The history the client asked for had a hole: it is said
                 // out loud, not papered over.
-                if let Err(code) = say(&format!(
-                    "history lost: the events before #{oldest} are no longer retained"
-                )) {
-                    return code;
+                let notice =
+                    format!("history lost: the events before #{oldest} are no longer retained");
+                match format {
+                    // The machine channel is parsed line by line: the
+                    // announcement travels on stderr so every stdout line
+                    // stays one event.
+                    EmitFormat::Jsonl => eprintln!("{notice}"),
+                    EmitFormat::Human => {
+                        if let Err(code) = say(&notice) {
+                            return code;
+                        }
+                    }
                 }
             }
             for event in &events {
-                if let Err(code) = say(&format!(
-                    "[{}] {}",
-                    provenance_label(&event.provenance),
-                    render_event(event)
-                )) {
+                if let Err(code) = say(&render_event_line(event, format)) {
                     return code;
                 }
             }
@@ -699,9 +778,12 @@ pub fn simulated_events() -> Vec<StructuredEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedAction, PrintOutcome, parse_action, print_events, write_line};
+    use super::{
+        EmitChoice, EmitFormat, ParsedAction, PrintOutcome, parse_action, print_events,
+        provenance_label, render_event, render_event_line, resolve_emit, write_line,
+    };
     use std::io;
-    use supervisor::protocol::SupervisorAction;
+    use supervisor::protocol::{Provenance, StructuredEvent, SupervisorAction};
 
     struct Failing(io::ErrorKind);
 
@@ -914,5 +996,113 @@ mod tests {
             matches!(parsed, ParsedAction::Refused(ref reason) if reason.contains("soon")),
             "{parsed:?}"
         );
+    }
+
+    /// The two shapes of event the channels really print: an automatic
+    /// decision and a telemetry observation whose body carries a
+    /// newline, the case that must never split a machine-readable line.
+    fn sample_events() -> Vec<StructuredEvent> {
+        vec![
+            StructuredEvent {
+                seq: 1,
+                epoch: 1,
+                kind: "supervisor/boot".into(),
+                payload: serde_json::json!({
+                    "message": "listening on the control socket; credentials are redacted",
+                }),
+                provenance: Provenance::Automatic {
+                    rule: "boot".into(),
+                },
+            },
+            StructuredEvent {
+                seq: 2,
+                epoch: 4,
+                kind: "telemetry/resources".into(),
+                payload: serde_json::json!({
+                    "unknown": true,
+                    "reason": "the cgroup path is\nnot readable",
+                }),
+                provenance: Provenance::Telemetry { unknown: true },
+            },
+        ]
+    }
+
+    #[test]
+    fn the_jsonl_channel_carries_the_whole_event_in_one_line() {
+        for event in sample_events() {
+            let line = render_event_line(&event, EmitFormat::Jsonl);
+            assert!(
+                !line.contains('\n'),
+                "one event is one line, never two: {line}"
+            );
+            let read: StructuredEvent =
+                serde_json::from_str(&line).expect("every JSONL line is one JSON object");
+            assert_eq!(read, event, "the machine channel loses nothing");
+        }
+    }
+
+    #[test]
+    fn the_readable_tail_keeps_the_line_the_cli_printed_before() {
+        for event in sample_events() {
+            let line = render_event_line(&event, EmitFormat::Human);
+            assert_eq!(
+                line,
+                format!(
+                    "[{}] {}",
+                    provenance_label(&event.provenance),
+                    render_event(&event)
+                ),
+                "the human line is the provenance tag over the shared rendering"
+            );
+        }
+        let tail = render_event_line(&sample_events()[1], EmitFormat::Human);
+        assert!(tail.contains("[telemetry-UNKNOWN]"), "{tail}");
+        assert!(tail.contains("#2"), "{tail}");
+    }
+
+    fn format_of(args: &[&str], stdout_is_terminal: bool) -> EmitChoice {
+        resolve_emit(&cli(args), stdout_is_terminal)
+    }
+
+    #[test]
+    fn the_two_channels_asked_for_together_are_refused_with_their_cause() {
+        let choice = format_of(&["--jsonl", "--pretty"], true);
+        match choice {
+            EmitChoice::Refused(reason) => {
+                assert!(reason.contains("--jsonl"), "{reason}");
+                assert!(reason.contains("--pretty"), "{reason}");
+                assert!(reason.contains("exclusive"), "{reason}");
+            }
+            other => panic!("one answer cannot be in two channels: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_jsonl_flag_is_the_machine_channel_even_on_a_terminal() {
+        assert_eq!(
+            format_of(&["--jsonl"], true),
+            EmitChoice::Format(EmitFormat::Jsonl)
+        );
+    }
+
+    #[test]
+    fn the_pretty_flag_is_the_readable_tail_even_on_a_pipe() {
+        assert_eq!(
+            format_of(&["--pretty"], false),
+            EmitChoice::Format(EmitFormat::Human)
+        );
+    }
+
+    #[test]
+    fn a_pipe_without_flags_is_answered_in_json_lines() {
+        assert_eq!(
+            format_of(&["--since", "0"], false),
+            EmitChoice::Format(EmitFormat::Jsonl)
+        );
+    }
+
+    #[test]
+    fn a_terminal_without_flags_keeps_the_readable_tail() {
+        assert_eq!(format_of(&[], true), EmitChoice::Format(EmitFormat::Human));
     }
 }
