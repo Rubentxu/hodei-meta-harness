@@ -11,13 +11,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use hodei_mh_workspace::git as workspace_git;
-use opensandbox::acp;
 use opensandbox::cleanup::CleanupRegistry;
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::client::ExecdClient;
 use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
-use opensandbox::execd::frames::ServerEvent;
 use serde_json::{Value, json};
 
 use promote::git;
@@ -877,124 +875,26 @@ fn next_deadline() -> Duration {
 }
 
 /// Minimal ACP drive: initialize, session/new, one prompt, answer
-/// permission requests by protocol, wait for end_turn.
+/// permission requests by protocol, wait for end_turn. The conversation
+/// itself lives in the live agent module: the probe and the product drive
+/// the SAME dialogue.
 async fn drive_agent(
     pipe: &mut opensandbox::execd::pipe::PipeSession,
     instruction: &str,
     timeout: Duration,
 ) -> AgentOutcome {
-    use opensandbox::acp::AcpAssembler;
-    let mut assembler = AcpAssembler::new();
-    let mut next_id: u64 = 10;
-    let mut agent_text = String::new();
-    let _ = pipe
-        .send_stdin(
-            acp::encode_request(
-                next_id,
-                "initialize",
-                json!({"protocolVersion": 1, "clientCapabilities": {}}),
-            )
-            .as_bytes(),
-        )
-        .await;
-    next_id += 1;
-    let deadline = Instant::now() + timeout;
-    let mut phase = 0u8;
-    let mut session_id = json!(null);
-    let mut outcome = AgentOutcome {
-        completed: false,
-        summary: String::new(),
-    };
-    while Instant::now() < deadline {
-        let Some(event) = tokio::time::timeout(Duration::from_secs(10), pipe.next_event())
-            .await
-            .ok()
-            .flatten()
-        else {
-            continue;
-        };
-        match event {
-            ServerEvent::Stdout(bytes) => {
-                for message in assembler.push(&bytes).unwrap_or_default() {
-                    if message.get("method").and_then(|m| m.as_str())
-                        == Some("session/request_permission")
-                    {
-                        let allow = message["params"]["options"]
-                            .as_array()
-                            .and_then(|opts| {
-                                opts.iter()
-                                    .find(|o| o["kind"].as_str() == Some("allow_once"))
-                                    .and_then(|o| o["optionId"].as_str().map(str::to_string))
-                            })
-                            .unwrap_or_default();
-                        let _ = pipe
-                            .send_stdin(
-                                acp::encode_response(
-                                    message.get("id").cloned().unwrap_or(json!(0)),
-                                    json!({"outcome": {"outcome": "selected", "optionId": allow}}),
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                    }
-                    if let Some(chunk) = message["params"]["update"]["content"]["text"].as_str()
-                        && agent_text.len() < 3000
-                    {
-                        agent_text.push_str(chunk);
-                    }
-                    let is_result = message.get("result").is_some();
-                    if is_result && phase == 0 {
-                        let _ = pipe
-                            .send_stdin(
-                                acp::encode_request(
-                                    next_id,
-                                    "session/new",
-                                    json!({"cwd": "/workspace/work", "mcpServers": []}),
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                        next_id += 1;
-                        phase = 1;
-                    } else if is_result
-                        && message["result"].get("sessionId").is_some()
-                        && phase == 1
-                    {
-                        session_id = message["result"]["sessionId"].clone();
-                        let _ = pipe
-                            .send_stdin(
-                                acp::encode_request(
-                                    next_id,
-                                    "session/prompt",
-                                    json!({
-                                        "sessionId": session_id.clone(),
-                                        "prompt": [{"type": "text", "text": instruction}],
-                                    }),
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                        next_id += 1;
-                        phase = 2;
-                    } else if is_result
-                        && phase == 2
-                        && message["result"].get("stopReason").is_some()
-                    {
-                        outcome.completed = true;
-                        outcome.summary = format!("end_turn, text_len={}", agent_text.len());
-                        return outcome;
-                    }
-                }
-            }
-            ServerEvent::Exit { .. } => break,
-            _ => {}
-        }
+    let turn = crate::live::agent::drive_agent(
+        pipe,
+        instruction,
+        "/workspace/work",
+        timeout,
+        crate::live::PermissionMode::AllowOnce,
+    )
+    .await;
+    AgentOutcome {
+        completed: turn.completed,
+        summary: turn.summary,
     }
-    outcome.summary = format!(
-        "timeout, text_tail={:?}",
-        agent_text.chars().rev().take(200).collect::<String>()
-    );
-    outcome
 }
 
 fn finish(steps: &[Step], elapsed: Duration) -> i32 {

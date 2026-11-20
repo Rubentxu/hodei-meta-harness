@@ -138,6 +138,44 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
     }
 }
 
+/// A claim that is released exactly once, whichever way the attempt ends.
+///
+/// The guard is owned by the attempt itself, so an attempt whose task is
+/// ABORTED (a Stop) still releases its claim when the future is dropped:
+/// the release does not depend on the attempt reaching its end.
+struct ClaimGuard {
+    claims: Arc<dyn ClaimPort>,
+    work_ref: String,
+    epoch: u64,
+    released: bool,
+}
+
+impl ClaimGuard {
+    fn new(claims: Arc<dyn ClaimPort>, work_ref: &str, epoch: u64) -> Self {
+        Self {
+            claims,
+            work_ref: work_ref.to_string(),
+            epoch,
+            released: false,
+        }
+    }
+
+    /// Give the work back now. Calling it twice releases once.
+    fn release_now(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.claims.release(&self.work_ref, self.epoch);
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
+
 /// The live runtime: the product's ports, wired in the product's order.
 pub struct LiveRuntime {
     identity: RuntimeIdentity,
@@ -245,10 +283,13 @@ impl ObjectiveRuntime for LiveRuntime {
                 )));
             }
         };
+        // The guard is created with the claim and travels with the attempt:
+        // a dropped attempt (aborted) still gives the work back.
+        let guard = ClaimGuard::new(self.claims.clone(), &item.id, epoch);
         let objective = match self.requirements.requirements(&item) {
             Ok(objective) => objective,
             Err(error) => {
-                self.claims.release(&item.id, epoch);
+                drop(guard);
                 return Ok(ObjectiveHandle::finished(outcome_of(
                     AttemptEnd::Unverifiable {
                         work_ref: item.id,
@@ -257,15 +298,13 @@ impl ObjectiveRuntime for LiveRuntime {
                 )));
             }
         };
-        let work_ref = item.id;
         let agent = self.agent.clone();
         let verifier = self.verifier.clone();
         let publisher = self.publisher.clone();
-        let claims = self.claims.clone();
         let cancelled = self.cancelled.clone();
         Ok(ObjectiveHandle::new(async move {
             let end = attempt(&objective, agent, verifier, publisher, cancelled).await;
-            claims.release(&work_ref, epoch);
+            drop(guard);
             outcome_of(end)
         }))
     }
@@ -850,6 +889,52 @@ mod tests {
         assert_eq!(agent.calls(), 1);
         assert_eq!(publisher.calls(), 0);
         assert_eq!(claims.releases(), vec![("T-1".to_string(), 17)]);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_attempt_still_releases_its_claim() {
+        // A Stop aborts the execution task: the attempt future is dropped
+        // mid-agent. The claim must be given back even then — a cancelled
+        // attempt that keeps the work claimed starves the next one.
+        struct BlockingAgent {
+            started: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentPort for BlockingAgent {
+            async fn execute(&self, _objective: &Objective) -> Result<Candidate, AgentError> {
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(candidate())
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let agent = Arc::new(BlockingAgent {
+            started: started.clone(),
+        });
+        let claims = Arc::new(FakeClaims::granting(19));
+        let runtime = LiveRuntime::new(
+            "project",
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
+            Arc::new(FixedRequirements),
+            agent,
+            Arc::new(HoldingVerifier),
+            Arc::new(CountingPublisher::confirm_closing()),
+            claims.clone(),
+        );
+        let handle = start(&runtime, None)
+            .await
+            .expect("the runtime accepts the objective");
+        let completion = tokio::spawn(async move { handle.completion().await });
+        started.notified().await;
+        completion.abort();
+        let _ = completion.await;
+        assert_eq!(
+            claims.releases(),
+            vec![("T-1".to_string(), 19)],
+            "an aborted attempt releases its claim exactly once"
+        );
     }
 
     #[tokio::test]

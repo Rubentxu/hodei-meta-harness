@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime};
+use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RenewOutcome};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
@@ -512,7 +512,7 @@ async fn handle_connection(
         if line.trim().is_empty() {
             continue;
         }
-        let handled = respond_to_line(&core, &line, limits);
+        let handled = respond_line(&core, runtime.as_ref(), &line, limits).await;
         write_answer(&mut writer, &handled.response, limits).await?;
         // The runtime runs OUTSIDE the lock: the core is never held
         // across an await.
@@ -673,6 +673,41 @@ fn cancel_execution(pending: &Pending) {
     }
 }
 
+/// Turn one NDJSON line into its response.
+///
+/// A renewal is the ONE action whose answer the runtime owns: it is asked
+/// OUTSIDE the lock (the lock is never held across an await), and its
+/// answer is what the engine records. Everything else is a pure decision
+/// over the core.
+async fn respond_line(
+    core: &SharedCore,
+    runtime: Option<&Arc<dyn ObjectiveRuntime>>,
+    line: &str,
+    limits: Limits,
+) -> Handled {
+    match serde_json::from_str::<Request>(line) {
+        Ok(Request::Action {
+            action: SupervisorAction::Renew { added_seconds },
+        }) => {
+            let renewal = match runtime {
+                Some(runtime) => runtime.renew(added_seconds).await,
+                None => RenewOutcome::Unsupported {
+                    reason: "no runtime is wired: there is no environment to renew".into(),
+                },
+            };
+            let mut guard = lock_core(core);
+            Handled {
+                response: Response::Action {
+                    protocol_version: PROTOCOL_VERSION,
+                    outcome: engine::apply_renewal(&mut guard, added_seconds, renewal),
+                },
+                follow_up: FollowUp::Nothing,
+            }
+        }
+        _ => respond_to_line(core, line, limits),
+    }
+}
+
 /// Turn one NDJSON line into its response. An unparseable line is an
 /// ERROR response, never a silent snapshot.
 fn respond_to_line(core: &SharedCore, line: &str, limits: Limits) -> Handled {
@@ -798,7 +833,99 @@ fn events_response(
 mod tests {
     use super::*;
     use crate::protocol::SupervisorAction;
-    use run::runtime::RuntimeIdentity;
+    use run::runtime::{ObjectiveHandle, RenewOutcome, RuntimeError, RuntimeIdentity};
+
+    /// A runtime whose renewal answer is scripted: the server must pass it
+    /// through, not invent one.
+    struct RenewingRuntime {
+        outcome: RenewOutcome,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectiveRuntime for RenewingRuntime {
+        fn identity(&self) -> RuntimeIdentity {
+            RuntimeIdentity::live("renewing")
+        }
+
+        async fn start(&self, _request: ObjectiveRequest) -> Result<ObjectiveHandle, RuntimeError> {
+            Ok(ObjectiveHandle::finished(ObjectiveOutcome::Idle {
+                reason: "nothing to do".into(),
+            }))
+        }
+
+        async fn renew(&self, _added_seconds: u64) -> RenewOutcome {
+            self.outcome.clone()
+        }
+    }
+
+    fn renewal_line() -> &'static str {
+        r#"{"req":"action","action":{"action":"renew","added_seconds":300}}"#
+    }
+
+    #[tokio::test]
+    async fn a_renewal_applies_the_confirmation_the_runtime_answered() {
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::live("renewing"),
+        )));
+        let runtime: Arc<dyn ObjectiveRuntime> = Arc::new(RenewingRuntime {
+            outcome: RenewOutcome::Confirmed { ttl_seconds: 420 },
+        });
+        let handled = respond_line(&core, Some(&runtime), renewal_line(), Limits::default()).await;
+        match handled.response {
+            Response::Action { outcome, .. } => {
+                assert!(outcome.applied, "{}", outcome.detail);
+                assert!(outcome.detail.contains("420"), "{}", outcome.detail);
+            }
+            other => panic!("expected action outcome, got {other:?}"),
+        }
+        let guard = core.lock().expect("lock");
+        assert_eq!(engine::snapshot(&guard).ttl_remaining_seconds, Some(420));
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_renewal_is_not_applied_and_says_why() {
+        let core: SharedCore = Arc::new(Mutex::new(engine::core_with_runtime(
+            "gc",
+            RuntimeIdentity::live("renewing"),
+        )));
+        let runtime: Arc<dyn ObjectiveRuntime> = Arc::new(RenewingRuntime {
+            outcome: RenewOutcome::Unsupported {
+                reason: "the lifecycle backend has no ttl renewal".into(),
+            },
+        });
+        let handled = respond_line(&core, Some(&runtime), renewal_line(), Limits::default()).await;
+        match handled.response {
+            Response::Action { outcome, .. } => {
+                assert!(!outcome.applied, "never a simulated success");
+                assert!(
+                    outcome.detail.contains("no ttl renewal"),
+                    "the reason the runtime gave is reported: {}",
+                    outcome.detail
+                );
+            }
+            other => panic!("expected action outcome, got {other:?}"),
+        }
+        let guard = core.lock().expect("lock");
+        assert_eq!(engine::snapshot(&guard).ttl_remaining_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn a_renewal_without_a_runtime_is_refused_instead_of_invented() {
+        let core: SharedCore = Arc::new(Mutex::new(engine::default_core("gc")));
+        let handled = respond_line(&core, None, renewal_line(), Limits::default()).await;
+        match handled.response {
+            Response::Action { outcome, .. } => {
+                assert!(!outcome.applied);
+                assert!(
+                    outcome.detail.contains("no runtime is wired"),
+                    "{}",
+                    outcome.detail
+                );
+            }
+            other => panic!("expected action outcome, got {other:?}"),
+        }
+    }
 
     #[test]
     fn unparseable_requests_get_error_not_silence() {

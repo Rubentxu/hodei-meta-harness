@@ -245,3 +245,168 @@ async fn every_public_supervisor_command_still_answers() {
     assert_eq!(code, 0, "sup-action stop answers: {stdout}{stderr}");
     assert!(stdout.contains("applied"), "{stdout}");
 }
+
+/// A temporary directory of this test's own.
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!("hodei-live-{tag}-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the temporary directory");
+    dir
+}
+
+/// A git repository with one commit on `main`.
+fn git_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = temp_dir(tag);
+    hodei_mh_workspace::git::init_fixture_repo(&dir).expect("a fixture repository");
+    std::fs::write(dir.join("README.md"), "fixture\n").expect("the fixture file");
+    let added = std::process::Command::new("git")
+        .args(["-C", dir.to_string_lossy().as_ref(), "add", "README.md"])
+        .output()
+        .expect("git add");
+    assert!(added.status.success(), "git add: {added:?}");
+    hodei_mh_workspace::git::commit_index(&dir, "fixture base").expect("the fixture commit");
+    dir
+}
+
+/// Run one command of the product with an explicit agent token.
+async fn capture_with_token(args: &[&str], token: &str) -> (i32, String, String) {
+    let output = Command::new(BIN)
+        .args(args)
+        .env("ANTHROPIC_AUTH_TOKEN", token)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run hodei-mh");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// The live flags of a boot, with the given directories.
+fn live_flags<'a>(
+    socket: &'a str,
+    project_dir: &'a str,
+    tracker_dir: &'a str,
+    managed_branch: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "supervisor",
+        "--socket",
+        socket,
+        "--project",
+        "cli-live",
+        "--live",
+        "--server",
+        "http://127.0.0.1:8081",
+        "--image",
+        "example/image:1",
+        "--project-dir",
+        project_dir,
+        "--tracker-dir",
+        tracker_dir,
+        "--managed-branch",
+        managed_branch,
+    ]
+}
+
+#[tokio::test]
+async fn live_and_rehearsal_together_are_refused() {
+    let socket = socket_path("live-exclusive");
+    let project = temp_dir("exclusive-project");
+    let project = project.to_string_lossy().to_string();
+    let mut flags = live_flags(&socket, &project, &project, "main");
+    flags.push("--rehearsal");
+    let (code, _stdout, stderr) = capture_with_token(&flags, "test-token").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("--live and --rehearsal are exclusive"),
+        "the refusal names the conflict: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_boot_without_a_required_flag_names_it() {
+    let socket = socket_path("live-missing");
+    let flags = [
+        "supervisor",
+        "--socket",
+        &socket,
+        "--project",
+        "cli-live",
+        "--live",
+        "--server",
+        "http://127.0.0.1:8081",
+        "--image",
+        "example/image:1",
+    ];
+    let (code, _stdout, stderr) = capture_with_token(&flags, "test-token").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("--project-dir is required with --live"),
+        "the refusal names the missing flag: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_boot_without_credentials_is_refused() {
+    let socket = socket_path("live-token");
+    let project = temp_dir("token-project");
+    let project = project.to_string_lossy().to_string();
+    let flags = live_flags(&socket, &project, &project, "main");
+    let (code, _stdout, stderr) = capture_with_token(&flags, "").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("ANTHROPIC_AUTH_TOKEN is empty"),
+        "the refusal names the credential: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_boot_in_a_directory_that_is_not_a_repository_is_refused() {
+    let socket = socket_path("live-repo");
+    let project = temp_dir("repo-project");
+    let project = project.to_string_lossy().to_string();
+    let flags = live_flags(&socket, &project, &project, "main");
+    let (code, _stdout, stderr) = capture_with_token(&flags, "test-token").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("is not a git repository"),
+        "the refusal names the repository: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_boot_without_the_managed_branch_is_refused() {
+    let socket = socket_path("live-branch");
+    let project = git_fixture("branch-project");
+    let project = project.to_string_lossy().to_string();
+    let flags = live_flags(&socket, &project, &project, "hodei-mh/main");
+    let (code, _stdout, stderr) = capture_with_token(&flags, "test-token").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("managed branch 'hodei-mh/main' does not exist"),
+        "the refusal names the branch: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_live_boot_with_a_tracker_that_does_not_answer_is_refused() {
+    let socket = socket_path("live-tracker");
+    let project = git_fixture("tracker-project");
+    let project = project.to_string_lossy().to_string();
+    let tracker = temp_dir("tracker-empty");
+    let tracker = tracker.to_string_lossy().to_string();
+    let flags = live_flags(&socket, &project, &tracker, "main");
+    let (code, _stdout, stderr) = capture_with_token(&flags, "test-token").await;
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("the tracker did not answer"),
+        "the refusal names the tracker: {stderr}"
+    );
+}

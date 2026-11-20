@@ -43,13 +43,46 @@ fn opt_flag(args: &[String], name: &str) -> Option<String> {
 /// provenance and AFTER credential redaction (AC-4).
 ///
 /// `--rehearsal` wires the rehearsal runtime: a deterministic run with no
-/// external effects, which says so in every snapshot. Without it the
-/// controller has NO runtime and refuses to start, because a run nobody
-/// can execute is not a run.
+/// external effects, which says so in every snapshot. `--live` wires the
+/// live runtime: the real tracker, the real sandboxes and the real managed
+/// branch. The two are exclusive, and a live boot that cannot execute
+/// refuses with its reason instead of starting a controller that would
+/// accept a run it can never carry out. Without either, the controller has
+/// NO runtime and refuses to start, because a run nobody can execute is
+/// not a run.
 pub async fn run_supervisor(args: &[String]) -> i32 {
     let socket = flag(args, "--socket", &default_socket());
     let project = flag(args, "--project", "hodei-mh");
     let rehearsal = args.iter().any(|a| a == "--rehearsal");
+    let live = args.iter().any(|a| a == "--live");
+    if live && rehearsal {
+        eprintln!(
+            "refusing to start: --live and --rehearsal are exclusive (a rehearsal measures nothing; a live run executes)"
+        );
+        return 1;
+    }
+    // The runtime is wired BEFORE the socket is bound: a controller whose
+    // configuration cannot execute must not own the identity of a project.
+    let runtime: Option<Arc<dyn ObjectiveRuntime>> = if live {
+        let config = match crate::live::config_from_args(args, &project) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("refusing the live supervisor: {error}");
+                return 1;
+            }
+        };
+        match crate::live::real_ports(&config).await {
+            Ok(runtime) => Some(Arc::new(runtime)),
+            Err(error) => {
+                eprintln!("refusing the live supervisor: {error}");
+                return 1;
+            }
+        }
+    } else if rehearsal {
+        Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
+    } else {
+        None
+    };
     // The identity of this controller is the project it serves, and the
     // path it serves: both are taken as EXCLUSIVE locks, so a second
     // controller can never assume either of them.
@@ -64,11 +97,6 @@ pub async fn run_supervisor(args: &[String]) -> i32 {
     // it when the controller stops, and only if it is still the same file.
     // The CLI does not unlink it: that would be the same fact in two
     // places, and the two could disagree.
-    let runtime: Option<Arc<dyn ObjectiveRuntime>> = if rehearsal {
-        Some(Arc::new(runner::rehearsal::TrialRuntime::new()))
-    } else {
-        None
-    };
     let core: Arc<Mutex<engine::SupervisorCore>> = Arc::new(Mutex::new({
         // The runtime is NOT declared here: the server that serves it
         // writes it into the core, so the runtime the snapshot names and
