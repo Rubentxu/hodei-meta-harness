@@ -153,6 +153,101 @@ async fn supervisor_alive(bin: &Path, socket: &str) -> bool {
         == 0
 }
 
+/// What the supervisor's journal says about the Stop of ONE project.
+///
+/// The SEQUENCES are what make the answer honest: a Stop that is refused
+/// because the run had already ended carries a sequence ABOVE the one of
+/// the verdict that ended it, so the refusal is not a mystery.
+#[derive(Debug, Default)]
+struct StopEvidence {
+    /// The sequence of the verdict that ENDED the run.
+    run_ended_at: Option<u64>,
+    /// The sequence of the Stop action.
+    stop_at: Option<u64>,
+    /// Whether the Stop was applied.
+    stop_applied: Option<bool>,
+    /// The reason the Stop gave.
+    stop_detail: Option<String>,
+}
+
+impl StopEvidence {
+    /// The Stop arrived AFTER the run had already ended: refusing to stop
+    /// a run that is gone is honest, not a failure to stop.
+    fn stop_came_after_the_end(&self) -> bool {
+        match (self.run_ended_at, self.stop_at) {
+            (Some(ended), Some(stop)) => ended < stop,
+            _ => false,
+        }
+    }
+}
+
+/// One sequence of the journal, printed as the number it was found at.
+fn sequence(seq: Option<u64>) -> String {
+    seq.map(|seq| format!("#{seq}"))
+        .unwrap_or_else(|| "MISSING".to_string())
+}
+
+/// Read the journal of ONE supervisor and keep what it says about the run
+/// and the Stop that was sent to it.
+async fn read_stop_evidence(bin: &Path, socket: &str) -> StopEvidence {
+    let (code, stdout, _) = run_capture(
+        bin,
+        &["sup-events", "--socket", socket, "--since", "0", "--jsonl"],
+    )
+    .await;
+    if code != 0 {
+        return StopEvidence::default();
+    }
+    stop_evidence_from_journal(&stdout)
+}
+
+/// The evidence a journal carries about a run and its Stop.
+///
+/// The journal is the machine channel: one JSON object per line, exactly
+/// as the socket carried it.
+fn stop_evidence_from_journal(journal: &str) -> StopEvidence {
+    let mut evidence = StopEvidence::default();
+    for line in journal
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(seq) = event.get("seq").and_then(Value::as_u64) else {
+            continue;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("objective/outcome") => {
+                let outcome = event
+                    .pointer("/payload/outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if matches!(outcome, "idle" | "rejected" | "failed") {
+                    evidence.run_ended_at.get_or_insert(seq);
+                }
+            }
+            Some("supervisor/action") => {
+                let action = event
+                    .pointer("/payload/action/action")
+                    .and_then(Value::as_str);
+                if action == Some("stop") {
+                    evidence.stop_at.get_or_insert(seq);
+                    evidence.stop_applied =
+                        event.pointer("/payload/applied").and_then(Value::as_bool);
+                    evidence.stop_detail = event
+                        .pointer("/payload/detail")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    evidence
+}
+
 /// The lifecycle server binary: it lives NEXT TO the hodei-mh binary
 /// (both are built by the same workspace).
 fn lifecycle_server_bin(bin: &Path) -> PathBuf {
@@ -837,6 +932,58 @@ pub async fn run(args: &[String]) -> i32 {
     .await;
     let (stop_code, stop_out, _) =
         run_capture(&bin, &["sup-action", "stop", "--socket", &alpha_socket]).await;
+    // The Stop is an HONEST answer, never a fake success: it either
+    // stopped a live run, or it says why there was nothing left to stop.
+    // The journal says which: the verdict that ended the run carries a
+    // sequence BELOW the one of the Stop, so a refused Stop is a run that
+    // had already ended by its own verdict — not a run nobody stopped.
+    let stop_evidence = read_stop_evidence(&bin, &alpha_socket).await;
+    let (alpha_status_code, alpha_status, _) =
+        run_capture(&bin, &["sup-status", "--socket", &alpha_socket]).await;
+    let stop_applied_answer = stop_code == 0 && stop_out.contains("applied");
+    let stop_refused_answer = stop_code == 1 && stop_out.contains("refused");
+    let (stop_honest, stop_story) = if stop_applied_answer {
+        let honest = stop_evidence.stop_applied == Some(true)
+            && alpha_status_code == 0
+            && alpha_status.contains("phase: stopped");
+        (
+            honest,
+            format!(
+                "the Stop stopped a live run (phase stopped in the snapshot; journal {}: {})",
+                sequence(stop_evidence.stop_at),
+                stop_evidence.stop_detail.clone().unwrap_or_default()
+            ),
+        )
+    } else if stop_refused_answer {
+        let honest = stop_out.contains("no running run to stop")
+            && stop_evidence.stop_applied == Some(false)
+            && stop_evidence.stop_came_after_the_end()
+            && alpha_status_code == 0
+            && alpha_status.contains("phase: idle")
+            && alpha_status.contains("objective: idle");
+        (
+            honest,
+            format!(
+                "the run had ALREADY ended by its own verdict (journal {}: {}) before the Stop \
+                 arrived (journal {}): there was nothing left to stop, and the supervisor said \
+                 so instead of pretending to stop it",
+                sequence(stop_evidence.run_ended_at),
+                alpha_status
+                    .lines()
+                    .find(|line| line.starts_with("objective:"))
+                    .unwrap_or("(no objective line in the snapshot)"),
+                sequence(stop_evidence.stop_at),
+            ),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "the Stop answered with exit {stop_code}: {}",
+                stop_out.trim()
+            ),
+        )
+    };
     let alpha_dir = &projects[0].1;
     // The build output is the durable record; with it confirmed, idle
     // release is allowed.
@@ -892,8 +1039,7 @@ pub async fn run(args: &[String]) -> i32 {
     };
     let stop_cycle_ok = start_code == 0
         && start_out.contains("applied")
-        && stop_code == 0
-        && stop_out.contains("applied")
+        && stop_honest
         && alpha_released
         && new_task
         && reclaimed
@@ -903,7 +1049,12 @@ pub async fn run(args: &[String]) -> i32 {
         name: "stop-idle-release-new-task-cycle",
         passed: stop_cycle_ok,
         detail: format!(
-            "alpha: start applied={start_code} ({}) -> stop applied={stop_code} ({}); idle-release ALLOWED by the durable gate={alpha_release_allowed}; DELETE status={alpha_delete_status} body={alpha_delete_body}; gone after delete={alpha_gone}; NEW backlog task created={new_task}; reclaimed={reclaimed}; re-admitted={re_admitted}; fresh sandbox built the updated project ({new_task_marker})={alpha_new_ok}",
+            "alpha: start applied={start_code} ({}) -> stop exit {stop_code} ({}); {stop_story}; \
+             idle-release ALLOWED by the durable gate={alpha_release_allowed}; DELETE \
+             status={alpha_delete_status} body={alpha_delete_body}; gone after \
+             delete={alpha_gone}; NEW backlog task created={new_task}; reclaimed={reclaimed}; \
+             re-admitted={re_admitted}; fresh sandbox built the updated project \
+             ({new_task_marker})={alpha_new_ok}",
             start_out.trim().lines().next().unwrap_or(""),
             stop_out.trim().lines().next().unwrap_or(""),
         ),
@@ -1194,4 +1345,93 @@ pub async fn run(args: &[String]) -> i32 {
         serde_json::to_string_pretty(&summary).unwrap_or_default()
     );
     if steps.iter().all(|s| s.passed) { 0 } else { 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One journal line, as the machine channel writes it.
+    fn line(seq: u64, kind: &str, payload: Value) -> String {
+        serde_json::json!({"seq": seq, "epoch": 1, "kind": kind, "payload": payload}).to_string()
+    }
+
+    /// The journal of a run that ended by its own verdict, with the Stop
+    /// that arrived after it.
+    fn a_journal_with_the_stop_after_the_end() -> String {
+        [
+            line(1, "objective/confirmed", json!({"epoch": 1})),
+            line(2, "objective/outcome", json!({"outcome": "idle"})),
+            line(
+                3,
+                "supervisor/action",
+                json!({"action": {"action": "stop"}, "applied": false,
+                       "detail": "no running run to stop"}),
+            ),
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn a_stop_that_came_after_the_verdict_is_honest() {
+        let evidence = stop_evidence_from_journal(&a_journal_with_the_stop_after_the_end());
+
+        assert_eq!(evidence.run_ended_at, Some(2));
+        assert_eq!(evidence.stop_at, Some(3));
+        assert_eq!(evidence.stop_applied, Some(false));
+        assert_eq!(
+            evidence.stop_detail.as_deref(),
+            Some("no running run to stop")
+        );
+        assert!(
+            evidence.stop_came_after_the_end(),
+            "the run had already ended when the Stop arrived"
+        );
+    }
+
+    #[test]
+    fn a_stop_that_came_before_the_verdict_stopped_a_live_run() {
+        let journal = [
+            line(
+                1,
+                "supervisor/action",
+                json!({"action": {"action": "stop"}, "applied": true,
+                       "detail": "stopped by the user"}),
+            ),
+            line(2, "objective/outcome", json!({"outcome": "idle"})),
+        ]
+        .join("\n");
+        let evidence = stop_evidence_from_journal(&journal);
+
+        assert_eq!(evidence.stop_applied, Some(true));
+        assert!(
+            !evidence.stop_came_after_the_end(),
+            "the Stop landed on a live run: the refusal story does not apply"
+        );
+    }
+
+    #[test]
+    fn a_journal_without_a_stop_never_claims_one() {
+        let journal = line(1, "objective/outcome", json!({"outcome": "idle"}));
+        let evidence = stop_evidence_from_journal(&journal);
+
+        assert_eq!(evidence.stop_at, None);
+        assert_eq!(evidence.stop_applied, None);
+        assert!(!evidence.stop_came_after_the_end());
+    }
+
+    #[test]
+    fn a_confirmed_attempt_does_not_count_as_the_end_of_the_run() {
+        let journal = [
+            line(1, "objective/outcome", json!({"outcome": "confirmed"})),
+            line(2, "objective/outcome", json!({"outcome": "confirmed"})),
+        ]
+        .join("\n");
+        let evidence = stop_evidence_from_journal(&journal);
+
+        assert_eq!(
+            evidence.run_ended_at, None,
+            "a confirmed objective does not end the run"
+        );
+    }
 }
