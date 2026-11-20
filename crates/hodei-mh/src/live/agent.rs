@@ -1238,17 +1238,38 @@ mod tests {
     }
 
     #[test]
-    fn a_reviewed_or_unknown_tool_is_refused_with_its_reason() {
-        for (kind, title) in [("fetch", "WebFetch"), ("other", "mystery")] {
-            let (answer, detail, refusal) = answered(
-                &permission(kind, title, allow_once()),
-                PermissionMode::AllowOnce,
-            );
-            assert_eq!(answer["outcome"]["outcome"], json!("cancelled"), "{kind}");
-            assert!(detail.starts_with("permission refused:"), "{detail}");
-            let event = refusal.expect("a policy denial is a refusal event");
-            assert_eq!(event["event"], json!("agent.permission_refused"));
-        }
+    fn a_reviewed_tool_is_refused_with_its_reason() {
+        let (answer, detail, refusal) = answered(
+            &permission("fetch", "WebFetch", allow_once()),
+            PermissionMode::AllowOnce,
+        );
+        assert_eq!(answer["outcome"]["outcome"], json!("cancelled"));
+        assert!(detail.starts_with("permission refused:"), "{detail}");
+        let event = refusal.expect("a policy denial is a refusal event");
+        assert_eq!(event["event"], json!("agent.permission_refused"));
+    }
+
+    /// The ACP emits `"other"` for composite shell commands, so an
+    /// unclassified kind must keep the run going inside the sandbox under
+    /// `allow-once`, and must still be refused when the operator denies.
+    #[test]
+    fn an_unclassified_tool_kind_runs_in_the_sandbox_unless_the_operator_denies() {
+        let (answer, detail, refusal) = answered(
+            &permission("other", "cat log && echo done && find .", allow_once()),
+            PermissionMode::AllowOnce,
+        );
+        assert_eq!(answer["outcome"]["optionId"], json!("a"));
+        assert!(detail.contains("sandbox"), "{detail}");
+        assert!(refusal.is_none(), "a routed grant refuses nothing");
+
+        let (answer, detail, refusal) = answered(
+            &permission("other", "cat log && echo done && find .", allow_once()),
+            PermissionMode::Deny,
+        );
+        assert_eq!(answer["outcome"]["outcome"], json!("cancelled"));
+        assert!(detail.starts_with("permission refused:"), "{detail}");
+        let event = refusal.expect("the deny mode is a refusal event");
+        assert_eq!(event["event"], json!("agent.permission_refused"));
     }
 
     #[test]
