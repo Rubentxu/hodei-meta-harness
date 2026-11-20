@@ -311,7 +311,7 @@ fn outcome_summary(outcome: &OneshotOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live::agent::AcpAgent;
+    use crate::live::runtime::AgentRuntime;
     use opensandbox::execd::fake::{CLIENT_FRAME_BINARY, FakeBehavior, FakeExecd};
 
     /// The credential of the fixture: a value shaped like a real token,
@@ -347,9 +347,10 @@ HTTPS_PROXY=http://127.0.0.1:8888 sh /workspace/ccacp/run-agent.sh claude-code-a
         let fake = FakeExecd::start(FakeBehavior::Cooperative).await;
         let session = session_over(&fake).await;
         let credential_line = credential_line_for(FAKE_TOKEN);
+        let wrapper_script = AgentRuntime::claude_code_acp().wrapper_script();
         let handshake = AgentHandshake {
             wrapper_path: "/workspace/ccacp/run-agent.sh",
-            wrapper_script: AcpAgent::wrapper_script(),
+            wrapper_script: &wrapper_script,
             credential_line: &credential_line,
         };
 
@@ -411,9 +412,10 @@ HTTPS_PROXY=http://127.0.0.1:8888 sh /workspace/ccacp/run-agent.sh claude-code-a
     #[test]
     fn the_handshake_never_prints_the_credential_it_carries() {
         let credential_line = credential_line_for(FAKE_TOKEN);
+        let wrapper_script = AgentRuntime::claude_code_acp().wrapper_script();
         let handshake = AgentHandshake {
             wrapper_path: "/workspace/ccacp/run-agent.sh",
-            wrapper_script: AcpAgent::wrapper_script(),
+            wrapper_script: &wrapper_script,
             credential_line: &credential_line,
         };
         let shown = format!("{handshake:?}");

@@ -74,9 +74,11 @@ product:
              --project-dir <path> --tracker-dir <path>
              --managed-branch <branch>
              [--proxy-url <url>] [--permission allow-once|deny]
+             [--agent claude-code|qoder]
                                        the live runtime: the real tracker, the
                                        real sandboxes and the real managed branch
-                                       (credentials only from the environment)
+                                       (credentials only from the environment,
+                                       under the variable the agent declares)
   sup-status | sup-action | sup-events | attach-terminal | tui
                                        observe and drive the supervisor
   sup-events [--socket PATH] [--since N]

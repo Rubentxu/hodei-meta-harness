@@ -29,6 +29,7 @@ use verify::transport::TransportDigest;
 use runner::ports::{AgentError, AgentPort, Objective};
 
 use crate::live::checkpoint::{CandidateRef, LiveCheckpoints};
+use crate::live::runtime::{AgentArtifact, AgentRuntime};
 use crate::live::session::{AgentHandshake, SandboxSession};
 use crate::live::{GitIdentity, LiveConfig, LiveError, PermissionMode};
 
@@ -40,12 +41,6 @@ const INCOMING_BUNDLE: &str = "/tmp/candidate.bundle";
 
 /// Where the candidate leaves the sandbox.
 const OUTGOING_BUNDLE: &str = "/tmp/candidate-out.bundle";
-
-/// The npm package of the ACP adapter, pinned.
-const ADAPTER_PACKAGE: &str = "@zed-industries/claude-code-acp@0.16.2";
-
-/// Where the adapter is staged inside the sandbox.
-const ADAPTER_ROOT: &str = "/workspace/ccacp";
 
 /// The subdirectory of the harness state that holds the staged adapters.
 const ADAPTER_STATE_DIR: &str = "adapters";
@@ -105,20 +100,28 @@ impl Drop for AdapterArchive {
     }
 }
 
-/// The directory the pinned adapter is installed in: private state of this
-/// user, under the harness state.
+/// The directory the pinned adapter is installed in: private state of
+/// this user, under the harness state, optionally in a per-runtime
+/// subdirectory (the vendor tarball caches beside its own name).
 ///
 /// It is NOT a predictable path in the world-writable temporary directory:
 /// an adapter staged from a path any local user could prepare is an
 /// adapter they could replace.
-fn adapter_install_dir() -> std::io::Result<PathBuf> {
+fn adapter_install_dir(subdir: Option<&str>) -> std::io::Result<PathBuf> {
     let root = hodei_mh_coordinator::paths::state_root();
     let adapters = root.join(ADAPTER_STATE_DIR);
     let owned = adapters.join(supervisor::paths::current_uid().to_string());
     for directory in [root.as_path(), adapters.as_path(), owned.as_path()] {
         ensure_private_dir(directory)?;
     }
-    Ok(owned)
+    match subdir {
+        None => Ok(owned),
+        Some(name) => {
+            let named = owned.join(name);
+            ensure_private_dir(&named)?;
+            Ok(named)
+        }
+    }
 }
 
 /// Make `directory` a directory only this user can enter, refusing a
@@ -179,6 +182,11 @@ const TEXT_TAIL_LIMIT: usize = 200;
 /// How long the cleanup of the agent session may take.
 const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one pinned artifact download may take on the host. The
+/// archive is small and the cache survives attempts; a stalled vendor
+/// is a refusal, not a hung attempt.
+const ARTIFACT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The stop reason of a turn the agent ended on its own.
 ///
 /// Any other reason — a refusal, a cancellation — means the agent did not
@@ -204,14 +212,20 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    /// The credentials the environment carries.
-    pub fn from_env() -> Result<Self, LiveError> {
-        let token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
+    /// The credentials the environment carries for one agent runtime:
+    /// the variant declares which variable holds the token and which
+    /// (if any) holds a gateway base URL. The channel is the process
+    /// environment, for every runtime, and nothing else.
+    pub fn from_env(runtime: &AgentRuntime) -> Result<Self, LiveError> {
+        let token = std::env::var(runtime.credential_env()).unwrap_or_default();
         if token.trim().is_empty() {
-            return Err(LiveError::MissingCredentials);
+            return Err(LiveError::MissingCredentials {
+                credential_env: runtime.credential_env().to_string(),
+            });
         }
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
+        let base_url = runtime
+            .base_url_env()
+            .and_then(|env| std::env::var(env).ok())
             .filter(|value| !value.trim().is_empty());
         Ok(Self::new(token, base_url))
     }
@@ -272,9 +286,10 @@ impl AcpAgent {
             .run_checked(&prepare_command(&self.config.managed_branch))
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
-        self.stage_adapter(session, work_ref).await?;
+        self.stage_agent(session, work_ref).await?;
         let command = self.agent_command();
-        let wrapper_path = adapter_wrapper_path();
+        let wrapper_path = self.config.runtime.wrapper_path();
+        let wrapper_script = self.config.runtime.wrapper_script();
         let credential_line = self.credential_line().ok_or_else(|| {
             Self::failure(
                 work_ref,
@@ -283,7 +298,7 @@ impl AcpAgent {
         })?;
         let handshake = AgentHandshake {
             wrapper_path: &wrapper_path,
-            wrapper_script: AcpAgent::wrapper_script(),
+            wrapper_script: &wrapper_script,
             credential_line: &credential_line,
         };
         let (mut conversation, agent_session) = session
@@ -403,17 +418,45 @@ impl AcpAgent {
         )
     }
 
-    /// Pack the pinned ACP adapter on the host and stage it in the
-    /// sandbox: the sandbox has no egress for npm.
-    async fn stage_adapter(
+    /// Pack the agent artifact on the host and stage it in the sandbox:
+    /// the dispatch is on the artifact data of the runtime, never on a
+    /// string. The sandbox has no registry egress, so both artifacts are
+    /// built on the host and uploaded.
+    async fn stage_agent(
         &self,
         session: &SandboxSession,
         work_ref: &str,
     ) -> Result<(), AgentError> {
-        let install_dir = adapter_install_dir().map_err(|error| {
+        match self.config.runtime.artifact() {
+            AgentArtifact::HostNpmAdapter {
+                package,
+                entrypoint,
+            } => {
+                self.stage_npm_adapter(session, work_ref, package, entrypoint)
+                    .await
+            }
+            AgentArtifact::VendorTarball {
+                url, sha256, name, ..
+            } => {
+                self.stage_vendor_tarball(session, work_ref, url, sha256, name)
+                    .await
+            }
+        }
+    }
+
+    /// Install the pinned npm adapter into private host state, pack it
+    /// and stage it in the sandbox.
+    async fn stage_npm_adapter(
+        &self,
+        session: &SandboxSession,
+        work_ref: &str,
+        package: &str,
+        entrypoint: &str,
+    ) -> Result<(), AgentError> {
+        let install_dir = adapter_install_dir(None).map_err(|error| {
             Self::failure(work_ref, format!("the private adapter directory: {error}"))
         })?;
-        let adapter = install_dir.join("node_modules/.bin/claude-code-acp");
+        let adapter = install_dir.join(entrypoint);
         if !adapter.exists() {
             let status = tokio::process::Command::new("npm")
                 .args([
@@ -422,7 +465,7 @@ impl AcpAgent {
                     install_dir.to_string_lossy().as_ref(),
                     "--no-audit",
                     "--no-fund",
-                    ADAPTER_PACKAGE,
+                    package,
                 ])
                 .status()
                 .await
@@ -456,14 +499,97 @@ impl AcpAgent {
         let bytes = tokio::fs::read(archive.path())
             .await
             .map_err(|error| Self::failure(work_ref, format!("the adapter archive: {error}")))?;
+        self.upload_and_stage(session, work_ref, bytes).await
+    }
+
+    /// Stage the pinned vendor tarball: the host keeps a private cached
+    /// copy, and every copy that reaches the sandbox has first matched
+    /// the pinned sha256 on the host. The sandbox re-verifies the digest
+    /// before extracting, so the bytes promoted into the agent process
+    /// are proven twice and trusted once.
+    async fn stage_vendor_tarball(
+        &self,
+        session: &SandboxSession,
+        work_ref: &str,
+        url: &str,
+        sha256: &str,
+        name: &str,
+    ) -> Result<(), AgentError> {
+        let cache_dir = adapter_install_dir(Some(self.config.runtime.name())).map_err(|error| {
+            Self::failure(work_ref, format!("the private artifact cache: {error}"))
+        })?;
+        let cached = cache_dir.join(name);
+        if crate::digest::sha256_file(&cached).as_deref() != Some(sha256) {
+            self.download_tarball(url, sha256, &cached)
+                .await
+                .map_err(|error| Self::failure(work_ref, error))?;
+        }
+        let bytes = tokio::fs::read(&cached)
+            .await
+            .map_err(|error| Self::failure(work_ref, format!("the cached artifact: {error}")))?;
+        self.upload_and_stage(session, work_ref, bytes).await
+    }
+
+    /// Download one pinned artifact, verify it against the pinned
+    /// digest, and only then let it take its cache name. A digest that
+    /// does not match is a refusal, never a retry through the network.
+    async fn download_tarball(&self, url: &str, sha256: &str, path: &Path) -> Result<(), String> {
+        let response = reqwest::Client::builder()
+            .timeout(ARTIFACT_DOWNLOAD_TIMEOUT)
+            .build()
+            .map_err(|error| format!("the download client: {error}"))?
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| format!("the artifact download from {url}: {error}"))?;
+        let response = response
+            .error_for_status()
+            .map_err(|error| format!("the artifact download from {url}: {error}"))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("the artifact body from {url}: {error}"))?;
+        let digest = crate::digest::sha256_hex(&bytes);
+        if digest != sha256 {
+            return Err(format!(
+                "the artifact {url} has sha256 {digest}, expected {sha256}"
+            ));
+        }
+        let temp = path.with_extension("part");
+        let _ = std::fs::remove_file(&temp);
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)
+                .map_err(|error| format!("the artifact temp file: {error}"))?;
+            let mut file = std::io::BufWriter::new(file);
+            std::io::Write::write_all(&mut file, &bytes)
+                .map_err(|error| format!("the artifact cache write: {error}"))?;
+            std::io::Write::flush(&mut file)
+                .map_err(|error| format!("the artifact cache write: {error}"))?;
+        }
+        std::fs::rename(&temp, path)
+            .map_err(|error| format!("the artifact cache name: {error}"))?;
+        Ok(())
+    }
+
+    /// Upload the packed artifact and run the runtime's staging check in
+    /// the sandbox: extract under the staging root and require the
+    /// executable agent (vendor tarballs re-verify their digest first).
+    async fn upload_and_stage(
+        &self,
+        session: &SandboxSession,
+        work_ref: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), AgentError> {
         session
-            .upload(bytes, "/tmp/ccacp.tgz")
+            .upload(bytes, &self.config.runtime.archive_path())
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
         session
-            .run_checked(&format!(
-                "mkdir -p {ADAPTER_ROOT} && tar xzf /tmp/ccacp.tgz -C {ADAPTER_ROOT} && test -x {ADAPTER_ROOT}/node_modules/.bin/claude-code-acp"
-            ))
+            .run_checked(&self.config.runtime.sandbox_stage_command())
             .await
             .map_err(|error| Self::failure(work_ref, error))?;
         Ok(())
@@ -472,15 +598,11 @@ impl AcpAgent {
     /// The command that starts the ACP adapter.
     ///
     /// It carries NO credential: the token reaches the adapter through
-    /// the stdin handshake that [`AcpAgent::wrapper_script`] consumes,
-    /// so the create_session body, the sandbox process table and every
-    /// log or error built from this command stay secret-free.
+    /// the stdin handshake that the runtime's wrapper consumes, so the
+    /// create_session body, the sandbox process table and every log or
+    /// error built from this command stay secret-free.
     pub fn agent_command(&self) -> String {
-        format!(
-            "PATH={ADAPTER_ROOT}/node_modules/.bin:$PATH HTTPS_PROXY={proxy} sh {wrapper} claude-code-acp",
-            proxy = crate::probe_util::shell_quote(&self.config.proxy_url),
-            wrapper = crate::probe_util::shell_quote(&adapter_wrapper_path()),
-        )
+        self.config.runtime.launch_command(&self.config.proxy_url)
     }
 
     /// The single stdin line the wrapper consumes: the base URL (empty
@@ -497,35 +619,6 @@ impl AcpAgent {
         (!base.contains(['\n', '\r', '\t']) && !token.contains(['\n', '\r', '\t']))
             .then(|| format!("{base}\t{token}\n"))
     }
-
-    /// The POSIX wrapper staged beside the adapter inside the sandbox.
-    ///
-    /// It reads exactly ONE stdin line (the credential handshake),
-    /// exports it, and execs the adapter, so the token lives only in the
-    /// environment of the agent's process and never in an argv. A POSIX
-    /// `read` consumes its line without buffering the rest of the pipe,
-    /// so the ACP stream that follows reaches the exec'd adapter whole.
-    pub fn wrapper_script() -> &'static str {
-        r#"#!/bin/sh
-IFS="$(printf '\t')" read -r base token
-if [ -z "$token" ]; then
-  exit 1
-fi
-ANTHROPIC_AUTH_TOKEN="$token"
-export ANTHROPIC_AUTH_TOKEN
-if [ -n "$base" ]; then
-  ANTHROPIC_BASE_URL="$base"
-  export ANTHROPIC_BASE_URL
-fi
-exec "$@"
-"#
-    }
-}
-
-/// Where the credential wrapper travels inside the sandbox: the staged
-/// adapter directory, private by construction since its staging.
-fn adapter_wrapper_path() -> String {
-    format!("{ADAPTER_ROOT}/run-agent.sh")
 }
 
 #[async_trait::async_trait]
@@ -1017,10 +1110,18 @@ mod tests {
             tracker_dir: PathBuf::from("/tmp/project"),
             managed_branch: "hodei-mh/main".into(),
             permission: PermissionMode::AllowOnce,
+            runtime: AgentRuntime::claude_code_acp(),
             author: Some(GitIdentity {
                 name: "Harness Author".into(),
                 email: "harness@example.com".into(),
             }),
+        }
+    }
+
+    fn config_for(runtime: AgentRuntime) -> LiveConfig {
+        LiveConfig {
+            runtime,
+            ..config()
         }
     }
 
@@ -1076,6 +1177,114 @@ mod tests {
         );
     }
 
+    /// The Qoder runtime is launched the same secret-free way: the argv
+    /// carries the CLI and its ACP flag, never the token.
+    #[test]
+    fn the_qoder_launch_command_carries_no_credential_either() {
+        let agent = AcpAgent::new(
+            config_for(AgentRuntime::qoder_acp()),
+            Credentials::new("qoder-fixture-token", None),
+        );
+        let command = agent.agent_command();
+        assert!(
+            command.contains("qodercli --acp"),
+            "the hidden ACP flag is how the CLI answers on the stream: {command}"
+        );
+        assert!(
+            !command.contains("QODER_PERSONAL_ACCESS_TOKEN=")
+                && !command.contains("qoder-fixture-token"),
+            "no credential name and no credential value in argv: {command}"
+        );
+        assert_eq!(
+            profiles::credentials::secret_leak_positions(std::slice::from_ref(&command)),
+            Vec::<usize>::new(),
+            "the command is not even recognised as secret-bearing: {command}"
+        );
+        assert_eq!(
+            agent.credential_line().as_deref(),
+            Some("\tqoder-fixture-token\n"),
+            "the credential still travels as the one stdin line, with no base URL field"
+        );
+    }
+
+    /// Both runtimes are driven by the same ACP v1 handshake against a
+    /// fake agent that knows exactly initialize, session/new and
+    /// session/prompt: the offline proof that the live transport fits
+    /// each declared runtime.
+    #[tokio::test]
+    async fn the_initialize_and_session_new_handshake_drives_every_agent_runtime() {
+        for runtime in [AgentRuntime::claude_code_acp(), AgentRuntime::qoder_acp()] {
+            let agent = AcpAgent::new(
+                config_for(runtime.clone()),
+                Credentials::new("fixture-token", None),
+            );
+            // The per-runtime handshake material exists and is clean.
+            assert!(!agent.agent_command().contains("fixture-token"));
+            assert!(agent.credential_line().is_some());
+            let mut pipe = scripted(vec![
+                stdout(json!({"jsonrpc": "2.0", "id": 10, "result": {"protocolVersion": 1}})),
+                stdout(json!({"jsonrpc": "2.0", "id": 11, "result": {"sessionId": "s-42"}})),
+                stdout(json!({"jsonrpc": "2.0", "id": 12, "result": {"stopReason": "end_turn"}})),
+            ]);
+            let sent = Arc::clone(&pipe.sent);
+            let turn = drive_agent(
+                &mut pipe,
+                "do the work",
+                WORKTREE,
+                AGENT_TIMEOUT,
+                PermissionMode::AllowOnce,
+            )
+            .await;
+            assert!(turn.completed, "{runtime:?}: {}", turn.summary);
+            let requests: Vec<Value> = sent
+                .lock()
+                .expect("the fake records stdin")
+                .iter()
+                .filter_map(|frame| serde_json::from_str(frame.trim()).ok())
+                .collect();
+            assert_eq!(requests.len(), 3, "{runtime:?}: {requests:?}");
+            assert_eq!(requests[0]["method"], "initialize", "{runtime:?}");
+            assert_eq!(requests[0]["params"]["protocolVersion"], 1, "{runtime:?}");
+            assert_eq!(requests[1]["method"], "session/new", "{runtime:?}");
+            assert_eq!(requests[1]["params"]["cwd"], WORKTREE, "{runtime:?}");
+            assert_eq!(requests[2]["method"], "session/prompt", "{runtime:?}");
+            assert_eq!(requests[2]["params"]["sessionId"], "s-42", "{runtime:?}");
+        }
+    }
+
+    /// The spike measured it: the Qoder server does NOT implement
+    /// `notifications/initialized` and answers it with -32601, so a
+    /// transport that sent it would break exactly one runtime. The
+    /// client never sends it, for any runtime: initialize is answered
+    /// by session/new, full stop.
+    #[tokio::test]
+    async fn the_flow_never_sends_notifications_initialized() {
+        for runtime in [AgentRuntime::claude_code_acp(), AgentRuntime::qoder_acp()] {
+            let mut pipe = scripted(vec![
+                stdout(json!({"jsonrpc": "2.0", "id": 10, "result": {"protocolVersion": 1}})),
+                stdout(json!({"jsonrpc": "2.0", "id": 11, "result": {"sessionId": "s-42"}})),
+                stdout(json!({"jsonrpc": "2.0", "id": 12, "result": {"stopReason": "end_turn"}})),
+            ]);
+            let sent = Arc::clone(&pipe.sent);
+            let turn = drive_agent(
+                &mut pipe,
+                "do the work",
+                WORKTREE,
+                AGENT_TIMEOUT,
+                PermissionMode::AllowOnce,
+            )
+            .await;
+            assert!(turn.completed, "{runtime:?}: {}", turn.summary);
+            let frames = sent.lock().expect("the fake records stdin");
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| !frame.contains("notifications/initialized")),
+                "{runtime:?}: {frames:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_credential_line_frames_exactly_one_stdin_handshake() {
         let agent = AcpAgent::new(
@@ -1106,7 +1315,8 @@ mod tests {
     fn the_wrapper_hands_the_credential_to_the_child_environment_only() {
         let dir = staging_dir("wrapper");
         std::fs::create_dir_all(&dir).expect("the fixture directory");
-        std::fs::write(dir.join("run-agent.sh"), AcpAgent::wrapper_script()).expect("the wrapper");
+        let wrapper = AgentRuntime::claude_code_acp().wrapper_script();
+        std::fs::write(dir.join("run-agent.sh"), wrapper).expect("the wrapper");
         // The stand-in adapter: it prints its argv and the two credential
         // variables of its environment, then EVERY remaining stdin byte.
         std::fs::write(
@@ -1163,12 +1373,18 @@ mod tests {
 
     #[test]
     fn the_wrapper_script_itself_carries_no_credential_value() {
-        let script = AcpAgent::wrapper_script();
-        assert!(
-            !script.contains("sk-"),
-            "the staged script is static: only the stdin line carries values"
-        );
-        assert!(script.contains("exec"), "and it execs, it does not fork");
+        for runtime in [AgentRuntime::claude_code_acp(), AgentRuntime::qoder_acp()] {
+            let script = runtime.wrapper_script();
+            assert!(
+                !script.contains("sk-") && !script.contains("fixture"),
+                "the staged script is static: only the stdin line carries values"
+            );
+            assert!(script.contains("exec"), "it execs, it does not fork");
+            assert!(
+                script.contains(runtime.credential_env()),
+                "the wrapper exports the variable its runtime declares"
+            );
+        }
     }
 
     #[test]
