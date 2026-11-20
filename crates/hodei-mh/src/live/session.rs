@@ -54,6 +54,38 @@ pub enum SessionError {
     Release { sandbox: String, reason: String },
 }
 
+/// The credential handshake of the ACP adapter: everything the session
+/// needs to start the agent WITHOUT a credential in the command.
+///
+/// The wrapper script and the launch command are safe to log and to
+/// persist: neither carries a value. The credential line is the only
+/// carrier in the whole handshake, it travels exclusively through the
+/// stdin pipe, and only the wrapper (never the daemon, never the adapter
+/// arguments) reads it.
+pub struct AgentHandshake<'a> {
+    /// Where the wrapper is staged inside the sandbox: the pre-staged
+    /// adapter directory, private since its staging.
+    pub wrapper_path: &'a str,
+    /// The POSIX wrapper: reads exactly one stdin line, exports the
+    /// credential it names, and execs the adapter.
+    pub wrapper_script: &'a str,
+    /// The one line the wrapper consumes, newline terminated, sent as
+    /// the first raw stdin frame before the ACP stream begins.
+    pub credential_line: &'a str,
+}
+
+impl std::fmt::Debug for AgentHandshake<'_> {
+    /// The debug view redacts the credential line: a handshake printed
+    /// in an error or a log must never print the secret it transports.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHandshake")
+            .field("wrapper_path", &self.wrapper_path)
+            .field("wrapper_script", &self.wrapper_script)
+            .field("credential_line", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A sandbox created for one attempt, with its transport and its cleanup.
 pub struct SandboxSession {
     sandbox_id: String,
@@ -190,13 +222,32 @@ impl SandboxSession {
         Ok(outcome.output)
     }
 
-    /// Start the ACP adapter and attach to its session.
+    /// Start the ACP adapter through the credential handshake and attach
+    /// to its session.
+    ///
+    /// The command carries NO credential: the wrapper is staged first,
+    /// the session is started, and the credential is then handed over as
+    /// the FIRST stdin frame — before any ACP byte — which only the
+    /// wrapper consumes. The adapter receives it as environment of its
+    /// own process, never in argv, never in the request body.
     pub async fn attach_agent(
         &self,
         command: &str,
         cwd: &str,
+        handshake: &AgentHandshake<'_>,
     ) -> Result<(PipeSession, CreateSessionResponse), SessionError> {
         let deadline = self.deadline();
+        self.execd
+            .upload_file(
+                handshake.wrapper_script.as_bytes().to_vec(),
+                handshake.wrapper_path,
+                deadline.remaining(),
+            )
+            .await
+            .map_err(|error| SessionError::Transfer {
+                path: handshake.wrapper_path.to_string(),
+                reason: error.to_string(),
+            })?;
         let session = self
             .execd
             .create_session(
@@ -223,6 +274,13 @@ impl SandboxSession {
             command: "the ACP adapter pipe".to_string(),
             detail: error.to_string(),
         })?;
+        attached
+            .send_stdin(handshake.credential_line.as_bytes())
+            .await
+            .map_err(|error| SessionError::Command {
+                command: "the credential handshake of the ACP adapter".to_string(),
+                detail: error.to_string(),
+            })?;
         Ok((attached, session))
     }
 
@@ -248,4 +306,118 @@ fn outcome_summary(outcome: &OneshotOutcome) -> String {
         .map(|code| code.to_string())
         .unwrap_or_else(|| "no terminal status".to_string());
     format!("exit {code}: {}", outcome.output.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::agent::AcpAgent;
+    use opensandbox::execd::fake::{CLIENT_FRAME_BINARY, FakeBehavior, FakeExecd};
+
+    /// The credential of the fixture: a value shaped like a real token,
+    /// never a real one.
+    const FAKE_TOKEN: &str = "sk-ant-fixture-token";
+
+    /// The launch command the session is asked to run: secret-free by
+    /// construction (its own shape is asserted in the agent tests), so
+    /// this test can measure exactly what the daemon received.
+    const LAUNCH_COMMAND: &str = "PATH=/workspace/ccacp/node_modules/.bin:$PATH \
+HTTPS_PROXY=http://127.0.0.1:8888 sh /workspace/ccacp/run-agent.sh claude-code-acp";
+
+    fn credential_line_for(token: &str) -> String {
+        format!("http://model.local\t{token}\n")
+    }
+
+    async fn session_over(fake: &FakeExecd) -> SandboxSession {
+        // The session is the transport plus the cleanup guard the fake
+        // never needs: only the adapter handshake is under test.
+        let control = ControlPlane::new(fake.base_url.clone());
+        SandboxSession {
+            sandbox_id: "sandbox-under-test".to_string(),
+            control,
+            execd: ExecdClient::new(ExecdEndpoint::new(fake.base_url.clone())),
+            guard: None,
+        }
+    }
+
+    /// The credential is the FIRST stdin frame and the ACP stream follows:
+    /// the bytes the daemon saw are the contract, observed offline.
+    #[tokio::test]
+    async fn the_credential_line_is_the_first_stdin_frame_and_the_acp_stream_follows() {
+        let fake = FakeExecd::start(FakeBehavior::Cooperative).await;
+        let session = session_over(&fake).await;
+        let credential_line = credential_line_for(FAKE_TOKEN);
+        let handshake = AgentHandshake {
+            wrapper_path: "/workspace/ccacp/run-agent.sh",
+            wrapper_script: AcpAgent::wrapper_script(),
+            credential_line: &credential_line,
+        };
+
+        let (pipe, _created) = session
+            .attach_agent(LAUNCH_COMMAND, "/workspace/work", &handshake)
+            .await
+            .expect("the handshake completes over the fake");
+        let initialize = r#"{"jsonrpc":"2.0","method":"initialize"}"#;
+        pipe.send_stdin(initialize.as_bytes())
+            .await
+            .expect("the pipe is open");
+        drop(pipe);
+        fake.await_pipes_closed(1).await;
+
+        let counts = fake.counts();
+        let stdin: Vec<&[u8]> = counts
+            .pipe_frames
+            .iter()
+            .filter(|(opcode, _)| *opcode == CLIENT_FRAME_BINARY)
+            .map(|(_, payload)| payload.as_slice())
+            .collect();
+        assert_eq!(stdin.len(), 2, "the credential line and the ACP request");
+        assert_eq!(
+            stdin[0],
+            opensandbox::execd::frames::encode_stdin(credential_line.as_bytes()),
+            "the credential travels as the first raw stdin frame, before any ACP byte"
+        );
+        assert_eq!(
+            stdin[1],
+            opensandbox::execd::frames::encode_stdin(initialize.as_bytes()),
+            "then the ACP stream"
+        );
+
+        // The request bodies the daemon keeps: the command and the staged
+        // wrapper carry no credential.
+        assert!(
+            counts
+                .commands
+                .iter()
+                .all(|seen| !seen.contains(FAKE_TOKEN)),
+            "the create_session command carries no credential"
+        );
+        assert_eq!(
+            profiles::credentials::secret_leak_positions(&counts.commands),
+            Vec::<usize>::new(),
+            "the command is not even recognised as secret-bearing"
+        );
+        assert!(
+            counts
+                .uploads
+                .iter()
+                .all(|body| !String::from_utf8_lossy(body).contains(FAKE_TOKEN)),
+            "the staged wrapper carries no credential either"
+        );
+    }
+
+    /// The credential line is redacted in the debug view: the handshake
+    /// can travel with an error without printing its secret.
+    #[test]
+    fn the_handshake_never_prints_the_credential_it_carries() {
+        let credential_line = credential_line_for(FAKE_TOKEN);
+        let handshake = AgentHandshake {
+            wrapper_path: "/workspace/ccacp/run-agent.sh",
+            wrapper_script: AcpAgent::wrapper_script(),
+            credential_line: &credential_line,
+        };
+        let shown = format!("{handshake:?}");
+        assert!(!shown.contains(FAKE_TOKEN), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
 }
