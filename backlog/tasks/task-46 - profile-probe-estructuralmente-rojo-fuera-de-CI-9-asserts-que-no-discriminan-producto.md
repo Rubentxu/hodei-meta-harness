@@ -3,9 +3,10 @@ id: TASK-46
 title: >-
   profile-probe estructuralmente rojo fuera de CI: 9 asserts que no discriminan
   producto
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-11-20T16:31:00Z'
+updated_date: '2026-11-20T16:55:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -29,3 +30,15 @@ Preflight SÍ pasó (imágenes presentes, proxy hodei-uat-proxy4 host-reachable 
 Acción: o los asserts del probe deben relajarse para hosts locales (configurar per-assert expectations por entorno), o profile-run necesita un modo local honesto, o la lane local debe declarar explícitamente "only CI" con motivo.
 Referencia: /tmp/uat-task34/bisect7d/probes-out/profile-probe-1.json y /tmp/uat-task34/evidence6/probes-out/profile-probe-1.json.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T16:55:00Z
+
+---
+
+Cierre tras merge --no-ff en main. Fast-check --all PASS. Implementación: struct Carriage + helper puro probe_command en profile_probe.rs:26-68; 7 argvs del probe pasan por el helper; list_sandbox_ids recibe server parseado. Verificación lane en puerto no-default (PORT=18091, proxy hodei-uat-proxy4): probes: PASS, residuo 0 networks/containers. Evidencia en /tmp/uat-task34/evidence46/lane.txt. Worker 2754343 tokens / 43 tool-uses / 12 min. Commit 32383fd.
+
+---
+<!-- COMMENTS:END -->
