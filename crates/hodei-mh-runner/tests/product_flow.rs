@@ -177,7 +177,11 @@ async fn the_rehearsal_drives_the_whole_sequence_through_the_real_socket() {
     // ref. The recording says so.
     let recorded = recorder.publications();
     assert_eq!(recorded.len(), 1, "the rehearsal recorded one publication");
-    assert!(!recorded[0].closed, "the rehearsal closed nothing");
+    assert_eq!(
+        recorded[0].closure,
+        runner::ports::Closed::Unconfirmed,
+        "the rehearsal closed nothing"
+    );
     assert!(
         recorded[0].detail.contains("nothing was closed"),
         "{}",

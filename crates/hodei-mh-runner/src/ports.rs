@@ -39,6 +39,16 @@ impl ObjectiveCheck {
     }
 }
 
+/// What the objective's publication closes.
+///
+/// A custom objective owns no ticket: it is promoted like any candidate,
+/// but there is nothing to close, and the tracker is never written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closes {
+    Ticket,
+    Nothing,
+}
+
 /// The work to execute and the requirements that decide whether it held.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Objective {
@@ -49,6 +59,11 @@ pub struct Objective {
     /// The checks that decide whether the objective held, each with the
     /// criterion that declares it.
     pub checks: Vec<ObjectiveCheck>,
+    /// The controller's run that carries this objective, when one named
+    /// it. It is the identity the durable checkpoint records.
+    pub run: Option<u64>,
+    /// What the objective closes when it is published.
+    pub closes: Closes,
 }
 
 impl Objective {
@@ -116,13 +131,24 @@ impl Verification {
     }
 }
 
+/// How the closure of a publication ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closed {
+    /// A ticket was closed and the re-read confirmed it.
+    Confirmed,
+    /// The objective owns no ticket: nothing had to be closed.
+    NotRequired,
+    /// Effects moved but the closure was not confirmed.
+    Unconfirmed,
+}
+
 /// What the publisher did with the candidate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Publication {
     /// The revision that was published, as git names it.
     pub revision: String,
-    /// Whether the work item was closed.
-    pub closed: bool,
+    /// How the closure ended.
+    pub closure: Closed,
     /// What happened, in words.
     pub detail: String,
 }

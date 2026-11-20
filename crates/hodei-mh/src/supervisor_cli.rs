@@ -284,11 +284,19 @@ fn provenance_label(provenance: &supervisor::protocol::Provenance) -> &'static s
 
 fn parse_action(args: &[String], name: &str) -> Option<SupervisorAction> {
     match name {
-        "start" => Some(SupervisorAction::Start {
-            project: flag(args, "--project", ""),
-            ticket: opt_flag(args, "--ticket"),
-            revision: opt_flag(args, "--revision"),
-        }),
+        "start" => match opt_flag(args, "--objective") {
+            // A custom objective owns no ticket: it is its own action so a
+            // ticket can never travel with it.
+            Some(objective) => Some(SupervisorAction::StartObjective {
+                project: flag(args, "--project", ""),
+                objective,
+            }),
+            None => Some(SupervisorAction::Start {
+                project: flag(args, "--project", ""),
+                ticket: opt_flag(args, "--ticket"),
+                revision: opt_flag(args, "--revision"),
+            }),
+        },
         "pause" => Some(SupervisorAction::Pause),
         "resume" => Some(SupervisorAction::Resume),
         "stop" => Some(SupervisorAction::Stop),
@@ -366,6 +374,18 @@ pub async fn run_action(args: &[String]) -> i32 {
                 return 1;
             }
         },
+        SupervisorAction::StartObjective { project, objective } if project.is_empty() => {
+            match client.snapshot().await {
+                Ok(snapshot) => SupervisorAction::StartObjective {
+                    project: snapshot.project,
+                    objective,
+                },
+                Err(e) => {
+                    eprintln!("cannot read the supervisor's project: {e}");
+                    return 1;
+                }
+            }
+        }
         other => other,
     };
     match client.action(action).await {
@@ -554,6 +574,7 @@ pub fn simulated_snapshot() -> Snapshot {
         phase: hodei_mh_run::run::Phase::Running,
         paused: false,
         ticket: Some("TASK-17".into()),
+        goal: None,
         revision: Some("0f3e91c".into()),
         // The simulated state measured nothing: it says UNKNOWN, the
         // same way a real supervisor says it when it has no telemetry.

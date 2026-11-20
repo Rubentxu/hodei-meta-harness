@@ -16,7 +16,9 @@ use run::runtime::{
 use tracker::core::TrackerRead;
 
 use crate::core::{GoalRunner, RunnerError};
-use crate::ports::{AgentPort, Objective, PublisherPort, RequirementsPort, VerifierPort};
+use crate::ports::{
+    AgentPort, Closed, Closes, Objective, PublisherPort, RequirementsPort, VerifierPort,
+};
 
 /// The claim this runtime holds on the work it selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,11 +63,10 @@ pub trait ClaimPort: Send + Sync {
 /// so no path ends without a recorded verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptEnd {
-    /// The candidate was published; `closed` says whether the work was
-    /// closed with it.
+    /// The candidate was published; `closure` says how the closure ended.
     Published {
         work_ref: String,
-        closed: bool,
+        closure: Closed,
         detail: String,
     },
     /// The verification did not cover every required check.
@@ -101,12 +102,12 @@ pub fn outcome_of(end: AttemptEnd) -> ObjectiveOutcome {
     match end {
         AttemptEnd::Published {
             work_ref,
-            closed: true,
+            closure: Closed::Confirmed | Closed::NotRequired,
             detail,
         } => ObjectiveOutcome::Confirmed { work_ref, detail },
         AttemptEnd::Published {
             work_ref,
-            closed: false,
+            closure: Closed::Unconfirmed,
             detail,
         } => ObjectiveOutcome::Failed {
             reason: format!(
@@ -344,6 +345,18 @@ impl ObjectiveRuntime for LiveRuntime {
         // gets a FRESH flag, and a stop that arrived before the attempt
         // did starts it cancelled instead of being lost.
         let cancelled = self.cancellations.install(run);
+        // A custom objective owns no ticket: it selects nothing, claims
+        // nothing and writes no tracker, so no selection runs for it.
+        if let Some(custom) = &request.objective {
+            if request.work_ref.is_some() {
+                return Err(RuntimeError(
+                    "a custom objective owns no ticket: name a ticket or an objective, not both"
+                        .into(),
+                ));
+            }
+            let objective = custom_objective(custom, run);
+            return Ok(self.handle(objective, None, cancelled));
+        }
         // Work somebody else holds is not selected at all: it is not
         // eligible, and the chain skips it.
         let held = match self.claims.claims() {
@@ -395,7 +408,7 @@ impl ObjectiveRuntime for LiveRuntime {
         // The guard is created with the claim and travels with the attempt:
         // a dropped attempt (aborted) still gives the work back.
         let guard = ClaimGuard::new(self.claims.clone(), &item.id, epoch);
-        let objective = match self.requirements.requirements(&item) {
+        let mut objective = match self.requirements.requirements(&item) {
             Ok(objective) => objective,
             Err(error) => {
                 drop(guard);
@@ -407,13 +420,31 @@ impl ObjectiveRuntime for LiveRuntime {
                 )));
             }
         };
+        objective.run = Some(run.number());
+        Ok(self.handle(objective, Some(guard), cancelled))
+    }
+
+    /// Signal the attempt of `run`: it ends after the agent returns,
+    /// without verifying or publishing, and releases everything it owns.
+    fn cancel(&self, run: RunId) {
+        LiveRuntime::cancel(self, run)
+    }
+}
+
+impl LiveRuntime {
+    /// The handle of an objective about to run: a stop that arrived while
+    /// the attempt was being set up ends it before any effect, and the
+    /// claim, when there is one, goes back with the attempt.
+    fn handle(
+        &self,
+        objective: Objective,
+        guard: Option<ClaimGuard>,
+        cancelled: Arc<AtomicBool>,
+    ) -> ObjectiveHandle {
         let agent = self.agent.clone();
         let verifier = self.verifier.clone();
         let publisher = self.publisher.clone();
-        Ok(ObjectiveHandle::new(async move {
-            // A stop that arrived while the attempt was being set up ends
-            // it before any effect: no sandbox is created for work nobody
-            // wants anymore, and the claim goes back with the attempt.
+        ObjectiveHandle::new(async move {
             let end = if cancelled.load(Ordering::SeqCst) {
                 AttemptEnd::Cancelled {
                     work_ref: objective.work_ref.clone(),
@@ -423,13 +454,19 @@ impl ObjectiveRuntime for LiveRuntime {
             };
             drop(guard);
             outcome_of(end)
-        }))
+        })
     }
+}
 
-    /// Signal the attempt of `run`: it ends after the agent returns,
-    /// without verifying or publishing, and releases everything it owns.
-    fn cancel(&self, run: RunId) {
-        LiveRuntime::cancel(self, run)
+/// The objective a custom request carries: free-form work that owns no
+/// ticket, so it declares no tracker check and closes nothing.
+fn custom_objective(text: &str, run: RunId) -> Objective {
+    Objective {
+        work_ref: "custom-objective".to_string(),
+        instruction: text.trim().to_string(),
+        checks: Vec::new(),
+        run: Some(run.number()),
+        closes: Closes::Nothing,
     }
 }
 
@@ -514,7 +551,7 @@ async fn attempt(
     {
         Ok(publication) => AttemptEnd::Published {
             work_ref,
-            closed: publication.closed,
+            closure: publication.closure,
             detail: publication.detail,
         },
         Err(error) => AttemptEnd::PromotionFailed {
@@ -531,7 +568,8 @@ mod tests {
 
     use super::*;
     use crate::ports::{
-        AgentError, ObjectiveCheck, Publication, PublisherError, RequirementsError, Verification,
+        AgentError, Closed, Closes, ObjectiveCheck, Publication, PublisherError, RequirementsError,
+        Verification,
         VerifierError,
     };
     use tracker::core::{WorkItem, WorkStatus};
@@ -551,6 +589,8 @@ mod tests {
                     id: "AC-1".into(),
                     command: "true".into(),
                 })],
+                run: None,
+                closes: Closes::Ticket,
             })
         }
     }
@@ -627,21 +667,21 @@ mod tests {
 
     struct CountingPublisher {
         calls: AtomicUsize,
-        closed: bool,
+        closure: Closed,
     }
 
     impl CountingPublisher {
         fn confirm_closing() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
-                closed: true,
+                closure: Closed::Confirmed,
             }
         }
 
         fn confirm_without_closure() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
-                closed: false,
+                closure: Closed::Unconfirmed,
             }
         }
 
@@ -661,7 +701,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Publication {
                 revision: "1f0c3a5b".into(),
-                closed: self.closed,
+                closure: self.closure,
                 detail: "the publisher moved the effects".into(),
             })
         }
@@ -789,6 +829,7 @@ mod tests {
             ObjectiveRequest {
                 project: "project".into(),
                 work_ref: work_ref.map(str::to_string),
+                objective: None,
             },
         )
     }
@@ -806,7 +847,7 @@ mod tests {
         assert_eq!(
             outcome_of(AttemptEnd::Published {
                 work_ref: "T-1".into(),
-                closed: true,
+                closure: Closed::Confirmed,
                 detail: "published".into(),
             }),
             ObjectiveOutcome::Confirmed {
@@ -816,7 +857,7 @@ mod tests {
         );
         let unconfirmed = outcome_of(AttemptEnd::Published {
             work_ref: "T-1".into(),
-            closed: false,
+            closure: Closed::Unconfirmed,
             detail: "moved".into(),
         });
         assert!(
@@ -899,6 +940,196 @@ mod tests {
         assert_eq!(publisher.calls(), 0);
         assert_eq!(claims.claim_calls(), 0, "idle work takes no claim");
         assert!(claims.releases().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recurring_goal_with_no_work_waits_twice_without_any_effect() {
+        let agent = Arc::new(CountingAgent::default());
+        let publisher = Arc::new(CountingPublisher::confirm_closing());
+        let claims = Arc::new(FakeClaims::granting(7));
+        let runtime = runtime_with(
+            Vec::new(),
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+            agent.clone(),
+        );
+        // Two consecutive starts of a goal whose queue is empty: each one
+        // waits, and neither opens a sandbox, a claim or an agent turn.
+        for run in 1..=2u64 {
+            let outcome = start(&runtime, RunId(run), None)
+                .await
+                .expect("the runtime accepts the objective")
+                .completion()
+                .await;
+            assert!(
+                matches!(outcome, ObjectiveOutcome::Idle { .. }),
+                "run {run}: {outcome:?}"
+            );
+        }
+        assert_eq!(agent.calls(), 0, "waiting costs no agent turn");
+        assert_eq!(publisher.calls(), 0);
+        assert_eq!(claims.claim_calls(), 0, "waiting takes no claim");
+        assert!(claims.releases().is_empty());
+    }
+
+    /// A tracker whose reads are counted: a custom objective must not
+    /// consult it, and must not write the directory it lives in.
+    struct CountingTracker {
+        snapshot_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl tracker::core::TrackerRead for CountingTracker {
+        async fn snapshot(&self) -> Result<Vec<WorkItem>, tracker::core::TrackerError> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    /// A publisher that records what it was asked to close.
+    struct RegistryPublisher {
+        closures: Mutex<Vec<Closes>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PublisherPort for RegistryPublisher {
+        async fn publish(
+            &self,
+            objective: &Objective,
+            _candidate: &Candidate,
+            _verification: &Verification,
+        ) -> Result<Publication, PublisherError> {
+            if let Ok(mut closures) = self.closures.lock() {
+                closures.push(objective.closes);
+            }
+            let closure = match objective.closes {
+                Closes::Ticket => Closed::Confirmed,
+                Closes::Nothing => Closed::NotRequired,
+            };
+            Ok(Publication {
+                revision: "1f0c3a5b".into(),
+                closure,
+                detail: "the publisher moved the effects".into(),
+            })
+        }
+    }
+
+    fn directory_snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return files;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(directory_snapshot(&path));
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                files.push((path, bytes));
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn a_custom_objective_never_reads_claims_or_the_tracker() {
+        let tracker_dir = std::env::temp_dir().join(format!(
+            "hodei-custom-objective-{}-{}",
+            std::process::id(),
+            "tracker"
+        ));
+        let _ = std::fs::remove_dir_all(&tracker_dir);
+        std::fs::create_dir_all(&tracker_dir).expect("the tracker fixture");
+        std::fs::write(tracker_dir.join("BACKLOG.md"), "# Backlog\n\n- keep me\n")
+            .expect("the backlog fixture");
+        let before = directory_snapshot(&tracker_dir);
+
+        let agent = Arc::new(CountingAgent::default());
+        let claims = Arc::new(FakeClaims::granting(7));
+        let publisher = Arc::new(RegistryPublisher {
+            closures: Mutex::new(Vec::new()),
+        });
+        let tracker = Arc::new(CountingTracker {
+            snapshot_calls: AtomicUsize::new(0),
+        });
+        let runtime = LiveRuntime::new(
+            "project",
+            tracker.clone(),
+            Arc::new(FixedRequirements),
+            agent.clone(),
+            Arc::new(HoldingVerifier),
+            publisher.clone(),
+            claims.clone(),
+        );
+        let outcome = runtime
+            .start(
+                RunId(3),
+                ObjectiveRequest {
+                    project: "project".into(),
+                    work_ref: None,
+                    objective: Some("summarise the docs".into()),
+                },
+            )
+            .await
+            .expect("the runtime accepts a custom objective")
+            .completion()
+            .await;
+
+        assert!(
+            matches!(outcome, ObjectiveOutcome::Confirmed { ref work_ref, .. } if work_ref == "custom-objective"),
+            "{outcome:?}"
+        );
+        assert_eq!(agent.seen(), vec!["custom-objective".to_string()]);
+        assert_eq!(claims.claim_calls(), 0, "a custom objective takes no claim");
+        assert!(claims.releases().is_empty());
+        assert_eq!(
+            tracker.snapshot_calls.load(Ordering::SeqCst),
+            0,
+            "a custom objective never reads the tracker"
+        );
+        assert_eq!(
+            publisher
+                .closures
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_default(),
+            vec![Closes::Nothing],
+            "the publisher was told there is no ticket to close"
+        );
+        assert_eq!(
+            directory_snapshot(&tracker_dir),
+            before,
+            "the tracker directory is byte-identical"
+        );
+        let _ = std::fs::remove_dir_all(&tracker_dir);
+    }
+
+    #[tokio::test]
+    async fn a_custom_objective_that_also_names_a_ticket_is_refused() {
+        let runtime = runtime_with(
+            Vec::new(),
+            Arc::new(FixedRequirements),
+            Arc::new(HoldingVerifier),
+            Arc::new(CountingPublisher::confirm_closing()),
+            Arc::new(FakeClaims::granting(7)),
+            Arc::new(CountingAgent::default()),
+        );
+        let refused = runtime
+            .start(
+                RunId(1),
+                ObjectiveRequest {
+                    project: "project".into(),
+                    work_ref: Some("T-1".into()),
+                    objective: Some("summarise the docs".into()),
+                },
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "an objective owns no ticket or one ticket"
+        );
     }
 
     #[tokio::test]
@@ -1121,7 +1352,7 @@ mod tests {
             }
             Ok(Publication {
                 revision: "1f0c3a5b".into(),
-                closed: true,
+                closure: Closed::Confirmed,
                 detail: "the closure moved the ticket".into(),
             })
         }
@@ -1436,7 +1667,7 @@ mod tests {
                 self.gate.notified().await;
                 Ok(Publication {
                     revision: "1f0c3a5b".into(),
-                    closed: true,
+                    closure: Closed::Confirmed,
                     detail: "the publisher moved the effects".into(),
                 })
             }
@@ -1713,6 +1944,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "another-project".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await;

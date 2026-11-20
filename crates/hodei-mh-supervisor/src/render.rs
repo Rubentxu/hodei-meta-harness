@@ -33,6 +33,13 @@ pub fn render_snapshot(snapshot: &Snapshot) -> Vec<String> {
         escape_control(snapshot.ticket.as_deref().unwrap_or("(none)"))
     ));
     lines.push(format!(
+        "goal: {}",
+        match &snapshot.goal {
+            Some(objective) => format!("custom objective: {}", escape_control(objective)),
+            None => "tracker work".to_string(),
+        }
+    ));
+    lines.push(format!(
         "revision: {}",
         escape_control(snapshot.revision.as_deref().unwrap_or("(none)"))
     ));
@@ -172,6 +179,9 @@ fn resources_label(observation: &ResourceObservation) -> String {
 fn action_label(action: &crate::protocol::SupervisorAction) -> String {
     match action {
         crate::protocol::SupervisorAction::Start { project, .. } => format!("start({project})"),
+        crate::protocol::SupervisorAction::StartObjective { project, .. } => {
+            format!("start_objective({project})")
+        }
         crate::protocol::SupervisorAction::Pause => "pause".to_string(),
         crate::protocol::SupervisorAction::Resume => "resume".to_string(),
         crate::protocol::SupervisorAction::Stop => "stop".to_string(),
@@ -193,6 +203,7 @@ mod tests {
             phase: run::run::Phase::Running,
             paused: false,
             ticket: None,
+            goal: None,
             revision: None,
             runtime: None,
             objective: None,
@@ -241,6 +252,7 @@ mod tests {
             phase: run::run::Phase::Idle,
             paused: false,
             ticket: Some("TASK-1\nphase: running".into()),
+            goal: None,
             revision: None,
             runtime: None,
             objective: None,
@@ -275,6 +287,7 @@ mod tests {
             phase: run::run::Phase::Running,
             paused: false,
             ticket: None,
+            goal: None,
             revision: None,
             runtime: None,
             objective: None,

@@ -12,7 +12,8 @@ use run::run::Phase;
 use run::runtime::{ObjectiveOutcome, ObjectiveRequest, ObjectiveRuntime, RunId};
 use runner::live::{ClaimError, ClaimPort, Claimed, LiveRuntime};
 use runner::ports::{
-    AgentError, AgentPort, Objective, ObjectiveCheck, Publication, PublisherError, PublisherPort,
+    AgentError, AgentPort, Closed, Closes, Objective, ObjectiveCheck, Publication, PublisherError,
+    PublisherPort,
     RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
 };
 use supervisor::engine::{self, Transition};
@@ -34,6 +35,8 @@ impl RequirementsPort for FixedRequirements {
                 id: "AC-1".into(),
                 command: "true".into(),
             })],
+            run: None,
+            closes: Closes::Ticket,
         })
     }
 }
@@ -88,7 +91,7 @@ impl PublisherPort for GatedPublisher {
         self.gate.notified().await;
         Ok(Publication {
             revision: "1f0c3a5b".into(),
-            closed: true,
+            closure: Closed::Confirmed,
             detail: "the publisher moved the effects".into(),
         })
     }
@@ -171,6 +174,7 @@ fn request() -> ObjectiveRequest {
     ObjectiveRequest {
         project: "project".into(),
         work_ref: None,
+        objective: None,
     }
 }
 

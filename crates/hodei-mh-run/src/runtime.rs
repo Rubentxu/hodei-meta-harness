@@ -78,6 +78,10 @@ pub struct ObjectiveRequest {
     pub project: String,
     /// The work item to execute, when the caller named one.
     pub work_ref: Option<String>,
+    /// A custom objective, when the caller asked for work that owns no
+    /// ticket. It never selects, claims or closes tracker work.
+    #[serde(default)]
+    pub objective: Option<String>,
 }
 
 /// What the objective ended up being.

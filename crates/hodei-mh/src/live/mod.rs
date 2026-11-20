@@ -7,6 +7,7 @@
 //! an objective it can never run.
 
 pub mod agent;
+pub mod checkpoint;
 pub mod claims;
 pub mod publisher;
 pub mod requirements;
@@ -24,6 +25,7 @@ use runner::live::LiveRuntime;
 use verify::runner::CleanRunner;
 
 use crate::live::agent::{AcpAgent, Credentials};
+use crate::live::checkpoint::Recovery;
 use crate::live::claims::StoreClaims;
 use crate::live::publisher::VerifiedPublisher;
 use crate::live::requirements::BacklogRequirements;
@@ -79,6 +81,11 @@ impl LiveConfig {
     pub fn bundle_path(&self) -> PathBuf {
         hodei_mh_coordinator::paths::project_state_dir(&self.project).join("candidate.bundle")
     }
+
+    /// The durable checkpoints of this project.
+    pub fn checkpoints(&self) -> checkpoint::LiveCheckpoints {
+        checkpoint::LiveCheckpoints::for_project(&self.project)
+    }
 }
 
 /// Why the live runtime could not be wired.
@@ -110,6 +117,8 @@ pub enum LiveError {
     Git { path: String, detail: String },
     #[error("the claims of the project could not be opened: {0}")]
     Claims(String),
+    #[error("the live checkpoint could not be read at boot: {0}")]
+    Checkpoint(String),
 }
 
 /// Build the live runtime, validating the boot preconditions first.
@@ -146,6 +155,27 @@ pub async fn real_ports(config: &LiveConfig) -> Result<LiveRuntime, LiveError> {
         )
         .map_err(|error| LiveError::Claims(error.to_string()))?,
     );
+    // A restart reads the durable record before any effect: a confirmed
+    // attempt is not redone, and a pending one is reported as uncertain
+    // instead of being executed again.
+    match config.checkpoints().recover() {
+        Ok(Recovery::Fresh) => {}
+        Ok(Recovery::NothingToRedo(record)) => eprintln!(
+            "live checkpoint: {} is confirmed (epoch {}, session {}): nothing to redo; handoff={}",
+            record.checkpoint.work_ref,
+            record.checkpoint.epoch,
+            record.checkpoint.session_id,
+            config.checkpoints().handoff_path().display()
+        ),
+        Ok(Recovery::Uncertain(record)) => eprintln!(
+            "live checkpoint: {} is PENDING (epoch {}, session {}): its outcome is uncertain and it is not re-executed; handoff={}",
+            record.checkpoint.work_ref,
+            record.checkpoint.epoch,
+            record.checkpoint.session_id,
+            config.checkpoints().handoff_path().display()
+        ),
+        Err(error) => return Err(LiveError::Checkpoint(error.to_string())),
+    }
     let requirements = Arc::new(BacklogRequirements::new("backlog", &config.tracker_dir));
     let verifier = Arc::new(CleanVerifier {
         runner: CleanRunner {

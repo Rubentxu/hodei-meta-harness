@@ -30,6 +30,23 @@ impl InteractionPolicy {
             requires_human: vec![ToolKind::Network, ToolKind::Unknown],
         }
     }
+
+    /// The policy of a refused automation: every tool kind needs a human
+    /// review, so no interaction is ever granted or routed by rule.
+    pub fn deny_all() -> Self {
+        Self {
+            auto_allow: Vec::new(),
+            sandbox_routed: Vec::new(),
+            requires_human: vec![
+                ToolKind::Read,
+                ToolKind::Write,
+                ToolKind::Execute,
+                ToolKind::Terminal,
+                ToolKind::Network,
+                ToolKind::Unknown,
+            ],
+        }
+    }
 }
 
 /// Host client capabilities (AC-3): the hodei-mh client NEVER advertises
@@ -52,6 +69,23 @@ mod tests {
         assert!(policy.sandbox_routed.contains(&ToolKind::Write));
         assert!(policy.sandbox_routed.contains(&ToolKind::Execute));
         assert!(policy.requires_human.contains(&ToolKind::Unknown));
+    }
+
+    #[test]
+    fn the_deny_policy_requires_review_for_every_kind() {
+        let policy = InteractionPolicy::deny_all();
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Write,
+            ToolKind::Execute,
+            ToolKind::Terminal,
+            ToolKind::Network,
+            ToolKind::Unknown,
+        ] {
+            assert!(!policy.auto_allow.contains(&kind), "{kind:?}");
+            assert!(!policy.sandbox_routed.contains(&kind), "{kind:?}");
+            assert!(policy.requires_human.contains(&kind), "{kind:?}");
+        }
     }
 
     #[test]

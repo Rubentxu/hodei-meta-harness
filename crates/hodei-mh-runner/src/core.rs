@@ -204,6 +204,8 @@ mod tests {
                     id: "AC-1".into(),
                     command: "true".into(),
                 })],
+                run: None,
+                closes: crate::ports::Closes::Ticket,
             })
         }
     }
@@ -252,7 +254,7 @@ mod tests {
                 .push(objective.work_ref.clone());
             Ok(crate::ports::Publication {
                 revision: "1f0c3a5b".into(),
-                closed: true,
+                closure: crate::ports::Closed::Confirmed,
                 detail: "published".into(),
             })
         }

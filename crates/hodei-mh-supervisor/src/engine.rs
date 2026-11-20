@@ -63,6 +63,8 @@ pub struct SupervisorCore {
     /// Prompt loop gated by Pause/Resume without touching the session.
     pub paused: bool,
     pub ticket: Option<String>,
+    /// The custom objective of the current run, when it owns no ticket.
+    pub custom_objective: Option<String>,
     pub revision: Option<String>,
     /// The runtime that executes objectives. Set when the controller is
     /// wired: it is what makes a rehearsal visible as a rehearsal, and
@@ -105,6 +107,7 @@ pub fn default_core(project: impl Into<String>) -> SupervisorCore {
         run: None,
         paused: false,
         ticket: None,
+        custom_objective: None,
         revision: None,
         runtime: None,
         objective: None,
@@ -311,6 +314,100 @@ pub fn apply_renewal(
     record_action(core, answer)
 }
 
+/// What one Start asks the controller to run.
+struct StartRequest<'a> {
+    project: &'a str,
+    ticket: Option<&'a str>,
+    revision: Option<&'a str>,
+    /// A custom objective owns no ticket: it never claims or closes work.
+    objective: Option<&'a str>,
+}
+
+fn apply_start(
+    core: &mut SupervisorCore,
+    action: &SupervisorAction,
+    request: StartRequest<'_>,
+) -> ActionOutcome {
+    let project = request.project;
+    if project != core.project {
+        // One controller PER PROJECT: a Start naming another project is
+        // refused, not applied under a different name.
+        return outcome(
+            action,
+            false,
+            format!(
+                "project mismatch: this supervisor serves '{}', not '{project}'",
+                core.project
+            ),
+        );
+    }
+    if core.runtime.is_none() {
+        // No runtime, no objective: the controller refuses instead of
+        // pretending that a run started.
+        return outcome(
+            action,
+            false,
+            "no runtime is wired: this supervisor cannot execute an objective yet",
+        );
+    }
+    if core.run.as_ref().is_some_and(|run| run.is_live()) {
+        // One exclusive controller: a run that is STARTING counts as in
+        // flight, or two controllers would share the state.
+        return outcome(
+            action,
+            false,
+            "a run is already in flight: not a second controller",
+        );
+    }
+    if core.winding_down {
+        // The stopped attempt may still be releasing its sandbox and its
+        // session: a new one would run beside it.
+        return outcome(
+            action,
+            false,
+            "the previous attempt is still winding down: one attempt at a time",
+        );
+    }
+    core.epoch += 1;
+    let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
+    // The run is STARTING, not running: nothing has confirmed that the
+    // work began.
+    core.run = Some(RunState::pending(grant, "supervisor-session"));
+    core.ticket = request.ticket.map(str::to_string);
+    core.custom_objective = request.objective.map(str::to_string);
+    core.revision = request.revision.map(str::to_string);
+    core.paused = false;
+    // The verdict of the PREVIOUS objective is not this run's verdict: a
+    // snapshot in `starting` must not show it.
+    core.objective = None;
+    core.stop_reason = None;
+    let detail = match core.custom_objective.clone() {
+        Some(objective) => {
+            // The custom objective is its own goal scope: the record says
+            // so once, without pretending a ticket exists.
+            emit_event(
+                core,
+                "goal/scope",
+                serde_json::json!({
+                    "scope": "custom-objective",
+                    "objective": objective,
+                    "ticket": serde_json::Value::Null,
+                }),
+                Provenance::Human,
+            );
+            format!(
+                "starting the custom objective '{objective}' for {project} (epoch {}); it owns no ticket; awaiting the runtime's confirmation",
+                core.epoch
+            )
+        }
+        None => format!(
+            "starting for {project} (epoch {}); awaiting the runtime's confirmation",
+            core.epoch
+        ),
+    };
+    outcome(action, true, detail)
+}
+
 /// Apply a client action. Every refusal is a REAL answer with its reason —
 /// never a silent no-op dressed as success.
 pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutcome {
@@ -319,67 +416,26 @@ pub fn apply(core: &mut SupervisorCore, action: SupervisorAction) -> ActionOutco
             project,
             ticket,
             revision,
-        } => {
-            if project != &core.project {
-                // One controller PER PROJECT: a Start naming another
-                // project is refused, not applied under a different name.
-                outcome(
-                    &action,
-                    false,
-                    format!(
-                        "project mismatch: this supervisor serves '{}', not '{project}'",
-                        core.project
-                    ),
-                )
-            } else if core.runtime.is_none() {
-                // No runtime, no objective: the controller refuses instead
-                // of pretending that a run started.
-                outcome(
-                    &action,
-                    false,
-                    "no runtime is wired: this supervisor cannot execute an objective yet",
-                )
-            } else if core.run.as_ref().is_some_and(|run| {
-                // One exclusive controller: a run that is STARTING counts as
-                // in flight, or two controllers would share the state.
-                run.is_live()
-            }) {
-                outcome(
-                    &action,
-                    false,
-                    "a run is already in flight: not a second controller",
-                )
-            } else if core.winding_down {
-                // The stopped attempt may still be releasing its sandbox
-                // and its session: a new one would run beside it.
-                outcome(
-                    &action,
-                    false,
-                    "the previous attempt is still winding down: one attempt at a time",
-                )
-            } else {
-                core.epoch += 1;
-                let grant = Grant::new(project, "supervisor-run", core.epoch, vec![]);
-                // The run is STARTING, not running: nothing has confirmed
-                // that the work began.
-                core.run = Some(RunState::pending(grant, "supervisor-session"));
-                core.ticket = ticket.clone();
-                core.revision = revision.clone();
-                core.paused = false;
-                // The verdict of the PREVIOUS objective is not this run's
-                // verdict: a snapshot in `starting` must not show it.
-                core.objective = None;
-                core.stop_reason = None;
-                outcome(
-                    &action,
-                    true,
-                    format!(
-                        "starting for {project} (epoch {}); awaiting the runtime's confirmation",
-                        core.epoch
-                    ),
-                )
-            }
-        }
+        } => apply_start(
+            core,
+            &action,
+            StartRequest {
+                project,
+                ticket: ticket.as_deref(),
+                revision: revision.as_deref(),
+                objective: None,
+            },
+        ),
+        SupervisorAction::StartObjective { project, objective } => apply_start(
+            core,
+            &action,
+            StartRequest {
+                project,
+                ticket: None,
+                revision: None,
+                objective: Some(objective),
+            },
+        ),
         SupervisorAction::Pause => {
             if core.paused {
                 outcome(&action, false, "already paused")
@@ -652,6 +708,7 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
             .unwrap_or(Phase::Idle),
         paused: core.paused,
         ticket: core.ticket.clone(),
+        goal: core.custom_objective.clone(),
         revision: core.revision.clone(),
         runtime: core.runtime.clone(),
         objective: core.objective.clone(),
@@ -759,6 +816,34 @@ mod tests {
             start.detail
         );
         assert!(core.run.is_none());
+    }
+
+    #[test]
+    fn a_custom_objective_start_records_a_goal_without_a_ticket() {
+        let mut core = wired("gc");
+        let start = apply(
+            &mut core,
+            SupervisorAction::StartObjective {
+                project: "gc".into(),
+                objective: "summarise the docs".into(),
+            },
+        );
+        assert!(start.applied, "{start:?}");
+        assert_eq!(core.ticket, None, "a custom objective owns no ticket");
+        assert_eq!(core.custom_objective.as_deref(), Some("summarise the docs"));
+        assert!(start.detail.contains("owns no ticket"), "{}", start.detail);
+        // The goal scope and the run are distinguished in the record.
+        let snapshot = snapshot(&core);
+        assert_eq!(snapshot.goal.as_deref(), Some("summarise the docs"));
+        assert_eq!(snapshot.ticket, None);
+        assert_eq!(snapshot.epoch, 1);
+        assert!(
+            core.events
+                .iter()
+                .any(|event| event.kind == "goal/scope"
+                    && event.payload["scope"] == "custom-objective"),
+            "the goal scope is an event of the run"
+        );
     }
 
     #[test]

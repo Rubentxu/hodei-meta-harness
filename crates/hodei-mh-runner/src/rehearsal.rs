@@ -21,7 +21,8 @@ use verify::transport::TransportDigest;
 
 use crate::core::GoalRunner;
 use crate::ports::{
-    AgentError, AgentPort, Objective, ObjectiveCheck, Publication, PublisherError, PublisherPort,
+    AgentError, AgentPort, Closed, Closes, Objective, ObjectiveCheck, Publication, PublisherError,
+    PublisherPort,
     RequirementsError, RequirementsPort, Verification, VerifierError, VerifierPort,
 };
 
@@ -88,6 +89,8 @@ impl RequirementsPort for ScriptedRequirements {
                 id: "AC-1".into(),
                 command: format!("rehearse {}", item.id),
             })],
+            run: None,
+            closes: Closes::Ticket,
         })
     }
 }
@@ -184,7 +187,7 @@ impl PublisherPort for RecordingPublisher {
         let publication = Publication {
             revision: candidate.revision.as_str().to_string(),
             // The rehearsal closes nothing.
-            closed: false,
+            closure: Closed::Unconfirmed,
             detail: format!(
                 "the rehearsal recorded the publication of {}; nothing was closed and no ref moved",
                 objective.work_ref
@@ -406,6 +409,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -418,7 +422,7 @@ mod tests {
         let recorded = runtime.publications();
         assert_eq!(recorded.len(), 1);
         // The rehearsal closed nothing and moved no ref.
-        assert!(!recorded[0].closed);
+        assert_eq!(recorded[0].closure, Closed::Unconfirmed);
         assert!(recorded[0].detail.contains("nothing was closed"));
     }
 
@@ -431,6 +435,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -459,6 +464,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: Some("TASK-9".into()),
+                    objective: None,
                 },
             ),
         )
@@ -474,7 +480,7 @@ mod tests {
         // The rehearsal still closed nothing: the recording says so.
         let recorded = runtime.publications();
         assert_eq!(recorded.len(), 1);
-        assert!(!recorded[0].closed);
+        assert_eq!(recorded[0].closure, Closed::Unconfirmed);
     }
 
     #[tokio::test]
@@ -491,6 +497,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: Some("TASK-9".into()),
+                    objective: None,
                 },
             )
             .await
@@ -510,6 +517,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await
@@ -529,6 +537,7 @@ mod tests {
                 ObjectiveRequest {
                     project: "trial".into(),
                     work_ref: None,
+                    objective: None,
                 },
             )
             .await

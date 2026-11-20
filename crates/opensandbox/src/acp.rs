@@ -84,6 +84,21 @@ pub fn encode_response(id: Value, result: Value) -> String {
         + "\n"
 }
 
+/// Encode a JSON-RPC error response for an incoming request id. It is the
+/// answer an unsupported interaction gets, so the peer stops waiting.
+pub fn encode_error(id: Value, code: i64, message: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message},
+    })
+    .to_string()
+        + "\n"
+}
+
+/// The JSON-RPC code of a method this client does not implement.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 /// True when the message is a request carrying one of the expected methods.
 pub fn is_method(message: &Value, method: &str) -> bool {
     message.get("method").and_then(|m| m.as_str()) == Some(method)
@@ -162,6 +177,16 @@ mod tests {
         assert_eq!(value["method"], "initialize");
         assert_eq!(value["params"]["protocolVersion"], 1);
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn an_error_response_carries_the_reason_and_the_method_code() {
+        let text = encode_error(json!(9), METHOD_NOT_FOUND, "unsupported interaction");
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], 9);
+        assert_eq!(value["error"]["code"], -32601);
+        assert_eq!(value["error"]["message"], "unsupported interaction");
+        assert!(value.get("result").is_none());
     }
 
     #[test]
