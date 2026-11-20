@@ -273,6 +273,10 @@ async fn acp_probe(args: &[String]) -> i32 {
     let mut sandbox_id: Option<String> = None;
 
     let client = ControlPlane::new(server);
+    // The ledger of the residues is DURABLE: it is reconciled BEFORE the
+    // new sandbox exists, so a sandbox a previous probe could not release
+    // is released here instead of lingering on the host.
+    let registry = CleanupRegistry::durable(CleanupRegistry::default_journal_path());
     let report = |checks: &[ProbeCheck], sandbox: Option<String>, elapsed: Duration, exit: i32| {
         let summary = json!({
             "task": "TASK-1",
@@ -292,6 +296,23 @@ async fn acp_probe(args: &[String]) -> i32 {
         );
         std::process::exit(exit);
     };
+
+    // A residue a previous run could not release is reconciled before a
+    // new sandbox is created. One that cannot be released stays journaled
+    // and is reported as a failed check: a residue nobody reports is a
+    // residue nobody reconciles.
+    let unreleased = registry.reconcile_sandboxes(&client).await;
+    if !unreleased.is_empty() {
+        checks.push(ProbeCheck {
+            name: "cleanup-reconcile",
+            passed: false,
+            detail: unreleased
+                .iter()
+                .map(|pending| pending.describe())
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
 
     // 1. Create sandbox through the hodei-mh lifecycle server.
     let create = client
@@ -342,9 +363,10 @@ async fn acp_probe(args: &[String]) -> i32 {
     });
 
     // Cleanup guarantee: delete the sandbox however we exit. The guard
-    // registers the sandbox while the deletion is not confirmed, so an
-    // early return or a cancellation never leaves an unrecorded residue.
-    let mut cleanup = CleanupGuard::sandbox(sid.clone(), CleanupRegistry::new());
+    // registers the sandbox in the durable ledger while the deletion is
+    // not confirmed, so an early return or a cancellation never leaves an
+    // unrecorded residue.
+    let mut cleanup = CleanupGuard::sandbox(sid.clone(), registry.clone());
 
     // 2. Resolve the execd endpoint.
     let endpoint = client

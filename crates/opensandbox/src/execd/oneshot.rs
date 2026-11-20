@@ -109,6 +109,12 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// that follow reuse it. A lost session invalidates it, because the
 /// execd behind the address may be a different server now.
 pub async fn ensure_ready(client: &ExecdClient, deadline: Deadline) -> bool {
+    // A spent budget is a refusal, cached readiness or not: the command
+    // would start with no time left and could never finish inside the
+    // budget of the operation.
+    if deadline.expired() {
+        return false;
+    }
     if client.readiness_is_current() {
         return true;
     }
@@ -437,21 +443,21 @@ pub async fn run(client: &ExecdClient, command: &str, deadline: Deadline) -> One
         }
     }
 
-    // The cleanup of the session shares the budget of the operation: a
-    // cleanup that cannot happen is REGISTERED, never lost.
-    let mut cleanup = crate::cleanup::CleanupGuard::execd_session(
-        client.endpoint().to_string(),
-        session.session_id.clone(),
-        client.cleanup_registry().clone(),
-    );
+    // The cleanup of the session shares the budget of the operation. A
+    // session lives inside its sandbox and dies with it, so a deletion
+    // that fails is NOT a host residue: it is reported and the operation
+    // does not pretend it was released.
     let cleanup_budget = deadline.remaining();
-    if cleanup_budget.is_zero() {
-        cleanup.fail("the budget of the operation left no time for the cleanup");
-    } else if crate::cleanup::cleanup_session(client, &mut cleanup, cleanup_budget)
-        .await
-        .is_err()
+    if !cleanup_budget.is_zero()
+        && let Err(error) = client
+            .delete_session(&session.session_id, cleanup_budget)
+            .await
     {
-        // The guard already registered the residue.
+        tracing::warn!(
+            session = %session.session_id,
+            %error,
+            "the execd session could not be deleted; it dies with its sandbox"
+        );
     }
 
     // The completeness of the output, measured against what the execd

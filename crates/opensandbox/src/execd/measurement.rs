@@ -20,6 +20,39 @@ const COMMANDS: usize = 20;
 /// The budget of one command.
 const COMMAND_BUDGET: Duration = Duration::from_secs(5);
 
+/// The most HTTP requests one session may cost: create, session state,
+/// delete and the WebSocket upgrade of the attach.
+const MAX_HTTP_REQUESTS_PER_SESSION: usize = 4;
+
+/// The most pipe attachments one session may cost: the live stream. A
+/// replay is only attached when the live stream lost bytes, and the
+/// cooperative fake delivers all of them.
+const MAX_PIPE_ATTACHES_PER_SESSION: usize = 1;
+
+/// The baseline of the transport BEFORE the readiness was cached.
+///
+/// It comes from the previous `run_when_ready`: every call ran the
+/// bounded readiness wait (`wait_until_ready`) and then the command, so
+/// the readiness was paid once per command — `COMMANDS` readiness probes
+/// and two sessions (the probe and the command) for each of the
+/// `COMMANDS` commands.
+#[derive(Debug, Clone, Copy)]
+struct Baseline {
+    /// The readiness probes of the previous transport.
+    probes: usize,
+    /// The sessions of the previous transport.
+    creates: usize,
+    /// The deletions of the previous transport.
+    deletes: usize,
+}
+
+/// One readiness probe and one command session per command.
+const BASELINE: Baseline = Baseline {
+    probes: COMMANDS,
+    creates: COMMANDS * 2,
+    deletes: COMMANDS * 2,
+};
+
 /// What the measurement observed.
 #[derive(Debug, Clone)]
 pub struct Measurement {
@@ -122,6 +155,10 @@ async fn the_transport_is_measured_against_a_local_fake_execd() {
         p95_ms: percentile(&sorted, 0.95),
     };
     println!("MEASUREMENT {}", measurement.summary());
+    println!(
+        "BASELINE probes={} creates={} deletes={} (the previous one probe per command)",
+        BASELINE.probes, BASELINE.creates, BASELINE.deletes
+    );
     assert_eq!(
         measurement.commands, COMMANDS,
         "every command was run exactly once"
@@ -129,6 +166,73 @@ async fn the_transport_is_measured_against_a_local_fake_execd() {
     assert_eq!(
         measurement.probes, 1,
         "the readiness of the generation is observed once"
+    );
+    assert!(
+        measurement.probes < BASELINE.probes,
+        "the readiness is no longer paid per command: {} probes, baseline {}",
+        measurement.probes,
+        BASELINE.probes
+    );
+    assert_eq!(
+        measurement.creates,
+        measurement.commands + measurement.probes,
+        "one session per command, plus the single readiness probe"
+    );
+    assert_eq!(
+        measurement.deletes, measurement.creates,
+        "every session the transport opened was deleted"
+    );
+    assert!(
+        measurement.http_requests <= measurement.creates * MAX_HTTP_REQUESTS_PER_SESSION,
+        "{} HTTP requests for {} sessions exceed the bound of {} per session",
+        measurement.http_requests,
+        measurement.creates,
+        MAX_HTTP_REQUESTS_PER_SESSION
+    );
+    assert!(
+        measurement.pipes <= measurement.creates * MAX_PIPE_ATTACHES_PER_SESSION,
+        "{} pipe attaches for {} sessions exceed the bound of {} per session",
+        measurement.pipes,
+        measurement.creates,
+        MAX_PIPE_ATTACHES_PER_SESSION
+    );
+}
+
+#[tokio::test]
+async fn a_spent_budget_is_refused_even_when_the_readiness_is_cached() {
+    // The readiness of the generation is already observed: a cache hit
+    // must NOT buy a command a budget that is already spent.
+    let fake = FakeExecd::start(FakeBehavior::Cooperative).await;
+    let client = client_of(&fake);
+    let first =
+        oneshot::run_when_ready(&client, &command_of(0), Deadline::in_budget(COMMAND_BUDGET)).await;
+    assert!(first.succeeded(), "the first command did not succeed");
+    assert!(
+        client.readiness_is_current(),
+        "the readiness of the generation is cached"
+    );
+    let before = fake.counts();
+
+    let outcome =
+        oneshot::run_when_ready(&client, &command_of(1), Deadline::in_budget(Duration::ZERO)).await;
+    assert!(
+        outcome.not_accepted(),
+        "a spent budget is refused: {outcome:?}"
+    );
+    assert!(
+        !outcome.uncertain(),
+        "the command never ran, so the result is not uncertain"
+    );
+
+    let after = fake.counts();
+    assert_eq!(
+        after.creates, before.creates,
+        "no session was opened with a spent budget"
+    );
+    assert_eq!(
+        after.times(&command_of(1)),
+        0,
+        "the real command never ran with a spent budget"
     );
 }
 

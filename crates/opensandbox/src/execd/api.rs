@@ -18,6 +18,10 @@ pub enum ExecdApiError {
     Status { status: u16, body: String },
     #[error("invalid JSON from execd: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    /// The transport of the client itself could not be built: nothing was
+    /// sent and no session exists.
+    #[error("the HTTP client of the execd is unavailable: {0}")]
+    ClientUnavailable(String),
 }
 
 #[derive(Debug, Serialize)]

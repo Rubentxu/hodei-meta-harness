@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use hodei_mh_workspace::git as workspace_git;
+use opensandbox::cleanup::CleanupRegistry;
 use promote::git as promote_git;
 use verify::evidence::{CheckBinding, EvidenceSet};
 use verify::git::{GitRevision, GitTree, Progress, tree_progress};
@@ -230,6 +231,7 @@ pub async fn run(server: &str, image: &str) -> i32 {
     let runner = CleanRunner {
         lifecycle_url: server.to_string(),
         image: image.to_string(),
+        journal: CleanupRegistry::default_journal_path(),
         timeout: Duration::from_secs(3),
     };
     let bundle_bytes = read_file(&repo.bundle);
