@@ -1,10 +1,10 @@
 ---
 id: TASK-41
 title: Visibilizar fallos silenciosos y estados muertos del bucle vivo
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T14:01:00Z'
+updated_date: '2026-11-20T14:22:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -42,4 +42,12 @@ Ronda 1 entregada en rama task/task-41-visibility (commits a7153e3, 052be7c, cdf
 - Hallazgo nuevo: drive_agent (agent.rs:660-669) hace busy-spin si pipe.next_event() devuelve None inmediatamente (socket cerrado limpio) — el timeout interno de 10 s envuelve la espera, no el reintento; hay que dormir o cortar el loop en Ok(None). Va en ronda 2, con prueba del corte.
 
 Ronda 1 integrada en main (merge fa7dde5). Reconciliación tras el rebase sobre 2986261: el worker de TASK-35 había refactorizado interaction_answer(-> Option<(Value,String)>), la r1 introduce el refusal como tercer elemento Option<Value>. Shape final: permission_answer -> (Value,String,Option<Value>) y interaction_answer -> Option<(String,String,Option<Value>)>; AcpTurn { completed, summary, interactions, refusal }; refusal exit anexa también interactions (commit 5459479) para que ambas salidas sean comparables. fast-check --all PASS; 22 tests live::agent; 122 binarios. Ninguna llamada externa cambió (permission_answer/interaction_answer/AcpTurn no se usan fuera de agent.rs). Ronda 2 en curso (ab332294) en task/task-41-round2 sobre main: (A) StoreClaims::release propaga error, (B) NoNewCommit decidir producir/eliminar, (C) install stops pendientes, (D) main.rs:704 mirrored tail, (E) busy-spin Ok(None).
+
+Ronda 2 entregada y integrada en main (merge posterior a ebb5fc8; task/task-41-round2 rebase sobre main limpio). Commits rebasados: 99c15ef (A+B+C), 43a3475 (E), 2f6308f (D). fast-check --all PASS (el primer run marcó un fallo parpadeante en snapshot_parses_pinned_cli_fixture_script en hodei-mh-tracker; la ejecución individual y el segundo run del lane lo confirman verde; no es regresión).
+A: ClaimPort::release devuelve Result con ClaimReleaseError tipado (runner/live.rs:51,67). AttemptEnd::UncertainRelease conserva el end interior con describe(),Outcome "the claim release did not complete: {cause}" en runner/live.rs:229. Slot interior release_failed en ClaimGuard (live.rs:252) drenado por take_release_error en live.rs:284 al terminal en handle() (615-635); Drop no panic. claims.rs:64-83 propaga. Prueba nueva a_refused_claim_release_ends_the_run_as_an_uncertain_release (runner/live.rs:2422) con store que falla offline, sin sandbox.
+B: NoNewCommit eliminado — AgentFailed conserva la causa "no changes" sin abrir una variante nueva; el doc en live.rs:149-154 explica por qué desapareció. Prueba an_agent_with_no_candidate_changes_carries_its_cause_and_never_promotes (live.rs:2477): publisher no se llama, claim liberado, resultado Failed con "no changes", no timeout.
+C: Invariante PROBADa sin ampliar semántica: install() doc en live.rs:326-340 + prueba a_pending_stop_superseded_by_a_newer_install_starts_and_cancels_nothing (live.rs:2516) demuestra que un stop pendiente de run anterior no arranca ni cancela tras install nuevo. No hay stops huérfanos.
+D: main.rs readable_tail/prompt_response_detail helpers (main.rs:625,633) en el probe; el site quedó en main.rs:727. Prueba nueva the_prompt_response_detail_keeps_the_agent_text_tail_readable en main.rs:799 en un módulo tests creado (no existía).
+E: drive_agent Ok(None) ahora break con reason propia (agent.rs:699-712 y 786-799): "the pipe closed cleanly before the turn completed". Prueba a_cleanly_closed_pipe_ends_the_turn_at_once_with_its_own_reason (agent.rs:1366): fake agotado, termina instantáneo, sin "timeout", sin sleep.
+Cinco de cinco. AC1-AC3 de TASK-41 cubiertas con tests offline; AC4 no pedida (descubrimiento sin AC explícito). Tarea marcada Done tras la aceptación del supervisor.
 <!-- SECTION:NOTES:END -->
