@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /home/rdcabrera/Proyectos/rust/goal-cycle-mh && backlog board 2>&1 | head -200)"
+    ]
+  }
+}
