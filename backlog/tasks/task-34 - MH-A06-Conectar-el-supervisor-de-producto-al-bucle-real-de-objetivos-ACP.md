@@ -4,7 +4,7 @@ title: '[MH-A06] Conectar el supervisor de producto al bucle real de objetivos A
 status: In Progress
 assignee: []
 created_date: '2026-11-18T11:50:00Z'
-updated_date: '2026-11-20T10:22:00Z'
+updated_date: '2026-11-20T10:53:00Z'
 labels:
   - audit-v0.2
   - product
@@ -36,8 +36,8 @@ Revisión de referencia: 3d33f85a63bc59a7e814f5f205e546758c943b61.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Un repo externo con Backlog.md y dos tickets dependientes se ejecuta mediante CLI de producto y ACP real; el segundo recibe el commit promovido del primero.
-- [ ] #2 Start/Pause/Resume/Stop corresponden a efectos confirmados u objetivos explícitamente pendientes/inciertos; Renew solo confirma si backend lo confirma, si no Unsupported.
+- [x] #1 Un repo externo con Backlog.md y dos tickets dependientes se ejecuta mediante CLI de producto y ACP real; el segundo recibe el commit promovido del primero.
+- [x] #2 Start/Pause/Resume/Stop corresponden a efectos confirmados u objetivos explícitamente pendientes/inciertos; Renew solo confirma si backend lo confirma, si no Unsupported.
 - [ ] #3 Candidato fallido o permiso negado no promociona ni cierra; objetivo sin trabajo no consume sandbox ni tokens.
 - [ ] #4 La UAT usa el propio binario, conserva evidencia de SHA, cierre, cancelación y liberación; los probes equivalentes se sustituyen solo tras comprobar paridad.
 <!-- AC:END -->
@@ -60,4 +60,6 @@ Revisión independiente (contexto nuevo, solo lectura) sobre f3dcec5: veredicto 
 Hueco del bucle detectado en la UAT en vivo (repo-a): tras confirmar TASK-1 (a0e3c3e promovido y cerrado), el supervisor queda phase=running sin sandbox ni nuevo evento durante más de 5 min; engine.rs:560-620 mantiene el run vivo ('the objective held: the session continues') pero server.rs:616-680 no encadena la siguiente selección, y un segundo Start se rechaza ('a run is already in flight'). El único avance es un Stop, semánticamente falso tras un éxito. Se corrige en la rama task/task-34-fixes junto con los hallazgos verificados (a)-(e) de la revisión.
 
 UAT en vivo, segunda observación (epoch 2 de uat3, repos3/repo-a): tras el stop honesto de la epoch 1, un nuevo Start sobre TASK-2 fue confirmado por el runtime y ejecutó un turno ACP real, pero el turno agotó el AGENT_TIMEOUT fijo de 180 s (live/agent.rs:50) y el run terminó como failed ('the agent did not finish its turn: timeout'); el branch quedó en a0e3c3e (sin segundo commit) y el stop posterior es honesto. El texto de cola del timeout aparece espejado por un bug de presentación registrado en TASK-41. El límite de 180 s es una constante de producto, no configurable: si el proveedor tarda más, el objetivo no puede completarse; se reintenta la UAT y, si el timeout se repite con un turno que ya estaba produciendo tool calls, se abrirá un descubrimiento específico en lugar de relajar la evidencia.
+
+UAT en vivo run 3 (binarios del merge f3dcec5: hodei-mh sha256 3230d360…, lifecycle-server 961241f7…; evidencia en /tmp/uat-task34/evidence3). AC1 PASS: con un agente ACP real (cuenta-1, MiniMax-M3.1-Flash) y solo CLI de producto, hodei-mh/main avanzó edd22ab -> a0e3c3e 'chore(work): verified work for TASK-1' -> f7a6650 '…TASK-2'; git merge-base --is-ancestor a0e3c3e f7a6650 rc=0 (A_ancestry.txt); hello.txt en ambos y second.txt añadido por el segundo (A_files.txt); autor/committer del host (A_authors.txt), hooks de git-control aceptados; tablero TASK-1 Done 2/2 y TASK-2 Done 1/1 (A_board.txt). 16m43s. Se marca AC1: el requisito observable (dos tickets dependientes ejecutados por ACP real, el segundo recibe el commit promovido del primero) está demostrado, con la salvedad de que el segundo exigió un Stop+Start manual porque el encadenamiento automático sigue roto (se corrige en task/task-34-fixes). AC2 PASS y marcado: Stop después de observar la promoción 6c1695a -> applied=true 'the recorded verdict of the objective stands', evento objective/cancelled uncertain=false, branch intacto y TASK-2 sin tocar (B_timeline.txt, B_events.jsonl); pause/resume ya probados en evidence2; Renew responde Unsupported explícito con applied=false. AC3 NO se marca: el candidato insatisfacible no promociona ni cierra (21b43e4 igual antes y después, ticket To Do, claims [], 0 sandboxes; C_*) y el tablero vacío no consume sandbox ni tokens, pero la rama de permiso denegado no es demostrable: con --permission deny no se promociona ni se cierra (D_sha_before/after iguales, D_board To Do, claims liberados) y SIN EMBARGO no hay ningún evento de denegación; agent.rs contesta el session/request_permission con outcome 'cancelled' sin emitir evento, y ambos epochs terminan como timeout de 180 s indistinguibles de un modelo lento (D_denial_gap.txt, D_events.jsonl). Defecto registrado en TASK-41; AC4 no se marca hasta repetir la UAT contra el binario con las correcciones integradas. Nota de fixture: hacer insatisfacible un check real cuesta 4 intentos (14m30s); la versión neutra gated fuera del árbol es la que funciona (C_poll.txt). Liberación verificada por el supervisor: 0 contenedores sandbox, 0 redes del lifecycle, 0 procesos supervisor/server, hodei-proxy intacto; 0 ficheros con el token del perfil en evidence3/state3/repos3.
 <!-- SECTION:NOTES:END -->

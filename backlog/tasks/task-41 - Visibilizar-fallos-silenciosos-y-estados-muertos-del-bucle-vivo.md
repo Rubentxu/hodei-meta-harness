@@ -4,7 +4,7 @@ title: Visibilizar fallos silenciosos y estados muertos del bucle vivo
 status: To Do
 assignee: []
 created_date: '2026-11-20T10:16:00Z'
-updated_date: '2026-11-20T10:22:00Z'
+updated_date: '2026-11-20T10:53:00Z'
 labels:
   - descubrimiento
 dependencies: []
@@ -29,4 +29,6 @@ Descubrimiento de la revisión independiente de TASK-34 (linea base f3dcec5), fu
 
 <!-- SECTION:NOTES:BEGIN -->
 Cuarto hallazgo (UAT en vivo 11:21, época 2 de uat3): el resumen de timeout del agente imprime el texto espejado. agent.rs:563-565 hace agent_text.chars().rev().take(200) para quedarse con la cola y lo formatea sin invertirlo de nuevo, así que el error muestra '...ti etaerc em teL' en lugar de 'Let me create it...'. No hay corrupción del stream: es un mensaje de fallo engañoso (bajo impacto, alta confusión). Corregir con prueba que afirme la cola legible.
+
+Quinto hallazgo (UAT run 3, escenario D con --permission deny, 11:43-11:50): la denegación de permiso es invisible para el consumidor. crates/hodei-mh/src/live/agent.rs responde al session/request_permission con {"outcome":{"outcome":"cancelled"}} y no emite ningún evento; los dos epochs terminaron como 'the agent did not finish its turn: timeout' a los 180 s y la única traza de la denegación quedó en el text_tail. Un observador no puede distinguir 'permiso denegado por política' de 'modelo lento', así que la AC3(ii) de TASK-34 no puede darse por demostrada. Arreglo exigible: emitir un evento explícito de denegación (herramienta, motivo, política aplicada) y que el resultado del run lo refleje como rechazo con causa en lugar de timeout genérico; prueba determinista con el fake de ACP, sin sandbox y sin dormir.
 <!-- SECTION:NOTES:END -->
