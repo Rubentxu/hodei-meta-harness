@@ -3,7 +3,7 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
-updated_date: '2026-11-20T19:31:00Z'
+updated_date: '2026-11-20T20:13:00Z'
 ---
 # Handoff
 
@@ -12,56 +12,61 @@ updated_date: '2026-11-20T19:31:00Z'
 
 ## Ahora
 
-- **El tablero está completo (51/51 `Done`) pero el CI de `main` tiene el carril de sondas
-  ROJO.** No lo cierres como si todo estuviera verde: el `workspace gate` (fmt, clippy, suite
-  completa) pasa, pero la `probe lane` falla desde 2026-11-20T11:13Z. Run 44799959858:
-  `workspace gate` SUCCESS, `probe lane` FAILURE.
-- **TASK-52** (creada en esta sesión, `In Progress`) recoge el defecto: `supervisor-probe` tiene
-  4 checks en rojo y `multiproject-probe` 1 step. Los checks afirman un run estable en fase
-  `running`; tras el encadenamiento de objetivos (TASK-34) el runtime de ensayo confirma al
-  instante y la época 1 termina, así que esa fase es transitoria. Worker en
-  `../wt-task52` (rama `task/task-52-probe-lane`) y revisión independiente en paralelo.
-  Reproducción local (mismos fallos): hay que arrancar el proxy de egreso, porque
-  `scripts/probes.sh` no corre sin él:
-  ```
-  docker run -d --name hodei-local-egress --network bridge -p 127.0.0.1:18888:8888 \
-    -v "$PWD/scripts/egress-proxy.py:/opt/egress-proxy.py:ro" \
-    --entrypoint python3 rust:1-bookworm /opt/egress-proxy.py \
-    --bind 0.0.0.0 --port 8888 --allow-prefix 172.16.0.0/12
-  HODEI_MH_EGRESS_PROXY_CONTAINER=hodei-local-egress \
-  HODEI_MH_PROXY_CHECK_URL=http://127.0.0.1:18888 \
-  HODEI_MH_CONTROL_TOKEN="$(openssl rand -hex 32)" \
-  scripts/probes.sh --rounds 1 --probe "supervisor-probe multiproject-probe"
-  ```
+- **El tablero está cerrado: 54/54 tareas `Done`, ninguna elegible pendiente.** Y el CI de
+  `main` está en verde de verdad: run `44808413572` con `workspace gate` SUCCESS y
+  `probe lane` SUCCESS (las seis sondas). PRs fusionados en las últimas 48 h: 15; commits:
+  136.
 - **Repo**: `hodei-meta-harness` (`/home/rdcabrera/Proyectos/rust/goal-cycle-mh`), en `main`
-  (`8b3ab72`), sincronizado con `origin/main`. Árbol limpio salvo `.qoder/` (ajeno, sin
-  versionar). Sin stashes, sin worktrees sueltos, sin ramas de tarea pendientes.
-- **Tarea abierta**: solo TASK-52. Todo lo demás está `Done` (33 → 51 durante el día, con
-  TASK-34, TASK-35, TASK-36, TASK-40…TASK-46 y la tanda de documentación TASK-47…TASK-51).
+  (`8d20acb`), sincronizado con `origin/main`, árbol limpio. Sin stashes, sin worktrees, sin
+  ramas de tarea, sin PRs abiertos. Otra sesión trabaja en paralelo en este mismo repo
+  (TASK-53/TASK-54, ambas cerradas), así que `main` puede avanzar sin que seas tú.
+- **Residuo ajeno observado en el host** (no es de este ciclo, no lo he tocado): los
+  contenedores `hodei-proxy` (un `sleep infinity` de otra sesión) y `hodei-uat-proxy4` siguen
+  levantados. El proxy que usa el carril de sondas es el que levanta `scripts/probes.sh` o el
+  que se arranca a mano con `HODEI_MH_EGRESS_PROXY_CONTAINER`; uno de los dos lo ocupa.
 
 ## Última tarea cerrada
 
-- **TASK-51 — Índice de documentación de usuario en `docs/README.md`** (3/3 AC), mergeada y con
-  la evidencia en el tablero. Precedida por TASK-47…TASK-50 (referencia CLI, quickstart,
-  configuración, troubleshooting) y por TASK-34…TASK-46 (bucle vivo, credenciales, visibilidad
-  de fallos, JSONL de eventos y correcciones de sondas).
+- **TASK-52 — El carril de sondas rojo en `main`** (4/4 AC), mergeada en PR #49 (`8d20acb`).
+  - El tablero decía "51/51 Done" y aun así el `probe lane` estaba rojo: las sondas afirmaban
+    un run estable en fase `running` que el encadenamiento de objetivos de TASK-34 ya no
+    sostiene (el runtime de ensayo confirma al instante y la época termina en milisegundos).
+  - Las sondas se reapuntaron al invariante real: el journal (`sup-events --jsonl`) debe
+    mostrar la época aplicada, confirmada por el runtime y cerrada por su veredicto; la CLI y
+    la TUI deben llevar el mismo valor en los doce campos del contrato de snapshot; el viewer
+    debe dejar el estado intacto antes y después; y un `Stop` solo es honesto si paró un run
+    vivo o si el journal prueba que el veredicto de fin es anterior a la acción.
+  - Ningún check se borró ni se volvió constante, y el `detail` de cada uno cuenta lo observado
+    (uno de ellos afirmaba "the confirmation never happened" cuando el journal mostraba la
+    confirmación).
 
 ## Aprendido
 
-- **El tablero puede estar completo y el CI rojo a la vez.** "51/51 Done" no es evidencia de
-  que el carril de integración pase: audita los artefactos del run, no solo el tablero.
-- **Los artefactos del carril se descargan**: `gh run download <run-id> -D <dir>` (desde dentro
-  del repo, si no `gh` no infiere el repositorio) y ahí está el JSON de cada probe con el check
-  que falló y su `detail`. Es la evidencia primaria del fallo.
-- **El `detail` de un check puede mentir**: `attached-terminal-read-only-and-disconnect-is-inert`
-  imprimía "still running" por construcción, mientras observaba otra cosa. Los detalles deben
-  contar lo observado.
+- **"Todo Done" no es lo mismo que "el CI pasa".** Audita el tablero Y los artefactos del run
+  (`gh run download <run> -D <dir>`, desde dentro del repo: si no, `gh` no infiere el
+  repositorio). El JSON de cada probe dice qué check falló y por qué.
+- **Una regresión se acota comparando el run verde con el primero rojo**: el delta entre ambos
+  commits es el culpable, y si no toca el fichero que falla, la culpa es del entorno del
+  check, no del código que comprueba. Aquí el delta era exactamente el commit de encadenamiento.
+- **Un `detail` de check puede mentir por construcción.** `attached-terminal-read-only…`
+  imprimía "still running" sin observarlo. Los detalles se escriben a partir de lo medido.
+- **Un check que no puede fallar es peor que un check rojo**: el del viewer era vacuo (no
+  distinguía "inerte" de "fuga"). Reapuntarlo a comparar el estado antes y después sí lo
+  distingue.
+- **Revisión independiente con contexto nuevo antes de tocar la evidencia**: la revisión
+  goldfish no refutó el diagnóstico y aportó dos correcciones (el detalle que mentía y la
+  vacuidad del check). También dejó anotada la cobertura que el arreglo deja sin observar en CI y la
+  dejó escrita como riesgo residual en la tarea.
 - **La política `git-control` juzga el historial completo**, no solo el commit que escribes: un
   mensaje malo creado en GitHub bloquea el fast-forward local y *todo* push. Se corrige con
   `git commit --amend --reset-author -F <mensaje>` y `git push --force-with-lease`; nunca
   `--no-verify`.
 - **Un `MERGE_HEAD` a medias es una operación viva**: `git merge --abort` + rama temporal +
   `amend` resolvió una fusión colgada sin relanzarla.
-- Las sondas (`run-probe`, `multiproject-probe`, `supervisor-probe`) **no son el mismo carril**:
-  `scripts/probes.sh` corre `release|supervisor|profile|multiproject|verify|trust-probe`, y lo
-  que no está en esa lista no lo detecta ninguna lane (de ahí nacieron TASK-38 y TASK-39).
+- **El carril de sondas exige un proxy de egreso propio** y no arranca sin él; la receta
+  exacta está en `scripts/probes.sh` y en el CI (`.github/workflows`): contenedor con
+  `scripts/egress-proxy.py`, puerto publicado, `HODEI_MH_EGRESS_PROXY_CONTAINER`,
+  `HODEI_MH_PROXY_CHECK_URL` y `HODEI_MH_CONTROL_TOKEN`. Un proxy que se deja levantado
+  ocupa el puerto y hace fallar la siguiente corrida por un motivo que no es del producto.
+- **Los workers también dejan residuos**: un contenedor de proxy y una rama sin borrar. El
+  cierre del supervisor tiene que mirarlos.
