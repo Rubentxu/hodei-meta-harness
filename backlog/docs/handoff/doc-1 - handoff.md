@@ -3,7 +3,7 @@ id: doc-1
 title: handoff
 type: other
 created_date: '2026-11-18T21:38:00Z'
-updated_date: '2026-11-20T08:08:00Z'
+updated_date: '2026-11-20T08:29:00Z'
 ---
 # Handoff
 
@@ -12,48 +12,52 @@ updated_date: '2026-11-20T08:08:00Z'
 
 ## Ahora
 
-- **TASK-38 y TASK-39 están CERRADAS.** `main` lleva el código de ambas (TASK-38 en `e9829ed`,
-  TASK-39 en `045fded`) y el cierre del tablero en `c536081`.
-  - TASK-38: `run-probe` entrega la credencial del execd por la cabecera del handshake
-    (`ExecdEndpoint::attach_options`) y un 401 aparece como check FALLIDO, no omitido.
-  - TASK-39: la sonda multiproyecto registra los sockets de supervisor que nombra, los elimina
-    tras matar a los supervisores y publica el paso `no-supervisor-socket-survives-the-probe`
-    (cleanup completo Y recuento de `/tmp` igual antes/después). Evidencia: probe real 14/14,
-    `all_passed=true`, 0 residuo, 4/4 sockets eliminados, 0 antes y 0 después.
-- **TASK-31 (MH-A08) en corrección.** El worker entregó `a004c59` con gate `--all` PASS y smoke
-  real 12/12, pero la revisión goldfish confirmó cuatro defectos que un corrector está
-  arreglando en `../wt-task31`:
-  1. AC2: `ensure_ready` devuelve `true` con la readiness cacheada aunque el deadline ya esté
-     agotado; la llamada bloqueada debe ser `NotAccepted` sin ejecutar el comando.
-  2. AC3: `reconcile_sandboxes` no tiene llamador productivo; el registro se pierde al salir o
-     al cancelar, y las entradas de sesión nunca se liberan. Hace falta diario durable y
-     reconciliación al entrar en los caminos que crean sandboxes.
-  3. AC4: la medición imprime p50/p95 pero no compara contra un baseline explícito.
-  4. Política: `expect()` en producción en `execd/client.rs` y `cleanup.rs`.
-- **TASK-36 (MH-A10, LOW) en curso** en `../wt-task36`: caché de build opt-in y segura
-  (módulo puro `cache.rs`, montaje/GC en `profile_run`, doc de perfiles), con benchmark
-  frío/caliente y la regla de que una caché escribible no puede producir PASS.
-- **La siguiente por prioridad es TASK-34 (MH-A06, HIGH)**: conectar el supervisor de producto
-  al bucle real de objetivos ACP. Depende de TASK-31, así que su encargo sale en cuanto TASK-31
-  se acepte y mergee. Después TASK-35 (MH-A13), que depende de TASK-34.
-- Tablero: 34 tareas `Done`; en curso TASK-31 y TASK-36; pendientes TASK-34 y TASK-35.
+- **TASK-31, TASK-36, TASK-38 y TASK-39 están cerradas.** `main` lleva TASK-31 en `67fc6ef`
+  (merge de PR #46) y el cierre del tablero en `1a2b7ec`.
+  - TASK-31: deadline único, readiness cacheada por generación, diario durable en
+    `$XDG_STATE_HOME/hodei-mh/cleanup-journal.json` reconciliado **antes** de crear sandbox
+    (`hodei-mh-verify` y probe acp), baseline explícito en la medición y sin `expect`/`unwrap`
+    de producción. Evidencia: gate `--all`, CI 44702550552 SUCCESS, smoke real 12/12
+    (`/tmp/runprobe-task31-merged.json`).
+  - TASK-36: caché de build opt-in con clave profile/imagen/toolchain/`Cargo.lock`/proyecto/scope,
+    digest verificado antes de restaurar, cuota con evicción y poda de huérfanos, y verificador
+    que nunca la consume. Frío 10.18 s → caliente 8.00 s (descargas); `--cache-target` 8.92 s →
+    0.95 s; archivo corrupto rechazado y descartado.
+- **TASK-34 (MH-A06, HIGH) en curso** en `../wt-task34` (rama `task/task-34-live-core`):
+  - Rebanada 1, `cc18f30`: `live.rs` puro (`AttemptEnd`/`outcome_of`, `LiveRuntime` con claims y
+    puertos), `select_in`, `RenewOutcome` y `renew` por defecto en el contrato, y en el motor
+    `apply_renewal` más la cancelación incierta de `Stop`; 20 tests; gate `--all` PASS.
+  - Rebanada 2 **en curso**: adaptadores `crates/hodei-mh/src/live/*` sobre el transporte de
+    TASK-31 (un `ExecdClient`, un `Deadline`, `UncertainResult` sin reintento, registro durable al
+    crear), flags `--live` con rechazos explícitos, Renew contestado por el runtime fuera del lock
+    y liberación del claim segura ante abort.
+  - Rebanada 3 **pendiente**: UAT con el binario real (repo externo con Backlog.md y dos tickets
+    dependientes por ACP real, permiso denegado sin promoción ni cierre, tablero vacío sin sandbox
+    ni tokens, Stop con evidencia de cancelación y liberación) y decisión de paridad antes de
+    sustituir `autonomous-loop`.
+- **TASK-35 (MH-A13) pendiente**, depende de TASK-34.
+- Tablero: 36 tareas `Done`; en curso TASK-34; pendiente TASK-35.
+- **Operaciones vivas**: el lifecycle server de 8081 se detuvo (era el binario de TASK-38, previo
+  a TASK-31). El contenedor `hodei-proxy` sigue sin listener: la UAT necesita un proxy de egreso
+  real (`scripts/egress-proxy.py` en `rust:1-bookworm`, con puerto publicado) y exportar
+  `HODEI_MH_EGRESS_PROXY_CONTAINER` y `HODEI_MH_PROXY_CHECK_URL`.
 
 ## Aprendido
 
-- **Un registro sin consumidor no es reconciliación.** `CleanupRegistry` con `Drop` cumple la
-  parte de "no se pierde la intención", pero si nadie llama a `reconcile_sandboxes` y el diario
-  vive solo en memoria, el residuo se pierde igual. La evidencia tiene que ser un llamador
-  productivo y un diario durable, no una API y su test.
-- **La sonda multiproyecto necesita el entorno completo del lane**: contenedor de egreso con
-  puerto publicado (`-p 127.0.0.1:18888:8888`, `scripts/egress-proxy.py` en `rust:1-bookworm`),
-  `HODEI_MH_EGRESS_PROXY_CONTAINER`, `HODEI_MH_PROXY_CHECK_URL` y `PORT=8082` si el servidor
-  adoptado ocupa 8081. Sin eso fallan pasos que no tienen que ver con el cambio.
-- **El gate de workspace puede fallar por flake del propio test**: `supervisor_cli` agotó sus
-  20 s esperando `phase: idle` en CI y pasó 3/3 en local y en la reejecución. Se reejecuta el job
-  y se registra; no se toca el test sin causa demostrada.
-- **La política `git-control` juzga commit por commit al actualizar una ref.** Un trailer
-  `Co-authored-by` en un squash de GitHub bloquea el fast-forward y todo push de ramas que lo
-  contengan. Remedio: mensaje limpio con el mismo árbol y `--force-with-lease`; nunca
-  `--no-verify`.
-- Las sondas siguen fuera de `scripts/probes.sh`; TASK-38 y TASK-39 nacieron de esa laguna y
-  ahora se ejecutan a mano con el entorno del lane.
+- **El gate local de una rama no valida un cambio de API compartida.** TASK-31 compilaba sola,
+  pero el código de TASK-36 ya en `main` llamaba a la firma antigua de `oneshot::run`: 5 `E0308`
+  y 1 `E0382` que solo aparecieron al evaluar el merge. Remedio: merge de `origin/main` en la
+  rama y adaptación de las llamadas (`14288bd`). Regla: cuando `main` se mueve, mirar el CI del
+  PR contra la base actual, no solo el gate local.
+- **El squash de GitHub inyecta `Co-authored-by`** cuando los commits de la rama llevan autor y
+  `git-control` bloquea la ref. Remedios usados: commit con el mismo árbol y mensaje limpio más
+  `--force-with-lease` (`be7d880`) y merge commit para PR #46.
+- **La política también rechaza el asunto de merge por defecto** (`GCTL-CONV-002`): un merge
+  manual debe llevar asunto `chore:`; nunca `--no-verify`.
+- **Un registro sin consumidor no es reconciliación**: hace falta un llamador productivo y un
+  diario durable; las sesiones execd no son residuo del host porque mueren con su sandbox.
+- **Flakes bajo carga**: `supervisor_cli` (phase idle) y
+  `socket_integration::a_client_that_does_not_read_is_dropped`. Pasan aislados y en la
+  reejecución; se reejecuta el job y se registra, no se toca el test sin causa demostrada.
+- Las sondas siguen fuera de `scripts/probes.sh`; el lane exige Backlog CLI, Docker, proxy de
+  egreso con listener e imágenes ya presentes en el daemon.
