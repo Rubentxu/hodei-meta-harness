@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@rubentxu'
 created_date: '2026-11-20T19:30:00Z'
-updated_date: '2026-11-20T20:13:00Z'
+updated_date: '2026-11-20T20:17:00Z'
 labels:
   - descubrimiento
   - bug
@@ -66,6 +66,18 @@ Riesgo residual y cobertura: tras el reapuntado, ninguna sonda de CI observa una
 
 Correccion de higiene: el worker dejo el contenedor de proxy `hodei-verify-t52-proxy` ocupando el puerto 18888; retirado antes de la verificacion del supervisor.
 <!-- SECTION:NOTES:END -->
+
+## Comments
+
+<!-- COMMENTS:BEGIN -->
+created: 2026-11-20T20:17:00Z
+
+---
+
+Evidencia conjunta (supervisor + verificador w52-verify + sesión concurrente): FIX fusionado a main via PR #49 squash 8d20acb, código byte-idéntico al commit verificado 7e50570 (git diff 7e50570 8d20acb sobre los dos ficheros de sondas = 0 líneas). AC3-local: preflight completo (Backlog CLI 1.55.3, Docker, imágenes, proxy de egreso) + una ronda real: supervisor-probe 11/11 PASS y multiproject-probe 14/14 PASS, all_passed=true, residue sandboxes=0/containers=0/networks=0; stop-idle-release paso por la rama honesta (stop rechazado con journal stop_applied=false y veredicto antes del Stop) afirmando el invariante completo. AC3-CI: run 44808413572 sobre main 8d20acb completed success en AMBOS jobs (workspace gate + probe lane con las seis sondas). AC1/AC4: cero sleep/aserciones de fase transitoria nuevos; el polling wait_ready_contains desaparece; las aserciones nuevas leen journal y estados terminales del MISMO snapshot (multiproject_probe.rs:948,962-963; supervisor_probe checks journal-driven). AC2: rechazado aceptado solo con evidencia completa (stop_came_after_the_end :176 + invariante :1040-1047). fast-check --all PASS post-merge. Ramas/worktree de tarea ya eliminados por el flujo PR; recursos del verificador limpiados.
+
+---
+<!-- COMMENTS:END -->
 
 ## Final Summary
 
