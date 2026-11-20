@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use hodei_mh_workspace::export::{self, ExportPolicy};
 use opensandbox::control::ControlPlane;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
+use opensandbox::execd::oneshot;
 use profiles::build_plan::{self, BuildPlan};
 use profiles::credentials::{self, SubscriptionNote};
 use profiles::doctor::{self, DoctorCheck};
@@ -28,6 +31,10 @@ pub const DEFAULT_PROXY_URL: &str = "http://hodei-proxy:8888";
 /// Bounded wait for the sandbox's execd to start answering. A sandbox
 /// that never becomes usable is a FAILURE, not an infinite wait.
 const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The budget of one run against a sandbox: the readiness wait, the
+/// observations, the staging and every plan command share it.
+const RUN_BUDGET: Duration = Duration::from_secs(3600);
 
 /// How much of a build output the record keeps. The output is REDACTED
 /// before it is cut: the tail of a build that printed a credential must
@@ -510,9 +517,16 @@ pub async fn run_profile(args: &[String]) -> i32 {
         }
     };
 
+    // ONE transport for the whole run: the connections are reused and the
+    // readiness of this sandbox generation is observed once. ONE deadline
+    // bounds the readiness wait, the observations, the staging and every
+    // plan command.
+    let transport = ExecdClient::new(execd);
+    let deadline = Deadline::in_budget(RUN_BUDGET);
+
     // The relay may be ready before execd has started inside the sandbox.
     // Wait with a deadline rather than treating a boot delay as a failed build.
-    if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
+    if !oneshot::ensure_ready(&transport, deadline.within(EXECD_READY_TIMEOUT)).await {
         let _ = client
             .delete(&ControlPlane::sandbox_path(&sid))
             .send()
@@ -526,10 +540,10 @@ pub async fn run_profile(args: &[String]) -> i32 {
     // 4. OBSERVED limits from inside the container (cgroups) AND the
     // sandbox's OWN network reachability (measured from inside, not from
     // the host: a host-side TCP check proves nothing about the sandbox).
-    let observed = opensandbox::execd::oneshot::run(
-        &execd,
+    let observed = oneshot::run(
+        &transport,
         "echo cpu=$(cat /sys/fs/cgroup/cpu.max) mem=$(cat /sys/fs/cgroup/memory.max)",
-        Duration::from_secs(30),
+        deadline.within(Duration::from_secs(30)),
     )
     .await;
     // bash's /dev/tcp takes HOST and PORT as SEPARATE path segments
@@ -538,13 +552,13 @@ pub async fn run_profile(args: &[String]) -> i32 {
         "{}/{proxy_port}",
         proxy_host.trim_start_matches('[').trim_end_matches(']')
     );
-    let egress = opensandbox::execd::oneshot::run(
-        &execd,
+    let egress = oneshot::run(
+        &transport,
         &format!(
             "if timeout 5 bash -c 'exec 3<>/dev/tcp/{proxy_target}' 2>/dev/null; then echo PROXY_REACHABLE; else echo PROXY_UNREACHABLE; fi; if timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo DIRECT_INTERNET_REACHABLE; else echo DIRECT_INTERNET_BLOCKED; fi",
             proxy_target = proxy_target
         ),
-        Duration::from_secs(30),
+        deadline.within(Duration::from_secs(30)),
     )
     .await;
     let proxy_reachable = egress.output.contains("PROXY_REACHABLE");
@@ -576,7 +590,12 @@ pub async fn run_profile(args: &[String]) -> i32 {
     // The execd connection can refuse the first attempts right after
     // the sandbox starts: bounded retries, never an unbounded wait.
     for _ in 0..3 {
-        if opensandbox::execd::api::upload_file(&execd, export_bytes.clone(), "/tmp/project.tgz")
+        if transport
+            .upload_file(
+                export_bytes.clone(),
+                "/tmp/project.tgz",
+                deadline.remaining(),
+            )
             .await
             .is_ok()
         {
@@ -587,12 +606,12 @@ pub async fn run_profile(args: &[String]) -> i32 {
     }
     let staged_ok = if uploaded {
         // The root is a SANITIZED name, quoted for the shell.
-        opensandbox::execd::oneshot::run(
-            &execd,
+        oneshot::run(
+            &transport,
             &format!(
                 "mkdir -p '{sandbox_root}' && tar xzf /tmp/project.tgz -C '{sandbox_root}' && rm /tmp/project.tgz"
             ),
-            Duration::from_secs(60),
+            deadline.within(Duration::from_secs(60)),
         )
         .await
         .succeeded()
@@ -627,8 +646,12 @@ pub async fn run_profile(args: &[String]) -> i32 {
     let mut all_ok = observed.succeeded();
     for command in &plan.commands {
         let proxied = format!("HTTPS_PROXY={proxy_url} HTTP_PROXY={proxy_url} {command}");
-        let outcome =
-            opensandbox::execd::oneshot::run(&execd, &proxied, Duration::from_secs(600)).await;
+        let outcome = oneshot::run(
+            &transport,
+            &proxied,
+            deadline.within(Duration::from_secs(600)),
+        )
+        .await;
         all_ok = all_ok && outcome.succeeded();
         executed.push(proxied.clone());
         command_outputs.push(command_record(

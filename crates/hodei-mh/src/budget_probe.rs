@@ -11,6 +11,8 @@ use budget::ledger::{Admission, BudgetLedger, SandboxId, WaitReason};
 use budget::pressure::{PressureAction, PressureSignal, react};
 use budget::vector::{HostCapacity, ResourceVector};
 use opensandbox::control::ControlPlane;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use serde_json::{Value, json};
 
@@ -134,14 +136,23 @@ pub async fn run(server: &str, image: &str) -> i32 {
         }
         Err(_) => ExecdEndpoint::default(),
     };
+    // ONE transport and ONE deadline for the measurements of this
+    // sandbox: the readiness is observed once and the commands share the
+    // budget.
+    let transport = ExecdClient::new(execd.clone());
+    let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd).await;
+    crate::probe_util::wait_for_execd(
+        &transport,
+        deadline.within(crate::probe_util::EXECD_READY_TIMEOUT),
+    )
+    .await;
     // Effective limits as the WORKLOAD sees them (cgroup v2 values).
     let limits = crate::probe_util::run_in_sandbox(
-        &execd,
+        &transport,
         "echo cpu=$(cat /sys/fs/cgroup/cpu.max) mem=$(cat /sys/fs/cgroup/memory.max)",
-        Duration::from_secs(30),
+        deadline.within(Duration::from_secs(30)),
     )
     .await;
     let cpu_max_quota: Option<f64> = limits
@@ -170,9 +181,9 @@ pub async fn run(server: &str, image: &str) -> i32 {
 
     // Measured workload under the limit, then CANCELLED (DoD).
     let workload = crate::probe_util::run_in_sandbox(
-        &execd,
+        &transport,
         "dd if=/dev/zero of=/dev/null bs=1M count=200000 & WPID=$!; sleep 1; cat /sys/fs/cgroup/cpu.stat | head -2; kill $WPID; echo workload-cancelled",
-        Duration::from_secs(30),
+        deadline.within(Duration::from_secs(30)),
     )
     .await;
     let workload_measured = workload.succeeded() && workload.output.contains("workload-cancelled");

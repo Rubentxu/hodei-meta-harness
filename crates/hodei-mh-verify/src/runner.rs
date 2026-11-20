@@ -17,9 +17,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use opensandbox::cleanup::{CleanupGuard, CleanupRegistry, cleanup_sandbox};
 use opensandbox::control::ControlPlane;
-use opensandbox::execd::api;
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
+use opensandbox::execd::oneshot;
 
 use crate::evidence::{BoundResult, CheckBinding, EvidenceBinding, EvidenceSet};
 use crate::git::{GitRevision, GitTree, RevisionMatch, compare};
@@ -29,6 +32,9 @@ use crate::transport::TransportDigest;
 /// Bounded wait for the sandbox's execd to accept sessions. A fresh
 /// sandbox publishes its port before the server inside can answer.
 const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounded wait for the preparation of the checkout inside the sandbox.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounded wait for the observations of the checkout (head and files).
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -114,6 +120,11 @@ impl CleanRunner {
                 return Err(RunnerError(format!("{error}; orphan cleanup: {cleaned}")));
             }
         };
+        // The cleanup of the sandbox is REGISTERED while it is not
+        // confirmed: a cancelled verification never leaves a sandbox
+        // behind without a record to reconcile.
+        let registry = CleanupRegistry::new();
+        let mut cleanup = CleanupGuard::sandbox(sandbox_id.clone(), registry.clone());
         // Everything that can fail AFTER the sandbox exists runs inside
         // this block, so the sandbox is deleted on every path: a failure
         // in the checks must not leave the host with residue.
@@ -132,20 +143,33 @@ impl CleanRunner {
             Ok::<_, RunnerError>((bound, observed, image_id))
         }
         .await;
-        let deleted = client
-            .delete(&ControlPlane::sandbox_path(&sandbox_id))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
         // The deletion failure is logged BEFORE the outcome error: a
         // residue on the host must not hide behind the error that stopped
         // the verification. It does not invalidate the evidence: the
         // checks really ran in that sandbox.
-        if !deleted {
-            tracing::warn!(%sandbox_id, "clean sandbox deletion failed");
+        if cleanup_sandbox(&client, &mut cleanup).await.is_err() {
+            tracing::warn!(
+                %sandbox_id,
+                "clean sandbox deletion failed: it stays registered for reconciliation"
+            );
         }
-        let (bound, observed, image_id) = outcome?;
+        let (bound, observed, image_id) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let pending = registry.pending();
+                if pending.is_empty() {
+                    return Err(error);
+                }
+                let described = pending
+                    .iter()
+                    .map(|entry| entry.describe())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(RunnerError(format!(
+                    "{error}; pending cleanup: {described}"
+                )));
+            }
+        };
         // The evidence records what was OBSERVED, not what was declared:
         // the head and the content git reported in the checkout that ran,
         // and the bytes that really travelled. The declarations were
@@ -268,11 +292,19 @@ impl CleanRunner {
         let execd = ExecdEndpoint::from_contract(&value)
             .ok_or_else(|| RunnerError("no execd endpoint".into()))?;
         let environment = format!("{image_id}::{sandbox_id}");
+        // ONE transport for the whole verification: the connections are
+        // reused and the readiness is observed once.
+        let execd_client = ExecdClient::new(execd);
+        // ONE deadline for the whole verification: the readiness wait,
+        // the preparation of the checkout and every check share it.
+        let deadline = Deadline::in_budget(self.budget_of(checks.len()));
 
         // The sandbox publishes its execd port BEFORE the server inside
         // can answer: wait (bounded) for it, so the upload does not fail
-        // for a reason that has nothing to do with the candidate.
-        if !opensandbox::execd::oneshot::wait_until_ready(&execd, EXECD_READY_TIMEOUT).await {
+        // for a reason that has nothing to do with the candidate. The
+        // readiness is observed ONCE and reused by the commands.
+        let ready = deadline.within(EXECD_READY_TIMEOUT);
+        if !oneshot::ensure_ready(&execd_client, ready).await {
             return Err(RunnerError(
                 "the sandbox execd never became usable".to_string(),
             ));
@@ -282,7 +314,12 @@ impl CleanRunner {
         // right after creation; a short retry covers that window.
         let mut uploaded = Err(RunnerError("bundle upload not attempted".into()));
         for attempt in 0..5 {
-            uploaded = api::upload_file(&execd, candidate.bundle.clone(), "/tmp/candidate.bundle")
+            uploaded = execd_client
+                .upload_file(
+                    candidate.bundle.clone(),
+                    "/tmp/candidate.bundle",
+                    deadline.remaining(),
+                )
                 .await
                 .map_err(|e| RunnerError(format!("bundle upload: {e}")));
             if uploaded.is_ok() {
@@ -297,9 +334,9 @@ impl CleanRunner {
         // fails here instead of producing bogus verdicts. The product flow
         // normalizes candidate repos to branch `main`.
         let prepared = run_with_timeout(
-            &execd,
+            &execd_client,
             "git init -q -b main /workspace/checkout && git -C /workspace/checkout fetch -q /tmp/candidate.bundle 'refs/heads/*:refs/remotes/bundle/*' && git -C /workspace/checkout checkout -q -f -B main refs/remotes/bundle/main",
-            Duration::from_secs(60),
+            deadline.within(PREPARE_TIMEOUT),
         )
         .await;
         if prepared.exit_code != Some(0) {
@@ -312,7 +349,7 @@ impl CleanRunner {
         // What was actually checked out must be what the candidate claims:
         // the head and the content it carries. Both are observed in the
         // sandbox, and both are compared BEFORE any check runs.
-        let observed_head = observe(&execd, "git rev-parse HEAD").await?;
+        let observed_head = observe(&execd_client, "git rev-parse HEAD", deadline).await?;
         let observed_revision = GitRevision::parse(&observed_head)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable head: {e}")))?;
         if let RevisionMatch::Differs { declared, observed } =
@@ -324,7 +361,7 @@ impl CleanRunner {
                 observed.as_str()
             )));
         }
-        let observed_tree = observe(&execd, "git rev-parse HEAD^{tree}").await?;
+        let observed_tree = observe(&execd_client, "git rev-parse HEAD^{tree}", deadline).await?;
         let observed_tree = GitTree::parse(&observed_tree)
             .map_err(|e| RunnerError(format!("the checkout did not report a usable tree: {e}")))?;
         if observed_tree != candidate.tree {
@@ -338,7 +375,8 @@ impl CleanRunner {
         let mut bound = Vec::new();
         for check in checks {
             let command = format!("cd {CHECKOUT} && {}", check.command);
-            let record = run_with_timeout(&execd, &command, self.timeout).await;
+            let record =
+                run_with_timeout(&execd_client, &command, deadline.within(self.timeout)).await;
             bound.push(BoundResult {
                 check_id: check.id.clone(),
                 environment: environment.clone(),
@@ -356,6 +394,15 @@ impl CleanRunner {
                 tree: observed_tree,
             },
         ))
+    }
+
+    /// The end-to-end budget of a verification: the readiness wait, the
+    /// preparation of the checkout and every check share it.
+    fn budget_of(&self, checks: usize) -> Duration {
+        let checks = u32::try_from(checks).unwrap_or(u32::MAX);
+        EXECD_READY_TIMEOUT
+            .saturating_add(PREPARE_TIMEOUT)
+            .saturating_add(self.timeout.saturating_mul(checks))
     }
 }
 
@@ -401,12 +448,15 @@ fn observed_image_id(created: &serde_json::Value) -> Result<String, RunnerError>
 
 /// Run one command and read its output: a command that does not succeed is
 /// an observation failure, never an empty observation.
-async fn observe(execd: &ExecdEndpoint, command: &str) -> Result<String, RunnerError> {
-    let outcome = opensandbox::execd::oneshot::run_when_ready(
-        execd,
+async fn observe(
+    transport: &ExecdClient,
+    command: &str,
+    deadline: Deadline,
+) -> Result<String, RunnerError> {
+    let outcome = oneshot::run_when_ready(
+        transport,
         &format!("cd {CHECKOUT} && {command}"),
-        OBSERVE_TIMEOUT,
-        EXECD_READY_TIMEOUT,
+        deadline.within(OBSERVE_TIMEOUT),
     )
     .await;
     if outcome.exit_code != Some(0) {
@@ -426,13 +476,11 @@ async fn observe(execd: &ExecdEndpoint, command: &str) -> Result<String, RunnerE
 /// execd refuses the first attempts. The readiness wait runs a harmless
 /// probe, so the check command itself runs EXACTLY ONCE.
 async fn run_with_timeout(
-    execd: &ExecdEndpoint,
+    transport: &ExecdClient,
     command: &str,
-    timeout: Duration,
+    deadline: Deadline,
 ) -> ExecutionRecord {
-    let outcome =
-        opensandbox::execd::oneshot::run_when_ready(execd, command, timeout, EXECD_READY_TIMEOUT)
-            .await;
+    let outcome = oneshot::run_when_ready(transport, command, deadline).await;
     match outcome.exit_code {
         Some(code) => ExecutionRecord::terminal(command, code, outcome.output),
         None => ExecutionRecord::absent(

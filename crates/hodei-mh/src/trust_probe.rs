@@ -22,6 +22,8 @@ use serde_json::{Value, json};
 
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::{EXECD_ACCESS_TOKEN_HEADER, ExecdEndpoint};
 use opensandbox::execd::oneshot;
 use opensandbox::execd::pipe;
@@ -30,6 +32,9 @@ use opensandbox::execd::pipe;
 const SANDBOX_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the execd of a fresh sandbox may take to answer.
 const EXECD_READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// The budget of one measured operation against a sandbox: the readiness
+/// wait and the commands of that operation share it.
+const PROBE_OPERATION_BUDGET: Duration = Duration::from_secs(1200);
 /// The port the execd listens on inside the sandbox.
 const EXECD_PORT: u16 = 44772;
 /// A public IPv6 address used to measure whether IPv6 is really gone.
@@ -376,8 +381,8 @@ print(json.dumps({
 "#;
 
 /// Run the measurement program inside a sandbox and read its answer.
-async fn measure(execd: &ExecdEndpoint, code: &str) -> Result<Value, String> {
-    let outcome = oneshot::run(execd, &python_command(code), SANDBOX_COMMAND_TIMEOUT).await;
+async fn measure(client: &ExecdClient, code: &str, deadline: Deadline) -> Result<Value, String> {
+    let outcome = oneshot::run(client, &python_command(code), deadline).await;
     if !outcome.succeeded() {
         return Err(format!(
             "the sandbox command did not succeed: {}",
@@ -631,6 +636,12 @@ pub async fn run(args: &[String]) -> i32 {
     }
     let id_a = created[0].clone();
     let (endpoint_a, endpoint_b) = (endpoints[0].clone(), endpoints[1].clone());
+    // ONE transport per sandbox: the connections are reused and the
+    // readiness of each generation is observed once. ONE deadline bounds
+    // every measured command of the probe.
+    let client_a = ExecdClient::new(endpoint_a.clone());
+    let client_b = ExecdClient::new(endpoint_b.clone());
+    let deadline = Deadline::in_budget(PROBE_OPERATION_BUDGET);
 
     // --- An unauthorized client cannot touch an existing sandbox. ---
     let mut refusals = Vec::new();
@@ -819,8 +830,8 @@ pub async fn run(args: &[String]) -> i32 {
     }
 
     // --- The sandbox is usable: the execd answers. ------------------
-    for (label, endpoint) in [("a", &endpoint_a), ("b", &endpoint_b)] {
-        if oneshot::wait_until_ready(endpoint, EXECD_READY_TIMEOUT).await {
+    for (label, client) in [("a", &client_a), ("b", &client_b)] {
+        if oneshot::ensure_ready(client, deadline.within(EXECD_READY_TIMEOUT)).await {
             report.pass(
                 "P08",
                 "the execd of every sandbox answers",
@@ -847,8 +858,10 @@ pub async fn run(args: &[String]) -> i32 {
     let program = SANDBOX_PROGRAM.replace("__TARGETS__", &targets.to_string());
 
     let mut own_ips: Vec<String> = Vec::new();
-    for (label, endpoint) in [("a", &endpoint_a), ("b", &endpoint_b)] {
-        let measurement = match measure(endpoint, &program).await {
+    for (label, client) in [("a", &client_a), ("b", &client_b)] {
+        let measurement = match measure(client, &program, deadline.within(SANDBOX_COMMAND_TIMEOUT))
+            .await
+        {
             Ok(measurement) => measurement,
             Err(reason) => {
                 report.fail(
@@ -1105,9 +1118,10 @@ pub async fn run(args: &[String]) -> i32 {
 
     // --- The sandbox cannot reach another sandbox. ------------------
     match lateral_isolation(
-        &endpoint_a,
-        &endpoint_b,
+        &client_a,
+        &client_b,
         own_ips.first().map(String::as_str),
+        deadline,
     )
     .await
     {
@@ -1116,8 +1130,8 @@ pub async fn run(args: &[String]) -> i32 {
     }
 
     // --- The authorized egress path really carries traffic. ---------
-    for (label, endpoint) in [("a", &endpoint_a), ("b", &endpoint_b)] {
-        match proxy_fetch(endpoint, &proxy_url, &proxy_target).await {
+    for (label, client) in [("a", &client_a), ("b", &client_b)] {
+        match proxy_fetch(client, &proxy_url, &proxy_target, deadline).await {
             Ok(status) => report.pass(
                 "P18",
                 "the sandbox reaches the internet through the proxy",
@@ -1132,8 +1146,8 @@ pub async fn run(args: &[String]) -> i32 {
     }
 
     // --- The proxy is not an open relay for plain HTTP. --------------
-    for (label, endpoint) in [("a", &endpoint_a), ("b", &endpoint_b)] {
-        match plain_http_through_proxy(endpoint, &proxy_url, &proxy_target).await {
+    for (label, client) in [("a", &client_a), ("b", &client_b)] {
+        match plain_http_through_proxy(client, &proxy_url, &proxy_target, deadline).await {
             Ok(refusal) => report.pass(
                 "P19",
                 "the proxy tunnels only the destinations it allows",
@@ -1269,7 +1283,12 @@ async fn credential_ownership(
     // EXECUTION PLANE honors, and the credential the caller asked for
     // has to be refused by it. Without this, the probe would only say
     // what the server believes about its own container.
-    if !oneshot::wait_until_ready(&endpoint, EXECD_READY_TIMEOUT).await {
+    //
+    // ONE transport and ONE deadline for the measurements of this
+    // environment: the readiness is observed once and reused.
+    let transport = ExecdClient::new(endpoint.clone());
+    let deadline = Deadline::in_budget(PROBE_OPERATION_BUDGET);
+    if !oneshot::ensure_ready(&transport, deadline.within(EXECD_READY_TIMEOUT)).await {
         return (
             id,
             Err("the execution plane of the environment never became ready".to_string()),
@@ -1323,7 +1342,7 @@ async fn credential_ownership(
     }
     // The identity of the environment belongs to the server too: the
     // caller asked for one, and the environment must carry another.
-    match sandbox_identity(&endpoint).await {
+    match sandbox_identity(&transport, deadline).await {
         Some(identity) if identity == id => {}
         Some(identity) => {
             return (
@@ -1372,14 +1391,14 @@ async fn execd_answer_for(endpoint: &ExecdEndpoint, token: &str) -> Option<u16> 
 }
 
 /// The identity the environment carries, read from inside it.
-async fn sandbox_identity(endpoint: &ExecdEndpoint) -> Option<String> {
-    if !oneshot::wait_until_ready(endpoint, EXECD_READY_TIMEOUT).await {
+async fn sandbox_identity(client: &ExecdClient, deadline: Deadline) -> Option<String> {
+    if !oneshot::ensure_ready(client, deadline.within(EXECD_READY_TIMEOUT)).await {
         return None;
     }
     let outcome = oneshot::run(
-        endpoint,
+        client,
         "sh -c 'printf %s \"$OPENSANDBOX_ID\"'",
-        SANDBOX_COMMAND_TIMEOUT,
+        deadline.within(SANDBOX_COMMAND_TIMEOUT),
     )
     .await;
     if !outcome.succeeded() {
@@ -1606,26 +1625,28 @@ fn split_target(target: &str) -> Option<(String, u16)> {
 /// second sandbox is measured against a target that IS listening, so a
 /// refusal is a refusal and not a closed port.
 async fn lateral_isolation(
-    endpoint_a: &ExecdEndpoint,
-    endpoint_b: &ExecdEndpoint,
+    client_a: &ExecdClient,
+    client_b: &ExecdClient,
     own_ip: Option<&str>,
+    deadline: Deadline,
 ) -> Result<String, String> {
     let Some(own_ip) = own_ip else {
         return Err("the address of the first sandbox could not be measured".to_string());
     };
-    let session = api::create_session(
-        endpoint_a,
-        CreateSessionRequest {
-            cwd: None,
-            command: Some(&listener_command()),
-        },
-    )
-    .await
-    .map_err(|error| format!("the listener session was refused: {error}"))?;
+    let session = client_a
+        .create_session(
+            CreateSessionRequest {
+                cwd: None,
+                command: Some(&listener_command()),
+            },
+            deadline.within(SANDBOX_COMMAND_TIMEOUT).remaining(),
+        )
+        .await
+        .map_err(|error| format!("the listener session was refused: {error}"))?;
 
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(8);
-    let ws_url = endpoint_a.ws_url(&session.session_id);
-    let options = endpoint_a.attach_options();
+    let ws_url = client_a.ws_url(&session.session_id);
+    let options = client_a.attach_options();
     tokio::spawn(async move {
         if let Ok(mut pipe_session) = pipe::attach(&ws_url, options).await {
             while let Some(event) = pipe_session.next_event().await {
@@ -1661,15 +1682,29 @@ async fn lateral_isolation(
 
     // Positive control: the listener IS reachable from inside its own
     // sandbox. Without it, the negative below would prove nothing.
-    let control = measure(endpoint_a, &connect_program("127.0.0.1", port)).await?;
+    let control = measure(
+        client_a,
+        &connect_program("127.0.0.1", port),
+        deadline.within(SANDBOX_COMMAND_TIMEOUT),
+    )
+    .await?;
     if control["reachable"].as_bool() != Some(true) {
-        let _ = api::delete_session(endpoint_a, &session.session_id).await;
+        let _ = client_a
+            .delete_session(&session.session_id, deadline.remaining())
+            .await;
         return Err("the listener was not reachable from inside its own sandbox".to_string());
     }
 
     // The measurement that matters: the other sandbox cannot reach it.
-    let measured = measure(endpoint_b, &connect_program(own_ip, port)).await;
-    let _ = api::delete_session(endpoint_a, &session.session_id).await;
+    let measured = measure(
+        client_b,
+        &connect_program(own_ip, port),
+        deadline.within(SANDBOX_COMMAND_TIMEOUT),
+    )
+    .await;
+    let _ = client_a
+        .delete_session(&session.session_id, deadline.remaining())
+        .await;
     let measured = measured?;
     if measured["reachable"].as_bool() == Some(true) {
         return Err(format!(
@@ -1699,9 +1734,10 @@ time.sleep(600)
 
 /// Fetch an HTTPS URL through the proxy from inside a sandbox.
 async fn proxy_fetch(
-    endpoint: &ExecdEndpoint,
+    client: &ExecdClient,
     proxy_url: &str,
     target: &str,
+    deadline: Deadline,
 ) -> Result<u16, String> {
     let program = format!(
         r#"
@@ -1714,7 +1750,7 @@ except Exception as error:
     print(json.dumps({{"error": type(error).__name__}}))
 "#
     );
-    let measurement = measure(endpoint, &program).await?;
+    let measurement = measure(client, &program, deadline.within(SANDBOX_COMMAND_TIMEOUT)).await?;
     if let Some(status) = measurement["status"].as_u64() {
         Ok(status as u16)
     } else {
@@ -1731,9 +1767,10 @@ except Exception as error:
 /// `Ok` carries the reason of the refusal; `Err` means the proxy
 /// answered the plain HTTP request, which is the failure.
 async fn plain_http_through_proxy(
-    endpoint: &ExecdEndpoint,
+    client: &ExecdClient,
     proxy_url: &str,
     target: &str,
+    deadline: Deadline,
 ) -> Result<String, String> {
     let plain = target.replacen("https://", "http://", 1);
     let program = format!(
@@ -1747,7 +1784,7 @@ except Exception as error:
     print(json.dumps({{"error": type(error).__name__}}))
 "#
     );
-    let measurement = measure(endpoint, &program).await?;
+    let measurement = measure(client, &program, deadline.within(SANDBOX_COMMAND_TIMEOUT)).await?;
     match measurement["status"].as_u64() {
         Some(status) => Err(format!("the plain HTTP fetch answered {status}")),
         None => Ok(measurement["error"]

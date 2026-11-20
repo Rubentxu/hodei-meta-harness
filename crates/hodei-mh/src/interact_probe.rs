@@ -18,6 +18,8 @@ use interact::response::validate;
 use opensandbox::acp::{self, AcpAssembler};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions};
@@ -118,9 +120,17 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
         }
         Err(_) => ExecdEndpoint::default(),
     };
+    // ONE transport and ONE deadline for the staging and the commands of
+    // this sandbox.
+    let transport = ExecdClient::new(execd.clone());
+    let deadline = Deadline::in_budget(crate::probe_util::SANDBOX_OPERATION_BUDGET);
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    crate::probe_util::wait_for_execd(&execd).await;
+    crate::probe_util::wait_for_execd(
+        &transport,
+        deadline.within(crate::probe_util::EXECD_READY_TIMEOUT),
+    )
+    .await;
     checks.push(Check {
         name: "sandbox",
         passed: !execd.is_empty(),
@@ -160,16 +170,16 @@ pub async fn run(server: &str, image: &str, proxy_url: &str) -> i32 {
     let uploaded = api::upload_file(&execd, bundle, "/tmp/ccacp.tgz").await;
     // The agent needs the staged adapter (same procedure as the TASK-1 leg).
     let staged = crate::probe_util::run_in_sandbox(
-        &execd,
+        &transport,
         "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
-        Duration::from_secs(120),
+        deadline.within(Duration::from_secs(120)),
     )
     .await;
     // A read-only fixture for the ordinary-permission prompt.
     let fixture = crate::probe_util::run_in_sandbox(
-        &execd,
+        &transport,
         "printf 'hodei-read-fixture' > /workspace/readme-fixture.txt",
-        Duration::from_secs(20),
+        deadline.within(Duration::from_secs(20)),
     )
     .await;
     checks.push(Check {

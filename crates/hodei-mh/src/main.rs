@@ -9,8 +9,11 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use opensandbox::acp::AcpAssembler;
+use opensandbox::cleanup::{CleanupGuard, CleanupRegistry, cleanup_sandbox};
 use opensandbox::control::ControlPlane;
 use opensandbox::execd::api::{self, CreateSessionRequest};
+use opensandbox::execd::client::ExecdClient;
+use opensandbox::execd::deadline::Deadline;
 use opensandbox::execd::endpoint::ExecdEndpoint;
 use opensandbox::execd::frames::ServerEvent;
 use opensandbox::execd::pipe::{self, AttachOptions, PipeSession};
@@ -338,21 +341,10 @@ async fn acp_probe(args: &[String]) -> i32 {
         detail: format!("id={sid} state={}", created["status"]["state"]),
     });
 
-    // Cleanup guarantee: delete the sandbox however we exit.
-    let cleanup = {
-        let client = client.clone();
-        let sid = sid.clone();
-        move || {
-            let client = client.clone();
-            let sid = sid.clone();
-            tokio::spawn(async move {
-                let _ = client
-                    .delete(&ControlPlane::sandbox_path(&sid))
-                    .send()
-                    .await;
-            });
-        }
-    };
+    // Cleanup guarantee: delete the sandbox however we exit. The guard
+    // registers the sandbox while the deletion is not confirmed, so an
+    // early return or a cancellation never leaves an unrecorded residue.
+    let mut cleanup = CleanupGuard::sandbox(sid.clone(), CleanupRegistry::new());
 
     // 2. Resolve the execd endpoint.
     let endpoint = client
@@ -376,15 +368,20 @@ async fn acp_probe(args: &[String]) -> i32 {
                 passed: false,
                 detail: format!("{other:?}"),
             });
-            cleanup();
+            let _ = cleanup_sandbox(&client, &mut cleanup).await;
             report(&checks, sandbox_id, started.elapsed(), 1);
             unreachable!()
         }
     };
 
+    // ONE transport for the whole probe: the connections are reused and
+    // the readiness of this sandbox generation is observed once. ONE
+    // deadline bounds the readiness wait, the staging and the commands.
+    let transport = ExecdClient::new(execd.clone());
+    let deadline = Deadline::in_budget(probe_util::SANDBOX_OPERATION_BUDGET);
     // The sandbox publishes its execd port before the server inside can
     // answer: wait (bounded) before using it.
-    probe_util::wait_for_execd(&execd).await;
+    probe_util::wait_for_execd(&transport, deadline.within(probe_util::EXECD_READY_TIMEOUT)).await;
 
     // 3. Install the agent inside the sandbox (mock script or npm adapter).
     match mode.as_str() {
@@ -395,8 +392,12 @@ async fn acp_probe(args: &[String]) -> i32 {
             let install = format!(
                 "mkdir -p /workspace && echo {encoded} | base64 -d > /workspace/mock-acp-agent.js && test -s /workspace/mock-acp-agent.js"
             );
-            let outcome =
-                probe_util::run_in_sandbox(&execd, &install, Duration::from_secs(20)).await;
+            let outcome = probe_util::run_in_sandbox(
+                &transport,
+                &install,
+                deadline.within(Duration::from_secs(20)),
+            )
+            .await;
             checks.push(ProbeCheck {
                 name: "agent-install",
                 passed: outcome.succeeded(),
@@ -430,7 +431,7 @@ async fn acp_probe(args: &[String]) -> i32 {
                         passed: false,
                         detail: format!("host npm install failed: {other:?}"),
                     });
-                    cleanup();
+                    let _ = cleanup_sandbox(&client, &mut cleanup).await;
                     report(&checks, sandbox_id, started.elapsed(), 1);
                     unreachable!()
                 }
@@ -449,15 +450,15 @@ async fn acp_probe(args: &[String]) -> i32 {
             let bundle = std::fs::read("/tmp/hodei-ccacp.tgz").unwrap_or_default();
             let uploaded = api::upload_file(&execd, bundle, "/tmp/ccacp.tgz").await;
             let probe_fs = probe_util::run_in_sandbox(
-                &execd,
+                &transport,
                 "ls -la /tmp/ccacp.tgz",
-                Duration::from_secs(15),
+                deadline.within(Duration::from_secs(15)),
             )
             .await;
             let staged_outcome = probe_util::run_in_sandbox(
-                &execd,
+                &transport,
                 "mkdir -p /workspace/ccacp && tar xzf /tmp/ccacp.tgz -C /workspace/ccacp 2>&1 | tail -2 && test -x /workspace/ccacp/node_modules/.bin/claude-code-acp",
-                Duration::from_secs(120),
+                deadline.within(Duration::from_secs(120)),
             )
             .await;
             let staged = staged_outcome.succeeded();
@@ -478,7 +479,7 @@ async fn acp_probe(args: &[String]) -> i32 {
                 passed: false,
                 detail: format!("unknown mode {other}"),
             });
-            cleanup();
+            let _ = cleanup_sandbox(&client, &mut cleanup).await;
             report(&checks, sandbox_id, started.elapsed(), 2);
             unreachable!()
         }
@@ -520,7 +521,7 @@ async fn acp_probe(args: &[String]) -> i32 {
             passed: false,
             detail: session.err().map(|e| e.to_string()).unwrap_or_default(),
         });
-        cleanup();
+        let _ = cleanup_sandbox(&client, &mut cleanup).await;
         report(&checks, sandbox_id, started.elapsed(), 1);
         unreachable!()
     };
@@ -534,7 +535,7 @@ async fn acp_probe(args: &[String]) -> i32 {
                 passed: false,
                 detail: err.to_string(),
             });
-            cleanup();
+            let _ = cleanup_sandbox(&client, &mut cleanup).await;
             report(&checks, sandbox_id, started.elapsed(), 1);
             unreachable!()
         }
@@ -561,12 +562,7 @@ async fn acp_probe(args: &[String]) -> i32 {
 
     // 6. Release everything; no orphans.
     let _ = api::delete_session(&execd, &session.session_id).await;
-    let deleted = client
-        .delete(&ControlPlane::sandbox_path(&sid))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    let deleted = cleanup_sandbox(&client, &mut cleanup).await.is_ok();
     checks.push(ProbeCheck {
         name: "cleanup",
         passed: deleted,
