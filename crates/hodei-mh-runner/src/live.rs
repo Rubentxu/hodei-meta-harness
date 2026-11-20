@@ -2702,11 +2702,7 @@ mod tests {
             Ok(())
         }
 
-        fn settle_no_effect(
-            &self,
-            work_ref: &str,
-            detail: &str,
-        ) -> Result<(), AttemptRecordError> {
+        fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<(), AttemptRecordError> {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if state.held.as_deref() != Some(work_ref) {
                 return Err(AttemptRecordError {
@@ -2752,10 +2748,7 @@ mod tests {
     ) -> LiveRuntime {
         LiveRuntime::new(
             "project",
-            Arc::new(FakeTracker::with_items(vec![item(
-                "T-1",
-                WorkStatus::Open,
-            )])),
+            Arc::new(FakeTracker::with_items(vec![item("T-1", WorkStatus::Open)])),
             Arc::new(FixedRequirements),
             agent,
             Arc::new(HoldingVerifier),
@@ -2780,7 +2773,10 @@ mod tests {
         let outcome = outcome_of_start(&runtime, None).await;
         match &outcome {
             ObjectiveOutcome::Failed { reason } => {
-                assert!(reason.contains("refused"), "the refusal is the verdict: {reason}");
+                assert!(
+                    reason.contains("refused"),
+                    "the refusal is the verdict: {reason}"
+                );
                 assert!(
                     reason.contains("before any effect"),
                     "the absence of effects is part of the verdict: {reason}"
@@ -2788,11 +2784,7 @@ mod tests {
             }
             other => panic!("a refusal must fail the run, got {other:?}"),
         }
-        assert_eq!(
-            publisher.calls(),
-            0,
-            "a refusal never promotes anything"
-        );
+        assert_eq!(publisher.calls(), 0, "a refusal never promotes anything");
         assert_eq!(
             claims.releases(),
             vec![("T-1".to_string(), 9)],

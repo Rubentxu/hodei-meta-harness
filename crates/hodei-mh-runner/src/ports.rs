@@ -224,10 +224,7 @@ impl AgentError {
     }
 
     /// The failure of a turn the policy refused before it had any effect.
-    pub fn refused_no_effect(
-        work_ref: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
+    pub fn refused_no_effect(work_ref: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::with_effects(work_ref, reason, TurnEffects::RefusedNoEffect)
     }
 

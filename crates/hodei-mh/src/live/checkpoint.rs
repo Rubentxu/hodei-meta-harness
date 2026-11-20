@@ -302,7 +302,11 @@ impl LiveCheckpoints {
     /// effects somebody must account for, so the settlement refuses and the
     /// record stays exactly as it was. Settling an already settled record
     /// is idempotent.
-    pub fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<LiveRecord, CheckpointError> {
+    pub fn settle_no_effect(
+        &self,
+        work_ref: &str,
+        detail: &str,
+    ) -> Result<LiveRecord, CheckpointError> {
         let refusal = |reason: String| CheckpointError::NotEffectless {
             work_ref: work_ref.to_string(),
             reason,
@@ -319,7 +323,7 @@ impl LiveCheckpoints {
         match record.phase {
             LivePhase::SettledNoEffect => return Ok(record),
             LivePhase::Confirmed => {
-                return Err(refusal("the attempt already reached its effect".into()))
+                return Err(refusal("the attempt already reached its effect".into()));
             }
             LivePhase::Pending => {}
         }
@@ -468,11 +472,10 @@ impl AttemptRecordPort for CheckpointRecords {
     }
 
     fn settle_no_effect(&self, work_ref: &str, detail: &str) -> Result<(), AttemptRecordError> {
-        let failure =
-            |error: CheckpointError| AttemptRecordError {
-                work_ref: work_ref.to_string(),
-                reason: error.to_string(),
-            };
+        let failure = |error: CheckpointError| AttemptRecordError {
+            work_ref: work_ref.to_string(),
+            reason: error.to_string(),
+        };
         // The handoff is rewritten WITH the settled record: a boot that
         // reads it finds "refused, no effects", never the instruction of
         // the attempt that never ran.
@@ -857,17 +860,20 @@ mod tests {
         records
             .settle_no_effect("TASK-7", "the permission policy refused \"bash\"")
             .expect("the refusal settles");
-        records.recover().expect("a settled record opens");
-        records
-            .begin_attempt(&AttemptGoal { run: 4, ..goal })
-            .expect("the next attempt opens without an operator");
 
-        // The handoff tells the truth about what never happened.
+        // The handoff tells the truth about what never happened: it is
+        // rewritten WITH the settled record, before any new attempt can
+        // replace it with its own instruction.
         let handoff = std::fs::read_to_string(dir.join(HANDOFF_FILE)).expect("the handoff");
         assert!(
             handoff.contains("the attempt refused; no candidate, no promotion, no closure"),
             "{handoff}"
         );
+
+        records.recover().expect("a settled record opens");
+        records
+            .begin_attempt(&AttemptGoal { run: 4, ..goal })
+            .expect("the next attempt opens without an operator");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
