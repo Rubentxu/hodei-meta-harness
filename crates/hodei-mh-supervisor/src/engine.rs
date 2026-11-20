@@ -5,7 +5,9 @@
 
 use run::grant::Grant;
 use run::run::{Phase, RunState};
-use run::runtime::{ObjectiveOutcome, ObjectiveReport, RenewOutcome, RuntimeIdentity};
+use run::runtime::{
+    CustomObjective, ObjectiveOutcome, ObjectiveReport, RenewOutcome, RuntimeIdentity,
+};
 
 use crate::protocol::{
     ActionOutcome, EventPage, PROTOCOL_VERSION, ResourceObservation, Snapshot, StructuredEvent,
@@ -64,7 +66,7 @@ pub struct SupervisorCore {
     pub paused: bool,
     pub ticket: Option<String>,
     /// The custom objective of the current run, when it owns no ticket.
-    pub custom_objective: Option<String>,
+    pub custom_objective: Option<CustomObjective>,
     pub revision: Option<String>,
     /// The runtime that executes objectives. Set when the controller is
     /// wired: it is what makes a rehearsal visible as a rehearsal, and
@@ -320,7 +322,7 @@ struct StartRequest<'a> {
     ticket: Option<&'a str>,
     revision: Option<&'a str>,
     /// A custom objective owns no ticket: it never claims or closes work.
-    objective: Option<&'a str>,
+    objective: Option<&'a CustomObjective>,
 }
 
 fn apply_start(
@@ -374,7 +376,7 @@ fn apply_start(
     // work began.
     core.run = Some(RunState::pending(grant, "supervisor-session"));
     core.ticket = request.ticket.map(str::to_string);
-    core.custom_objective = request.objective.map(str::to_string);
+    core.custom_objective = request.objective.cloned();
     core.revision = request.revision.map(str::to_string);
     core.paused = false;
     // The verdict of the PREVIOUS objective is not this run's verdict: a
@@ -390,14 +392,16 @@ fn apply_start(
                 "goal/scope",
                 serde_json::json!({
                     "scope": "custom-objective",
-                    "objective": objective,
+                    "objective": objective.instruction,
+                    "accept": objective.accept.command,
+                    "expect_exit": objective.accept.expect_exit,
                     "ticket": serde_json::Value::Null,
                 }),
                 Provenance::Human,
             );
             format!(
-                "starting the custom objective '{objective}' for {project} (epoch {}); it owns no ticket; awaiting the runtime's confirmation",
-                core.epoch
+                "starting the custom objective '{}' for {project} (epoch {}); it owns no ticket; awaiting the runtime's confirmation",
+                objective.instruction, core.epoch
             )
         }
         None => format!(
@@ -708,7 +712,10 @@ pub fn snapshot(core: &SupervisorCore) -> Snapshot {
             .unwrap_or(Phase::Idle),
         paused: core.paused,
         ticket: core.ticket.clone(),
-        goal: core.custom_objective.clone(),
+        goal: core
+            .custom_objective
+            .as_ref()
+            .map(|objective| objective.instruction.clone()),
         revision: core.revision.clone(),
         runtime: core.runtime.clone(),
         objective: core.objective.clone(),
@@ -825,12 +832,23 @@ mod tests {
             &mut core,
             SupervisorAction::StartObjective {
                 project: "gc".into(),
-                objective: "summarise the docs".into(),
+                objective: run::runtime::CustomObjective {
+                    instruction: "summarise the docs".into(),
+                    accept: goal::source::TerminationCriterion {
+                        command: "test -f SUMMARY.md".into(),
+                        expect_exit: 0,
+                    },
+                },
             },
         );
         assert!(start.applied, "{start:?}");
         assert_eq!(core.ticket, None, "a custom objective owns no ticket");
-        assert_eq!(core.custom_objective.as_deref(), Some("summarise the docs"));
+        assert_eq!(
+            core.custom_objective
+                .as_ref()
+                .map(|objective| objective.instruction.as_str()),
+            Some("summarise the docs")
+        );
         assert!(start.detail.contains("owns no ticket"), "{}", start.detail);
         // The goal scope and the run are distinguished in the record.
         let snapshot = snapshot(&core);
@@ -844,6 +862,38 @@ mod tests {
                     && event.payload["scope"] == "custom-objective"),
             "the goal scope is an event of the run"
         );
+    }
+
+    #[test]
+    fn a_custom_objective_carries_its_accept_command() {
+        let mut core = wired("gc");
+        apply(
+            &mut core,
+            SupervisorAction::StartObjective {
+                project: "gc".into(),
+                objective: run::runtime::CustomObjective {
+                    instruction: "summarise the docs".into(),
+                    accept: goal::source::TerminationCriterion {
+                        command: "test -f SUMMARY.md".into(),
+                        expect_exit: 1,
+                    },
+                },
+            },
+        );
+        // The recorded criterion is the one the operator gave, command
+        // and expected exit together: a consumer of the event stream
+        // re-checks the acceptance without guessing its polarity.
+        let scope = core
+            .events
+            .iter()
+            .find(|event| event.kind == "goal/scope")
+            .expect("the goal scope event");
+        assert_eq!(
+            scope.payload["accept"],
+            serde_json::json!("test -f SUMMARY.md")
+        );
+        assert_eq!(scope.payload["expect_exit"], serde_json::json!(1));
+        assert_eq!(scope.payload["ticket"], serde_json::Value::Null);
     }
 
     #[test]

@@ -17,6 +17,7 @@ futures-util = { workspace = true }
 sha2 = { workspace = true }
 libc = "0.2"
 run = { path = "../hodei-mh-run", package = "hodei-mh-run" }
+goal = { path = "../hodei-mh-goal", package = "hodei-mh-goal" }
 
 [dev-dependencies]
 async-trait = { workspace = true }

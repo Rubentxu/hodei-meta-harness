@@ -9,6 +9,7 @@ license.workspace = true
 name = "run"
 
 [dependencies]
+goal = { path = "../hodei-mh-goal", package = "hodei-mh-goal" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

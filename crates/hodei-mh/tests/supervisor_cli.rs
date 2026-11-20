@@ -452,3 +452,54 @@ async fn a_live_boot_with_a_tracker_that_does_not_answer_is_refused() {
         "the refusal names the tracker: {stderr}"
     );
 }
+
+#[tokio::test]
+async fn an_objective_that_also_names_a_ticket_never_reaches_the_supervisor() {
+    // The real binary, an unreachable socket: the refusal must happen
+    // while parsing, before any connection — a contradictory request is
+    // never sent, and its two halves are never split into two actions.
+    let (code, _stdout, stderr) = capture(&[
+        "sup-action",
+        "start",
+        "--socket",
+        "/unused-by-this-test.sock",
+        "--objective",
+        "summarise the docs",
+        "--accept",
+        "test -f SUMMARY.md",
+        "--ticket",
+        "TASK-9",
+    ])
+    .await;
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("not both"),
+        "the refusal names the conflict: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Connection refused"),
+        "the malformed request is refused before the socket is touched: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn an_objective_without_a_criterion_names_the_flag_it_needs() {
+    let (code, _stdout, stderr) = capture(&[
+        "sup-action",
+        "start",
+        "--socket",
+        "/unused-by-this-test.sock",
+        "--objective",
+        "summarise the docs",
+    ])
+    .await;
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("--accept"),
+        "the refusal names the missing flag: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Connection refused"),
+        "the incomplete request is refused before the socket is touched: {stderr}"
+    );
+}

@@ -23,7 +23,7 @@ pub enum GoalSource {
 
 /// A verifiable termination condition: a command plus the exit code that
 /// means "fulfilled".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminationCriterion {
     pub command: String,
     pub expect_exit: i32,

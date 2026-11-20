@@ -28,10 +28,11 @@ pub enum SupervisorAction {
         revision: Option<String>,
     },
     /// Start one pass over a custom objective: it owns no ticket, so it
-    /// never selects, claims or closes tracker work.
+    /// never selects, claims or closes tracker work. The objective ends
+    /// by its operator criterion, never by the agent's feeling of done.
     StartObjective {
         project: String,
-        objective: String,
+        objective: run::runtime::CustomObjective,
     },
     Pause,
     Resume,
@@ -230,14 +231,20 @@ mod tests {
 
     #[test]
     fn a_custom_objective_start_carries_no_ticket() {
-        let raw = r#"{"req":"action","action":{"action":"start_objective","project":"gc","objective":"summarise"}}"#;
+        let raw = r#"{"req":"action","action":{"action":"start_objective","project":"gc","objective":{"instruction":"summarise","accept":{"command":"test -f SUMMARY.md","expect_exit":0}}}}"#;
         let request: Request = serde_json::from_str(raw).expect("parse");
         assert_eq!(
             request,
             Request::Action {
                 action: SupervisorAction::StartObjective {
                     project: "gc".into(),
-                    objective: "summarise".into(),
+                    objective: run::runtime::CustomObjective {
+                        instruction: "summarise".into(),
+                        accept: goal::source::TerminationCriterion {
+                            command: "test -f SUMMARY.md".into(),
+                            expect_exit: 0,
+                        },
+                    },
                 }
             }
         );

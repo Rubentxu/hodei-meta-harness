@@ -847,6 +847,7 @@ name = "hodei-mh-run"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "hodei-mh-goal",
  "serde",
  "serde_json",
  "thiserror",
@@ -859,6 +860,7 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "hodei-mh-goal",
+ "hodei-mh-promote",
  "hodei-mh-run",
  "hodei-mh-supervisor",
  "hodei-mh-tracker",
@@ -875,6 +877,7 @@ version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
+ "hodei-mh-goal",
  "hodei-mh-run",
  "libc",
  "serde",

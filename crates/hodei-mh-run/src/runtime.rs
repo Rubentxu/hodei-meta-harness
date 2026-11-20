@@ -81,7 +81,20 @@ pub struct ObjectiveRequest {
     /// A custom objective, when the caller asked for work that owns no
     /// ticket. It never selects, claims or closes tracker work.
     #[serde(default)]
-    pub objective: Option<String>,
+    pub objective: Option<CustomObjective>,
+}
+
+/// A free-form objective the caller named: it owns no ticket, so the
+/// tracker never judges it. Its end is the operator's own termination
+/// criterion — a command plus the exit code that means "fulfilled" —
+/// never the agent's feeling of done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomObjective {
+    /// What the agent is asked to do, in the caller's own words.
+    pub instruction: String,
+    /// The criterion that ends the objective: it becomes the one check
+    /// the verification must produce evidence for.
+    pub accept: goal::source::TerminationCriterion,
 }
 
 /// What the objective ended up being.
